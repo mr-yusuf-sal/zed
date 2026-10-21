@@ -14361,6 +14361,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "quarry"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures 0.3.34",
+ "gpui",
+ "log",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "ui",
+ "util",
+]
+
+[[package]]
 name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
