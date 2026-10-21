@@ -188,3 +188,21 @@ Rules emerge from validated patterns, not one-off observations. The workflow is:
 1. Agent notes a pattern during a session.
 2. Team validates the pattern in code review.
 3. A dedicated commit adds the rule with context on *why* it exists.
+
+# Fork build settings (this checkout only)
+
+This checkout is the `custom` branch of a personal fork, built by `ZedFork/build.ps1` outside the repo. Upstream's `[profile.release]` (`lto = "thin"`, `codegen-units = 1`) ends every build in a long single-threaded LTO-then-link tail — over 25 minutes on 32 cores with most of them idle. The script overrides the profile to `lto = false`, `debug = false`, `codegen-units = 16`, `incremental = true`, which brings a from-scratch build to ~16 min and an "edit one crate, get a new exe" rebuild to ~1.5 min.
+
+* Keep those overrides in `build.ps1` as `CARGO_PROFILE_RELEASE_*` env vars. Do **not** move them into this repo's `Cargo.toml`: the branch has to stay a small stack of commits that rebases onto each upstream stable tag, and a profile edit there is pure conflict surface.
+* Never pass build flags through `$env:RUSTFLAGS`. It *replaces* the `cfg(all())` and `cfg(target_os = "windows")` rustflags in `.cargo/config.toml` instead of extending them, silently dropping `+crt-static` and breaking the livekit link. Use `cargo build --config target.<triple>.rustflags=[...]`, which merges.
+* Do not link with lld. Rust's bundled `lld-link.exe` does link (given `-Clinker-flavor=msvc`, since rustc otherwise prepends a `-flavor link` that lld-link rejects), but the resulting binary died with `0xc0000005` at fault offset `0x0` — a call through a null address, no Rust panic — every time the git graph was opened. The same commit relinked with MSVC `link.exe` is fine. The `LNK4217 "locally defined symbol imported"` warnings for the wasmtime symbols tree-sitter pulls in are not the tell: `link.exe` emits them 48 times too.
+
+# Commit & push policy (this checkout only)
+
+**Every change ends with a commit and a push.** After finishing a piece of work — no matter how small — stage it, commit it, and push it to `origin/custom` (`mr-yusuf-sal/zed`) in the same turn. Do not leave finished work sitting uncommitted, and do not leave a commit sitting unpushed. The working tree is also the editor's build source, so anything left dirty here is one `-Update` rebase away from being hard to recover.
+
+* Never push to `upstream`. It is `zed-industries/zed` and this fork has no business writing to it; `origin` is the only push target.
+* Commit only the work related to the finished task. This branch has to stay a readable stack of commits that rebases cleanly onto each new upstream stable tag, so unrelated changes swept into a commit are a direct cost later.
+* Write the message the way the existing commits on this branch do: subject stating the effect, then a body explaining what was actually wrong and why this fix, in prose. A commit that overclaims is worse than one that admits what it does not know.
+* `build.ps1 -Update` force-pushes the rebased branch with `--force-with-lease`. That is the only place a force push is expected; never reach for one to resolve an ordinary rejected push.
+* If a push fails, say so plainly and report the commit as local-only. Never claim work was pushed when it was not.
