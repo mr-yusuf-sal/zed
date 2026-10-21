@@ -593,8 +593,10 @@ impl SplitState {
         1.0 - self.visible_main_ratio
     }
 
-    fn main_ratio(&self) -> f32 {
-        self.main_ratio
+    /// The ratio actually being rendered. `commit_ratio` only copies this into `main_ratio` once
+    /// a drag settles, so this is the value to trust when saving.
+    fn visible_ratio(&self) -> f32 {
+        self.visible_main_ratio
     }
 
     /// Jumps straight to a ratio, for restoring a split saved in an earlier session or when
@@ -1867,8 +1869,13 @@ impl GitGraph {
     /// Records where the divider was left for the current position and writes every remembered
     /// ratio back out. Called once a drag settles, not while it is moving.
     fn persist_split_ratio(&mut self, cx: &mut Context<Self>) {
-        let ratio = self.commit_details_split_state.read(cx).main_ratio();
+        let ratio = self.commit_details_split_state.read(cx).visible_ratio();
         if !ratio.is_finite() {
+            return;
+        }
+        // Called on tab switches too, so skip the sqlite round-trip when nothing moved.
+        let key = self.commit_details_position.as_str();
+        if self.commit_details_split_ratios.get(key) == Some(&ratio) {
             return;
         }
         // Re-read before writing: another git graph holds its own copy of this map, and writing
@@ -5098,6 +5105,9 @@ impl Item for GitGraph {
         if let Some(nav_history) = self.nav_history.as_mut() {
             nav_history.push::<()>(None, None, cx);
         }
+        // A drag released outside the window never delivers its drop, so the size the user left
+        // behind would otherwise be lost on quit. Leaving the tab is enough to save it.
+        self.persist_split_ratio(cx);
     }
 
     fn set_nav_history(
