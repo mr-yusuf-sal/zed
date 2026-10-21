@@ -10,6 +10,7 @@ use crate::{
     git_timestamp::format_git_timestamp,
 };
 use collections::{BTreeMap, HashMap, IndexSet};
+use db::kvp::KeyValueStore;
 use editor::Editor;
 use file_icons::FileIcons;
 use git::{
@@ -83,6 +84,8 @@ const TABLE_COLUMN_COUNT: usize = 4;
 const REFS_COLUMN_INDEX: usize = 0;
 const GRAPH_COLUMN_INDEX: usize = 1;
 const GRAPH_LAYOUT_TABLE_OFFSET: usize = 2;
+const COLUMN_WIDTHS_KEY: &str = "git_graph_column_widths";
+const COLUMN_WIDTHS_PATH_HISTORY_KEY: &str = "git_graph_path_history_column_widths";
 const ROW_VERTICAL_PADDING: Pixels = px(4.0);
 
 struct CopiedState {
@@ -1696,6 +1699,7 @@ impl GitGraph {
                 )
             })
         };
+        Self::restore_and_persist_column_widths(&column_widths, &log_source, cx);
         let column_visibility = TableRow::from_element(
             false,
             if matches!(log_source, LogSource::Path(_)) {
@@ -1770,6 +1774,71 @@ impl GitGraph {
 
         this.fetch_initial_graph_data(cx);
         this
+    }
+
+    /// Column widths are global rather than per item: the widths last dragged in any git graph
+    /// apply to every git graph opened afterwards, across restarts. Path history has a different
+    /// column layout, so it gets its own key.
+    fn restore_and_persist_column_widths(
+        column_widths: &Entity<RedistributableColumnsState>,
+        log_source: &LogSource,
+        cx: &mut Context<Self>,
+    ) {
+        let key = if matches!(log_source, LogSource::Path(_)) {
+            COLUMN_WIDTHS_PATH_HISTORY_KEY
+        } else {
+            COLUMN_WIDTHS_KEY
+        };
+
+        let saved = KeyValueStore::global(cx)
+            .read_kvp(key)
+            .log_err()
+            .flatten()
+            .and_then(|json| serde_json::from_str::<Vec<f32>>(&json).log_err())
+            .filter(|fractions| {
+                let sum: f32 = fractions.iter().sum();
+                fractions.iter().all(|f| f.is_finite() && *f > 0.0) && (0.9..=1.1).contains(&sum)
+            });
+        if let Some(fractions) = saved {
+            column_widths.update(cx, |state, _| {
+                state.restore_widths(
+                    fractions
+                        .into_iter()
+                        .map(DefiniteLength::Fraction)
+                        .collect(),
+                );
+            });
+        }
+
+        let mut last_saved = column_widths.read(cx).committed_widths().clone();
+        cx.observe(column_widths, move |_, column_widths, cx| {
+            let widths = column_widths.read(cx).committed_widths().clone();
+            if widths == last_saved {
+                return;
+            }
+            last_saved = widths.clone();
+
+            let fractions: Vec<f32> = widths
+                .as_slice()
+                .iter()
+                .filter_map(|width| match width {
+                    DefiniteLength::Fraction(fraction) => Some(*fraction),
+                    DefiniteLength::Absolute(_) => None,
+                })
+                .collect();
+            if fractions.len() != widths.cols() {
+                return;
+            }
+            let Some(json) = serde_json::to_string(&fractions).log_err() else {
+                return;
+            };
+            let kvp = KeyValueStore::global(cx);
+            cx.background_spawn(
+                async move { kvp.write_kvp(key.to_string(), json).await.log_err() },
+            )
+            .detach();
+        })
+        .detach();
     }
 
     fn on_repository_event(

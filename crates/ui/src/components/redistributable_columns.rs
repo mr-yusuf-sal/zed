@@ -138,6 +138,21 @@ impl RedistributableColumnsState {
         &self.preview_widths
     }
 
+    pub fn committed_widths(&self) -> &TableRow<DefiniteLength> {
+        &self.committed_widths
+    }
+
+    /// Replaces the current widths (e.g. with ones restored from a previous session) while
+    /// keeping the initial widths, so a double-click still resets to the original defaults.
+    /// Ignored when the column count doesn't match.
+    pub fn restore_widths(&mut self, widths: Vec<DefiniteLength>) {
+        if widths.len() != self.cols() {
+            return;
+        }
+        self.committed_widths = widths.into_table_row(self.cols());
+        self.preview_widths = self.committed_widths.clone();
+    }
+
     pub fn resize_behavior(&self) -> &TableRow<TableResizeBehavior> {
         &self.resize_behavior
     }
@@ -578,8 +593,10 @@ pub fn bind_redistributable_columns(
             }
         })
         .on_drop::<DraggedColumn>(move |_, _, cx| {
-            columns_state.update(cx, |columns, _| {
+            columns_state.update(cx, |columns, cx| {
                 columns.commit_preview();
+                // Lets observers (e.g. ones persisting the widths) react to a finished drag.
+                cx.notify();
             });
         })
 }
@@ -629,7 +646,10 @@ pub fn render_redistributable_columns_resize_handles(
         };
         let on_drag_end: Option<Rc<dyn Fn(&mut App)>> = {
             Some(Rc::new(move |cx| {
-                columns_state.update(cx, |state, _| state.commit_preview());
+                columns_state.update(cx, |state, cx| {
+                    state.commit_preview();
+                    cx.notify();
+                });
             }))
         };
         children.push(render_column_resize_divider(
