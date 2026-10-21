@@ -14366,6 +14366,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "db",
  "futures 0.3.34",
  "gpui",
  "log",
@@ -14373,6 +14374,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "tabular_data_preview",
  "tokio",
  "ui",
  "util",

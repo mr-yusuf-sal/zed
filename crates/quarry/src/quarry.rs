@@ -4,8 +4,10 @@
 //! The engine-specific parts live behind [`driver::Driver`]. Everything above that — the tree,
 //! the query view, credential handling — is written once and knows nothing about Postgres.
 
+pub mod connection_store;
 pub mod driver;
 pub mod drivers;
+pub mod result_table;
 pub mod runtime;
 
 use anyhow::{Context as _, Result, anyhow};
@@ -16,6 +18,7 @@ use std::sync::Arc;
 
 pub fn init(cx: &mut App) {
     QuarryRuntime::init(cx);
+    connection_store::ConnectionStore::init(cx);
 }
 
 /// Opens a connection, fetching the password from the OS credential store on the way.
