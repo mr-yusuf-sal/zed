@@ -7,6 +7,8 @@
 pub mod connection_store;
 pub mod driver;
 pub mod drivers;
+pub mod panel;
+pub mod query_view;
 pub mod result_table;
 pub mod runtime;
 
@@ -19,6 +21,7 @@ use std::sync::Arc;
 pub fn init(cx: &mut App) {
     QuarryRuntime::init(cx);
     connection_store::ConnectionStore::init(cx);
+    panel::init(cx);
 }
 
 /// Opens a connection, fetching the password from the OS credential store on the way.
@@ -65,12 +68,105 @@ pub async fn connect(config: ConnectionConfig, cx: &mut gpui::AsyncApp) -> Resul
                 })
                 .await?
         }
-        engine => {
-            return Err(anyhow!("{} support is not implemented yet", engine.label()));
+        Engine::SqlServer => {
+            open(&runtime, &config, username, password, |h, p, d, u, pw| {
+                Box::pin(async move {
+                    Ok(Arc::new(
+                        drivers::sqlserver::SqlServerDriver::connect(
+                            &h,
+                            p,
+                            d.as_deref(),
+                            u.as_deref(),
+                            pw.as_deref(),
+                        )
+                        .await?,
+                    ) as Arc<dyn Driver>)
+                })
+            })
+            .await?
+        }
+        Engine::MongoDb => {
+            open(&runtime, &config, username, password, |h, p, d, u, pw| {
+                Box::pin(async move {
+                    Ok(Arc::new(
+                        drivers::mongodb::MongoDriver::connect(
+                            &h,
+                            p,
+                            d.as_deref(),
+                            u.as_deref(),
+                            pw.as_deref(),
+                        )
+                        .await?,
+                    ) as Arc<dyn Driver>)
+                })
+            })
+            .await?
+        }
+        Engine::Redis => {
+            open(&runtime, &config, username, password, |h, p, d, u, pw| {
+                Box::pin(async move {
+                    Ok(Arc::new(
+                        drivers::redis::RedisDriver::connect(
+                            &h,
+                            p,
+                            d.as_deref(),
+                            u.as_deref(),
+                            pw.as_deref(),
+                        )
+                        .await?,
+                    ) as Arc<dyn Driver>)
+                })
+            })
+            .await?
+        }
+        Engine::ClickHouse => {
+            open(&runtime, &config, username, password, |h, p, d, u, pw| {
+                Box::pin(async move {
+                    Ok(Arc::new(
+                        drivers::clickhouse::ClickHouseDriver::connect(
+                            &h,
+                            p,
+                            d.as_deref(),
+                            u.as_deref(),
+                            pw.as_deref(),
+                        )
+                        .await?,
+                    ) as Arc<dyn Driver>)
+                })
+            })
+            .await?
         }
     };
 
     Ok(driver)
+}
+
+/// Every engine connects the same way — move the owned config fields onto the Quarry runtime,
+/// build the driver there, hand back a trait object — so only the driver constructor differs.
+/// The closure returns a boxed future because each driver's is a different concrete type.
+fn open<F>(
+    runtime: &QuarryRuntime,
+    config: &ConnectionConfig,
+    username: Option<String>,
+    password: Option<String>,
+    build: F,
+) -> impl std::future::Future<Output = Result<Arc<dyn Driver>>> + Send + 'static
+where
+    F: FnOnce(
+            String,
+            u16,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Arc<dyn Driver>>> + Send>,
+        > + Send
+        + 'static,
+{
+    let host = config.host.clone();
+    let port = config.port;
+    let database = config.database.clone();
+    runtime.spawn(async move { build(host, port, database, username, password).await })
 }
 
 /// Stores the password for `config` in the OS credential store, replacing any previous one.
