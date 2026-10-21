@@ -4,7 +4,14 @@ use sqlx::{Column as _, Row as _, ValueRef as _, postgres::PgPoolOptions};
 use ui::SharedString;
 
 pub struct PostgresDriver {
-    pool: sqlx::PgPool,
+    /// Connection settings minus the database, so a pool can be opened for any of them.
+    options: sqlx::postgres::PgConnectOptions,
+    /// The database named in the connection URL. Queries typed in the editor run here.
+    default_database: String,
+    /// One pool per database. A Postgres connection is bound to a single database and cannot
+    /// query across them, so browsing a server's other databases means opening another pool;
+    /// without this the tree could only ever show the one database the URL named.
+    pools: tokio::sync::Mutex<std::collections::HashMap<String, sqlx::PgPool>>,
 }
 
 impl PostgresDriver {
@@ -32,10 +39,43 @@ impl PostgresDriver {
             // A browser issues one query at a time per view; a couple of connections is enough
             // to keep the tree responsive while a long query runs.
             .max_connections(4)
-            .connect_with(options)
+            .connect_with(options.clone())
             .await
             .with_context(|| format!("connecting to postgres at {host}:{port}"))?;
-        Ok(Self { pool })
+
+        // Whatever the server resolved to, so the tree can mark it and queries can target it.
+        let default_database: String = sqlx::raw_sql("SELECT current_database()")
+            .fetch_one(&pool)
+            .await
+            .context("reading the current database")?
+            .try_get_raw(0)
+            .ok()
+            .and_then(|raw| raw.as_str().ok().map(str::to_string))
+            .unwrap_or_else(|| database.unwrap_or("postgres").to_string());
+
+        let mut pools = std::collections::HashMap::new();
+        pools.insert(default_database.clone(), pool);
+        Ok(Self {
+            options,
+            default_database,
+            pools: tokio::sync::Mutex::new(pools),
+        })
+    }
+
+    /// Returns the pool for `database`, opening one the first time it is asked for. Pools are
+    /// kept because expanding a tree hits the same database repeatedly.
+    async fn pool(&self, database: &str) -> Result<sqlx::PgPool> {
+        let mut pools = self.pools.lock().await;
+        if let Some(pool) = pools.get(database) {
+            return Ok(pool.clone());
+        }
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(self.options.clone().database(database))
+            .await
+            .with_context(|| format!("opening {database}"))?;
+        pools.insert(database.to_string(), pool.clone());
+        Ok(pool)
     }
 }
 
@@ -83,15 +123,20 @@ fn to_result_set(rows: Vec<sqlx::postgres::PgRow>, row_limit: usize) -> ResultSe
 }
 
 impl PostgresDriver {
-    async fn fetch(&self, sql: &str, row_limit: usize) -> Result<ResultSet> {
+    async fn fetch_in(&self, database: &str, sql: &str, row_limit: usize) -> Result<ResultSet> {
+        let pool = self.pool(database).await?;
         // `raw_sql` uses the simple query protocol, which is what makes `cell` above work and
         // also lets the user run several statements separated by semicolons, the way they would
         // in psql. Prepared statements would reject that.
         let rows = sqlx::raw_sql(sql)
-            .fetch_all(&self.pool)
+            .fetch_all(&pool)
             .await
             .with_context(|| format!("running: {}", sql.trim()))?;
         Ok(to_result_set(rows, row_limit))
+    }
+
+    async fn fetch(&self, sql: &str, row_limit: usize) -> Result<ResultSet> {
+        self.fetch_in(&self.default_database, sql, row_limit).await
     }
 }
 
@@ -99,14 +144,13 @@ impl PostgresDriver {
 impl Driver for PostgresDriver {
     async fn children(&self, path: &[SharedString]) -> Result<Vec<ObjectNode>> {
         match path {
-            // Top level: the schemas a user actually works in. The catalogs are hidden because
-            // they bury the interesting ones under hundreds of system tables.
+            // Top level is the server's databases, not the connected one's schemas. A Postgres
+            // connection is bound to one database, so starting at schemas made every other
+            // database on the server unreachable without adding a second connection.
             [] => {
                 let result = self
                     .fetch(
-                        "SELECT nspname FROM pg_catalog.pg_namespace \
-                         WHERE nspname NOT LIKE 'pg\\_%' AND nspname <> 'information_schema' \
-                         ORDER BY nspname",
+                        "SELECT datname FROM pg_database                          WHERE NOT datistemplate AND datallowconn ORDER BY datname",
                         10_000,
                     )
                     .await?;
@@ -115,7 +159,32 @@ impl Driver for PostgresDriver {
                     .into_iter()
                     .filter_map(|row| row.into_iter().next().flatten())
                     .map(|name| ObjectNode {
+                        detail: (name == self.default_database).then(|| "connected".into()),
                         path: vec![name.clone()],
+                        name,
+                        kind: ObjectKind::Database,
+                        has_children: true,
+                    })
+                    .collect())
+            }
+            // Schemas the user actually works in; the catalogs are hidden because they bury the
+            // interesting ones under hundreds of system tables.
+            [database] => {
+                let result = self
+                    .fetch_in(
+                        database,
+                        r"SELECT nspname FROM pg_catalog.pg_namespace
+                           WHERE nspname NOT LIKE 'pg\_%' AND nspname <> 'information_schema'
+                           ORDER BY nspname",
+                        10_000,
+                    )
+                    .await?;
+                Ok(result
+                    .rows
+                    .into_iter()
+                    .filter_map(|row| row.into_iter().next().flatten())
+                    .map(|name| ObjectNode {
+                        path: vec![database.clone(), name.clone()],
                         name,
                         kind: ObjectKind::Schema,
                         has_children: true,
@@ -123,16 +192,12 @@ impl Driver for PostgresDriver {
                     })
                     .collect())
             }
-            [schema] => {
+            [database, schema] => {
                 let sql = format!(
-                    "SELECT c.relname, c.relkind \
-                     FROM pg_catalog.pg_class c \
-                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-                     WHERE n.nspname = {} AND c.relkind IN ('r', 'v', 'm', 'p') \
-                     ORDER BY c.relname",
+                    "SELECT c.relname, c.relkind,                             COALESCE(NULLIF(c.reltuples, -1)::bigint, 0) AS rows                      FROM pg_catalog.pg_class c                      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace                      WHERE n.nspname = {} AND c.relkind IN ('r', 'v', 'm', 'p')                      ORDER BY c.relname",
                     quote_literal(schema)
                 );
-                let result = self.fetch(&sql, 10_000).await?;
+                let result = self.fetch_in(database, &sql, 10_000).await?;
                 Ok(result
                     .rows
                     .into_iter()
@@ -140,29 +205,34 @@ impl Driver for PostgresDriver {
                         let mut values = row.into_iter();
                         let name = values.next().flatten()?;
                         let relkind = values.next().flatten()?;
+                        let rows = values.next().flatten();
+                        let is_view = matches!(relkind.as_ref(), "v" | "m");
                         Some(ObjectNode {
-                            path: vec![schema.clone(), name.clone()],
+                            path: vec![database.clone(), schema.clone(), name.clone()],
                             name,
-                            kind: match relkind.as_ref() {
-                                "v" | "m" => ObjectKind::View,
-                                _ => ObjectKind::Table,
+                            kind: if is_view {
+                                ObjectKind::View
+                            } else {
+                                ObjectKind::Table
                             },
                             has_children: true,
-                            detail: None,
+                            // reltuples is the planner's estimate, not a count: showing it costs
+                            // nothing, while COUNT(*) on every table would make the tree crawl.
+                            detail: (!is_view)
+                                .then_some(rows)
+                                .flatten()
+                                .map(|rows| SharedString::from(format!("~{rows} rows"))),
                         })
                     })
                     .collect())
             }
-            [schema, table] => {
+            [database, schema, table] => {
                 let sql = format!(
-                    "SELECT column_name, data_type, is_nullable \
-                     FROM information_schema.columns \
-                     WHERE table_schema = {} AND table_name = {} \
-                     ORDER BY ordinal_position",
+                    "SELECT column_name, data_type, is_nullable                      FROM information_schema.columns                      WHERE table_schema = {} AND table_name = {}                      ORDER BY ordinal_position",
                     quote_literal(schema),
                     quote_literal(table)
                 );
-                let result = self.fetch(&sql, 10_000).await?;
+                let result = self.fetch_in(database, &sql, 10_000).await?;
                 Ok(result
                     .rows
                     .into_iter()
@@ -176,7 +246,12 @@ impl Driver for PostgresDriver {
                             _ => data_type.to_string(),
                         };
                         Some(ObjectNode {
-                            path: vec![schema.clone(), table.clone(), name.clone()],
+                            path: vec![
+                                database.clone(),
+                                schema.clone(),
+                                table.clone(),
+                                name.clone(),
+                            ],
                             name,
                             kind: ObjectKind::Column,
                             has_children: false,
@@ -194,8 +269,8 @@ impl Driver for PostgresDriver {
     }
 
     async fn preview(&self, path: &[SharedString], row_limit: usize) -> Result<ResultSet> {
-        let [schema, table, ..] = path else {
-            bail!("expected a schema-qualified table, got {path:?}");
+        let [database, schema, table, ..] = path else {
+            bail!("expected database, schema and table, got {path:?}");
         };
         // Identifiers are quoted rather than interpolated so mixed-case and reserved names work;
         // they come from the catalog rather than from the user, but quoting keeps it honest.
@@ -206,7 +281,7 @@ impl Driver for PostgresDriver {
             // One extra row is what tells the view the result was cut short.
             row_limit + 1
         );
-        self.fetch(&sql, row_limit).await
+        self.fetch_in(database, &sql, row_limit).await
     }
 }
 

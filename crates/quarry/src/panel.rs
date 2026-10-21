@@ -62,13 +62,34 @@ impl Default for ConnectionState {
     }
 }
 
+/// The add-connection form: a URL and an optional password, kept together so the password is
+/// written to the credential store at the same moment the connection is saved.
+struct Draft {
+    url: Entity<Editor>,
+    password: Entity<Editor>,
+    error: Option<SharedString>,
+}
+
+fn new_password_editor(window: &mut Window, cx: &mut App) -> Entity<Editor> {
+    cx.new(|cx| {
+        let mut editor = Editor::single_line(window, cx);
+        editor.set_placeholder_text("password (optional)", window, cx);
+        // Masked so a shoulder or a screen share does not read it; the value still goes
+        // straight to the OS credential store and nowhere else.
+        editor.set_masked(true, cx);
+        editor
+    })
+}
+
 pub struct QuarryPanel {
     focus_handle: FocusHandle,
     workspace: WeakEntity<Workspace>,
     store: Entity<ConnectionStore>,
     states: Vec<ConnectionState>,
-    /// Non-empty while the user is typing a connection URL.
-    new_connection: Option<Entity<Editor>>,
+    /// Present while the user is filling in the add-connection form.
+    draft: Option<Draft>,
+    /// Set while changing the password of a connection that already exists.
+    password_prompt: Option<(usize, Entity<Editor>)>,
     width: Option<Pixels>,
     position: DockPosition,
     _tasks: Vec<Task<()>>,
@@ -94,7 +115,8 @@ impl QuarryPanel {
             workspace,
             store,
             states: (0..count).map(|_| ConnectionState::default()).collect(),
-            new_connection: None,
+            draft: None,
+            password_prompt: None,
             width: None,
             position: DockPosition::Left,
             _tasks: Vec::new(),
@@ -102,29 +124,90 @@ impl QuarryPanel {
     }
 
     fn start_adding(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let editor = cx.new(|cx| {
+        let url = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_placeholder_text("postgres://user@localhost:5432/database", window, cx);
             editor
         });
-        editor.focus_handle(cx).focus(window, cx);
-        self.new_connection = Some(editor);
+        url.focus_handle(cx).focus(window, cx);
+        self.draft = Some(Draft {
+            url,
+            password: new_password_editor(window, cx),
+            error: None,
+        });
         cx.notify();
     }
 
-    fn confirm_adding(&mut self, cx: &mut Context<Self>) {
-        let Some(editor) = self.new_connection.take() else {
+    fn confirm_adding(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = self.draft.as_ref() else {
             return;
         };
-        let text = editor.read(cx).text(cx);
-        match parse_connection_url(&text) {
-            Ok(config) => self.store.update(cx, |store, cx| store.add(config, cx)),
+        let text = draft.url.read(cx).text(cx);
+        let config = match parse_connection_url(&text) {
+            Ok(config) => config,
             Err(error) => {
-                // Put the text back so a typo can be corrected rather than retyped.
-                log::warn!("Quarry: {error:#}");
-                self.new_connection = Some(editor);
+                // Keep the form open with the text still in it so a typo can be corrected
+                // rather than retyped, and say what was wrong where the user is looking.
+                if let Some(draft) = self.draft.as_mut() {
+                    draft.error = Some(format!("{error:#}").into());
+                }
+                cx.notify();
+                return;
+            }
+        };
+
+        let password = draft.password.read(cx).text(cx);
+        self.draft = None;
+        if !password.is_empty() {
+            self.save_password(&config, password, cx);
+        }
+        self.store.update(cx, |store, cx| store.add(config, cx));
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Writes the password to the OS credential store, where `crate::connect` looks for it. It
+    /// never enters the config, so it reaches neither the key-value store nor any file.
+    fn save_password(
+        &mut self,
+        config: &ConnectionConfig,
+        password: String,
+        cx: &mut Context<Self>,
+    ) {
+        let config = config.clone();
+        let username = config.username.clone().unwrap_or_default();
+        let task = cx.spawn(async move |_, cx| {
+            if let Err(error) = crate::save_password(&config, &username, &password, cx).await {
+                log::error!("Quarry could not save the password: {error:#}");
+            }
+        });
+        self._tasks.push(task);
+    }
+
+    fn start_password_prompt(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = new_password_editor(window, cx);
+        editor.focus_handle(cx).focus(window, cx);
+        self.password_prompt = Some((index, editor));
+        cx.notify();
+    }
+
+    fn confirm_password_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((index, editor)) = self.password_prompt.take() else {
+            return;
+        };
+        let password = editor.read(cx).text(cx);
+        if let Some(config) = self.store.read(cx).get(index).cloned() {
+            self.save_password(&config, password, cx);
+            // Drop the open driver so the next click reconnects with the new password instead
+            // of keeping the session that was authenticated with the old one.
+            if let Some(state) = self.states.get_mut(index) {
+                state.driver = None;
+                state.children.clear();
+                state.expanded.clear();
+                state.error = None;
             }
         }
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -406,6 +489,15 @@ impl QuarryPanel {
                                 .color(Color::Info),
                         )
                     })
+                    .child(div().flex_1())
+                    .child(
+                        IconButton::new(("quarry-password", index), IconName::Lock)
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(|_, cx| Tooltip::simple("Set Password", cx))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.start_password_prompt(index, window, cx);
+                            })),
+                    )
                     .on_click(cx.listener(move |this, _, _window, cx| {
                         this.connect(index, cx);
                     })),
@@ -507,23 +599,58 @@ impl Render for QuarryPanel {
                             })),
                     ),
             )
-            .children(self.new_connection.clone().map(|editor| {
+            .children(self.draft.as_ref().map(|draft| {
                 v_flex()
                     .w_full()
                     .px_2()
                     .py_1()
                     .gap_0p5()
-                    .child(editor)
+                    .child(draft.url.clone())
+                    .child(draft.password.clone())
+                    .children(draft.error.clone().map(|error| {
+                        Label::new(error)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Error)
+                    }))
                     .child(
                         Label::new("Enter to save · a password in the URL is ignored")
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
                     )
-                    .on_action(cx.listener(|this, _: &menu::Confirm, _window, cx| {
-                        this.confirm_adding(cx);
+                    .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                        this.confirm_adding(window, cx);
                     }))
-                    .on_action(cx.listener(|this, _: &menu::Cancel, _window, cx| {
-                        this.new_connection = None;
+                    .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
+                        this.draft = None;
+                        this.focus_handle.focus(window, cx);
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            }))
+            .children(self.password_prompt.as_ref().map(|(index, editor)| {
+                let name = self
+                    .store
+                    .read(cx)
+                    .get(*index)
+                    .map(|config| config.name.clone())
+                    .unwrap_or_default();
+                v_flex()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .gap_0p5()
+                    .child(
+                        Label::new(SharedString::from(format!("Password for {name}")))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(editor.clone())
+                    .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                        this.confirm_password_prompt(window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
+                        this.password_prompt = None;
+                        this.focus_handle.focus(window, cx);
                         cx.notify();
                     }))
                     .into_any_element()
@@ -542,16 +669,13 @@ impl Render for QuarryPanel {
                             .map(|(index, config)| self.render_connection(index, config, cx))
                             .collect::<Vec<_>>(),
                     )
-                    .when(
-                        connections.is_empty() && self.new_connection.is_none(),
-                        |this| {
-                            this.child(
-                                Label::new("No connections yet — use + to add one")
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            )
-                        },
-                    ),
+                    .when(connections.is_empty() && self.draft.is_none(), |this| {
+                        this.child(
+                            Label::new("No connections yet — use + to add one")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                    }),
             )
             .into_any_element()
             .into_any()
