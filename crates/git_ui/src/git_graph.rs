@@ -82,6 +82,8 @@ const TREE_INDENT: f32 = 20.0;
 const TABLE_COLUMN_COUNT: usize = 4;
 const COLUMN_WIDTHS_KEY: &str = "git_graph_column_widths";
 const COLUMN_WIDTHS_PATH_HISTORY_KEY: &str = "git_graph_path_history_column_widths";
+const DETAIL_PANEL_POSITION_KEY: &str = "git_graph_detail_panel_position";
+const DETAIL_PANEL_RATIOS_KEY: &str = "git_graph_detail_panel_ratios";
 const ROW_VERTICAL_PADDING: Pixels = px(4.0);
 
 struct CopiedState {
@@ -538,47 +540,103 @@ struct SearchState {
     selected_index: Option<usize>,
 }
 
+/// Which edge of the graph the commit detail panel is docked to. `Right` splits the tab
+/// horizontally (panel beside the commits), `Bottom` splits it vertically (panel underneath),
+/// which suits wide-but-short windows and long commit messages.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum DetailPanelPosition {
+    #[default]
+    Right,
+    Bottom,
+}
+
+impl DetailPanelPosition {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Right => Self::Bottom,
+            Self::Bottom => Self::Right,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Right => "right",
+            Self::Bottom => "bottom",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "right" => Some(Self::Right),
+            "bottom" => Some(Self::Bottom),
+            _ => None,
+        }
+    }
+}
+
+/// Ratios are expressed along whichever axis the split currently runs, so the same state drives
+/// both a side-by-side and a stacked layout. `main` is the graph side, `detail` the panel side.
 struct SplitState {
-    left_ratio: f32,
-    visible_left_ratio: f32,
+    main_ratio: f32,
+    visible_main_ratio: f32,
 }
 
 impl SplitState {
     fn new() -> Self {
         Self {
-            left_ratio: 1.0,
-            visible_left_ratio: 1.0,
+            main_ratio: 1.0,
+            visible_main_ratio: 1.0,
         }
     }
 
-    fn right_ratio(&self) -> f32 {
-        1.0 - self.visible_left_ratio
+    fn detail_ratio(&self) -> f32 {
+        1.0 - self.visible_main_ratio
+    }
+
+    fn main_ratio(&self) -> f32 {
+        self.main_ratio
+    }
+
+    /// Jumps straight to a ratio, for restoring a split saved in an earlier session or when
+    /// switching the panel to an axis that already has a remembered size.
+    fn set_ratio(&mut self, ratio: f32) {
+        self.main_ratio = ratio;
+        self.visible_main_ratio = ratio;
     }
 
     fn on_drag_move(
         &mut self,
         drag_event: &DragMoveEvent<DraggedSplitHandle>,
+        position: DetailPanelPosition,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
         let drag_position = drag_event.event.position;
         let bounds = drag_event.bounds;
-        let bounds_width = bounds.right() - bounds.left();
 
         let min_ratio = 0.1;
         let max_ratio = 0.9;
 
-        let new_ratio = (drag_position.x - bounds.left()) / bounds_width;
-        self.visible_left_ratio = new_ratio.clamp(min_ratio, max_ratio);
+        let new_ratio = match position {
+            DetailPanelPosition::Right => {
+                let width = bounds.right() - bounds.left();
+                (drag_position.x - bounds.left()) / width
+            }
+            DetailPanelPosition::Bottom => {
+                let height = bounds.bottom() - bounds.top();
+                (drag_position.y - bounds.top()) / height
+            }
+        };
+        self.visible_main_ratio = new_ratio.clamp(min_ratio, max_ratio);
     }
 
     fn commit_ratio(&mut self) {
-        self.left_ratio = self.visible_left_ratio;
+        self.main_ratio = self.visible_main_ratio;
     }
 
     fn on_double_click(&mut self) {
-        self.left_ratio = 1.0;
-        self.visible_left_ratio = 1.0;
+        self.main_ratio = 1.0;
+        self.visible_main_ratio = 1.0;
     }
 }
 
@@ -599,6 +657,8 @@ actions!(
         ScrollDown,
         /// Toggles the selected commit's changed files between flat and tree views.
         ToggleChangedFilesView,
+        /// Moves the commit detail panel between the right side and the bottom.
+        ToggleDetailPanelPosition,
     ]
 );
 
@@ -1480,6 +1540,10 @@ pub struct GitGraph {
     repo_id: RepositoryId,
     changed_files_scroll_handle: UniformListScrollHandle,
     changed_files_view_mode: ChangedFilesViewMode,
+    commit_details_position: DetailPanelPosition,
+    /// Split ratio per panel position, so the width chosen on the right and the height
+    /// chosen at the bottom are remembered independently.
+    commit_details_split_ratios: HashMap<String, f32>,
     commit_details_metadata_collapsed: bool,
     commit_details_message_collapsed: bool,
     changed_files_expanded_dirs: HashMap<RepoPath, bool>,
@@ -1746,6 +1810,8 @@ impl GitGraph {
             repo_id,
             changed_files_scroll_handle: UniformListScrollHandle::new(),
             changed_files_view_mode: ChangedFilesViewMode::default(),
+            commit_details_position: Self::restore_detail_panel_position(cx),
+            commit_details_split_ratios: Self::restore_split_ratios(cx),
             commit_details_metadata_collapsed: false,
             commit_details_message_collapsed: false,
             changed_files_expanded_dirs: HashMap::default(),
@@ -1753,8 +1819,102 @@ impl GitGraph {
             nav_history: None,
         };
 
+        this.apply_saved_split_ratio(cx);
         this.fetch_initial_graph_data(cx);
         this
+    }
+
+    /// Like the column widths, the detail panel position is global and survives restarts, so the
+    /// layout chosen once applies to every git graph opened afterwards. An unreadable or
+    /// unrecognised value falls back to the default rather than failing to open the graph.
+    fn restore_detail_panel_position(cx: &App) -> DetailPanelPosition {
+        KeyValueStore::global(cx)
+            .read_kvp(DETAIL_PANEL_POSITION_KEY)
+            .log_err()
+            .flatten()
+            .and_then(|value| DetailPanelPosition::from_str(&value))
+            .unwrap_or_default()
+    }
+
+    fn restore_split_ratios(cx: &App) -> HashMap<String, f32> {
+        KeyValueStore::global(cx)
+            .read_kvp(DETAIL_PANEL_RATIOS_KEY)
+            .log_err()
+            .flatten()
+            .and_then(|json| serde_json::from_str::<HashMap<String, f32>>(&json).log_err())
+            .map(|mut ratios| {
+                // A ratio outside the range the divider itself allows would wedge the panel
+                // open or shut with no way to drag it back, so drop anything unusable.
+                ratios.retain(|_, ratio| ratio.is_finite() && (0.1..=1.0).contains(ratio));
+                ratios
+            })
+            .unwrap_or_default()
+    }
+
+    fn apply_saved_split_ratio(&mut self, cx: &mut Context<Self>) {
+        let Some(ratio) = self
+            .commit_details_split_ratios
+            .get(self.commit_details_position.as_str())
+            .copied()
+        else {
+            return;
+        };
+        self.commit_details_split_state.update(cx, |state, _| {
+            state.set_ratio(ratio);
+        });
+    }
+
+    /// Records where the divider was left for the current position and writes every remembered
+    /// ratio back out. Called once a drag settles, not while it is moving.
+    fn persist_split_ratio(&mut self, cx: &mut Context<Self>) {
+        let ratio = self.commit_details_split_state.read(cx).main_ratio();
+        if !ratio.is_finite() {
+            return;
+        }
+        // Re-read before writing: another git graph holds its own copy of this map, and writing
+        // ours wholesale would drop whatever axis that one has since saved. The stored map wins
+        // over our in-memory copy, which may itself be stale; only the entry being changed here
+        // is ours to impose. Our earlier drags are already in the store.
+        let mut ratios = Self::restore_split_ratios(cx);
+        ratios.insert(self.commit_details_position.as_str().to_string(), ratio);
+        self.commit_details_split_ratios = ratios;
+
+        let Some(json) = serde_json::to_string(&self.commit_details_split_ratios).log_err() else {
+            return;
+        };
+        let kvp = KeyValueStore::global(cx);
+        cx.background_spawn(async move {
+            kvp.write_kvp(DETAIL_PANEL_RATIOS_KEY.to_string(), json)
+                .await
+                .log_err()
+        })
+        .detach();
+    }
+
+    fn toggle_detail_panel_position(
+        &mut self,
+        _: &ToggleDetailPanelPosition,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Save where the divider sits on the axis being left, so returning to it restores that
+        // size rather than whatever the other axis happened to use.
+        self.persist_split_ratio(cx);
+        self.commit_details_position = self.commit_details_position.toggled();
+        self.commit_details_split_state.update(cx, |state, _| {
+            state.set_ratio(1.0);
+        });
+        self.apply_saved_split_ratio(cx);
+
+        let value = self.commit_details_position.as_str().to_string();
+        let kvp = KeyValueStore::global(cx);
+        cx.background_spawn(async move {
+            kvp.write_kvp(DETAIL_PANEL_POSITION_KEY.to_string(), value)
+                .await
+                .log_err()
+        })
+        .detach();
+        cx.notify();
     }
 
     /// Column widths are global rather than per item: the widths last dragged in any git graph
@@ -3212,11 +3372,13 @@ impl GitGraph {
             }));
 
         v_flex()
-            .min_w(px(300.))
-            .h_full()
+            .map(|this| match self.commit_details_position {
+                DetailPanelPosition::Right => this.min_w(px(300.)).h_full(),
+                DetailPanelPosition::Bottom => this.min_h(px(160.)).w_full(),
+            })
             .bg(cx.theme().colors().editor_background)
             .flex_basis(DefiniteLength::Fraction(
-                self.commit_details_split_state.read(cx).right_ratio(),
+                self.commit_details_split_state.read(cx).detail_ratio(),
             ))
             .child(
                 v_flex()
@@ -3225,20 +3387,53 @@ impl GitGraph {
                     .p_2()
                     .gap_2()
                     .child(
-                        div().absolute().top_2().right_2().child(
-                            IconButton::new("close-detail", IconName::Close)
+                        h_flex()
+                            .absolute()
+                            .top_2()
+                            .right_2()
+                            .gap_0p5()
+                            .child(
+                                IconButton::new(
+                                    "toggle-detail-position",
+                                    match self.commit_details_position {
+                                        DetailPanelPosition::Right => IconName::Split,
+                                        DetailPanelPosition::Bottom => IconName::SplitAlt,
+                                    },
+                                )
                                 .icon_size(IconSize::Small)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.selected_entry_idx = None;
-                                    this.selected_commit_diff = None;
-                                    this.selected_commit_diff_stats = None;
-                                    this.selected_commit_message = None;
-                                    this._selected_commit_message_task = None;
-                                    this.changed_files_expanded_dirs.clear();
-                                    this._commit_diff_task = None;
-                                    cx.notify();
-                                })),
-                        ),
+                                .tooltip({
+                                    let label = match self.commit_details_position {
+                                        DetailPanelPosition::Right => "Move Panel to Bottom",
+                                        DetailPanelPosition::Bottom => "Move Panel to Right",
+                                    };
+                                    move |_, cx| {
+                                        Tooltip::for_action(label, &ToggleDetailPanelPosition, cx)
+                                    }
+                                })
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.toggle_detail_panel_position(
+                                            &ToggleDetailPanelPosition,
+                                            window,
+                                            cx,
+                                        );
+                                    },
+                                )),
+                            )
+                            .child(
+                                IconButton::new("close-detail", IconName::Close)
+                                    .icon_size(IconSize::Small)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.selected_entry_idx = None;
+                                        this.selected_commit_diff = None;
+                                        this.selected_commit_diff_stats = None;
+                                        this.selected_commit_message = None;
+                                        this._selected_commit_message_task = None;
+                                        this.changed_files_expanded_dirs.clear();
+                                        this._commit_diff_task = None;
+                                        cx.notify();
+                                    })),
+                            ),
                     )
                     .child(
                         div().absolute().top_2().left_2().child(
@@ -4264,27 +4459,41 @@ impl GitGraph {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let position = self.commit_details_position;
         div()
             .id("commit-view-split-resize-container")
             .relative()
-            .h_full()
             .flex_shrink_0()
-            .w(px(1.))
+            .map(|this| match position {
+                // The divider is a one-pixel line across the full span of the shared edge.
+                DetailPanelPosition::Right => this.h_full().w(px(1.)),
+                DetailPanelPosition::Bottom => this.w_full().h(px(1.)),
+            })
             .bg(cx.theme().colors().border_variant)
             .child(
                 div()
                     .id("commit-view-split-resize-handle")
                     .absolute()
-                    .left(px(-RESIZE_HANDLE_WIDTH / 2.0))
-                    .w(px(RESIZE_HANDLE_WIDTH))
-                    .h_full()
-                    .cursor_col_resize()
+                    // The grab area straddles the line so it stays easy to hit from both sides.
+                    .map(|this| match position {
+                        DetailPanelPosition::Right => this
+                            .left(px(-RESIZE_HANDLE_WIDTH / 2.0))
+                            .w(px(RESIZE_HANDLE_WIDTH))
+                            .h_full()
+                            .cursor_col_resize(),
+                        DetailPanelPosition::Bottom => this
+                            .top(px(-RESIZE_HANDLE_WIDTH / 2.0))
+                            .h(px(RESIZE_HANDLE_WIDTH))
+                            .w_full()
+                            .cursor_row_resize(),
+                    })
                     .block_mouse_except_scroll()
                     .on_click(cx.listener(|this, event: &ClickEvent, _window, cx| {
                         if event.click_count() >= 2 {
                             this.commit_details_split_state.update(cx, |state, _| {
                                 state.on_double_click();
                             });
+                            this.persist_split_ratio(cx);
                         }
                         cx.stop_propagation();
                     }))
@@ -4444,12 +4653,18 @@ impl Render for GitGraph {
             let graph_content_width = self.graph_canvas_content_width();
             let gutter_width = self.ref_label_gutter_width(window, cx);
 
-            h_flex()
+            div()
+                .flex()
+                .map(|this| match self.commit_details_position {
+                    DetailPanelPosition::Right => this.flex_row(),
+                    DetailPanelPosition::Bottom => this.flex_col(),
+                })
                 .size_full()
                 .child(
                     v_flex()
                         .flex_1()
                         .min_w_0()
+                        .min_h_0()
                         .size_full()
                         .flex()
                         .flex_col()
@@ -4727,14 +4942,16 @@ impl Render for GitGraph {
                         }),
                 )
                 .on_drag_move::<DraggedSplitHandle>(cx.listener(|this, event, window, cx| {
+                    let position = this.commit_details_position;
                     this.commit_details_split_state.update(cx, |state, cx| {
-                        state.on_drag_move(event, window, cx);
+                        state.on_drag_move(event, position, window, cx);
                     });
                 }))
                 .on_drop::<DraggedSplitHandle>(cx.listener(|this, _event, _window, cx| {
                     this.commit_details_split_state.update(cx, |state, _cx| {
                         state.commit_ratio();
                     });
+                    this.persist_split_ratio(cx);
                 }))
                 .when(self.selected_entry_idx.is_some(), |this| {
                     this.child(self.render_commit_view_resize_handle(window, cx))
@@ -4750,6 +4967,7 @@ impl Render for GitGraph {
             .on_action(cx.listener(|this, _: &OpenCommitView, window, cx| {
                 this.open_selected_commit_view(window, cx);
             }))
+            .on_action(cx.listener(Self::toggle_detail_panel_position))
             .on_action(cx.listener(Self::copy_selected_commit_sha))
             .on_action(cx.listener(Self::copy_selected_commit_tag))
             .on_action(cx.listener(Self::cancel))
