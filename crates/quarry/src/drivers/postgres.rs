@@ -1,6 +1,6 @@
 use crate::driver::{Driver, ObjectKind, ObjectNode, ResultSet};
 use anyhow::{Context as _, Result, bail};
-use sqlx::{Column as _, Row as _, ValueRef as _, postgres::PgPoolOptions};
+use sqlx::{Column as _, Executor as _, Row as _, ValueRef as _, postgres::PgPoolOptions};
 use ui::SharedString;
 
 pub struct PostgresDriver {
@@ -132,7 +132,32 @@ impl PostgresDriver {
             .fetch_all(&pool)
             .await
             .with_context(|| format!("running: {}", sql.trim()))?;
-        Ok(to_result_set(rows, row_limit))
+
+        if !rows.is_empty() {
+            return Ok(to_result_set(rows, row_limit));
+        }
+
+        // An empty result still has a shape. Rows are the only place the simple query protocol
+        // carries column names, so with none returned the grid would be blank even though the
+        // table has columns -- indistinguishable, to the user, from the query having failed.
+        // `describe` asks the server for the statement's result columns directly.
+        let columns = match pool.describe(sql).await {
+            Ok(described) => described
+                .columns()
+                .iter()
+                .map(|column| SharedString::from(column.name().to_string()))
+                .collect(),
+            // describe prepares the statement, which rejects the multi-statement input the
+            // simple protocol allows. Nothing is lost: the result was empty either way.
+            Err(error) => {
+                log::debug!("quarry: could not describe {sql:?}: {error}");
+                Vec::new()
+            }
+        };
+        Ok(ResultSet {
+            columns,
+            ..ResultSet::default()
+        })
     }
 
     async fn fetch(&self, sql: &str, row_limit: usize) -> Result<ResultSet> {
