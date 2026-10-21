@@ -1,0 +1,37 @@
+[package]
+name = "quarry"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+name = "quarry"
+path = "src/quarry.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+gpui.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ui.workspace = true
+util.workspace = true
+
+# Drivers are added one engine at a time rather than up front: each is a sizeable dependency
+# tree and this fork's build loop is tuned for short rebuilds.
+#
+# Every driver here is written against tokio, while gpui runs on smol. They are confined to the
+# runtime owned by `runtime.rs` and must never be awaited on a gpui executor.
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls", "json"] }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
