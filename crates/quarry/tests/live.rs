@@ -64,7 +64,13 @@ fn postgres() {
             "localhost",
             54322,
             Some("app"),
-            Some("app"),
+            // Overridable so the same test can be run as a user with rights to every database,
+            // which is the only way the preview path gets covered on a real server.
+            Some(
+                std::env::var("QUARRY_PG_USER")
+                    .unwrap_or_else(|_| "app".into())
+                    .as_str(),
+            ),
             std::env::var("QUARRY_PG_PASSWORD").ok().as_deref(),
         )
         .await
@@ -131,19 +137,55 @@ fn postgres_preview() {
             "localhost",
             54322,
             Some("app"),
-            Some("app"),
+            // Overridable so the same test can be run as a user with rights to every database,
+            // which is the only way the preview path gets covered on a real server.
+            Some(
+                std::env::var("QUARRY_PG_USER")
+                    .unwrap_or_else(|_| "app".into())
+                    .as_str(),
+            ),
             std::env::var("QUARRY_PG_PASSWORD").ok().as_deref(),
         )
         .await
         .expect("connecting");
-        let tables = driver.children(&path(&["public"])).await.expect("tables");
-        let Some(first) = tables.first() else {
-            println!("no tables in public");
-            return;
-        };
-        match driver.preview(&first.path, 5).await {
-            Ok(result) => println!("{} -> {:?}", first.name, result.columns),
-            Err(error) => println!("ERROR: {error:#}"),
+        // Try tables until one can actually be read. Browsing a server usually means seeing
+        // databases the connected user has no rights in, so a permission denial is a fact about
+        // the environment, not a defect in the driver, and must not be reported as a failure.
+        let mut attempted = 0usize;
+        let mut denied = 0usize;
+        'search: for database in driver.children(&[]).await.expect("databases") {
+            for schema in driver.children(&database.path).await.unwrap_or_default() {
+                for table in driver.children(&schema.path).await.unwrap_or_default() {
+                    attempted += 1;
+                    match driver.preview(&table.path, 5).await {
+                        Ok(result) => {
+                            println!(
+                                "{} -> {} columns, {} rows",
+                                table.path.join("."),
+                                result.columns.len(),
+                                result.rows.len()
+                            );
+                            assert!(
+                                !result.columns.is_empty(),
+                                "preview returned no columns for {}",
+                                table.path.join(".")
+                            );
+                            return;
+                        }
+                        Err(error) if format!("{error:#}").contains("permission denied") => {
+                            denied += 1;
+                        }
+                        Err(error) => panic!("preview failed on {}: {error:#}", table.path.join(".")),
+                    }
+                    if attempted >= 25 {
+                        break 'search;
+                    }
+                }
+            }
         }
+
+        println!(
+            "preview not exercised: {attempted} tables tried, {denied} denied to this user.              Connect as a user with rights (the cluster's superuser) to cover this path."
+        );
     });
 }
