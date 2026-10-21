@@ -864,6 +864,11 @@ spin = { version = "0.10", default-features = false, features = ["mutex", "spin_
 smol = "2.0"
 sqlformat = "0.2"
 sqlx = { version = "0.8", default-features = false }
+# Quarry's engine drivers. Each is tokio-based and is confined to Quarry's own runtime.
+mongodb = "3"
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "keep-alive"] }
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "rustls", "chrono", "winauth"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 stacksafe = "1.0"
 streaming-iterator = "0.1"
 strsim = "0.11"
