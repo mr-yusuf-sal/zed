@@ -1,4 +1,4 @@
-use std::{future::IntoFuture, path::Path, time::Duration};
+use std::{cell::Cell, future::IntoFuture, path::Path, rc::Rc, time::Duration};
 
 use super::*;
 use editor::{Editor, SelectionEffects};
@@ -4886,6 +4886,101 @@ async fn test_no_seed_query_when_setting_disabled(cx: &mut TestAppContext) {
         assert_eq!(finder.delegate.matches.len(), 1);
         assert_match_at_position(finder, 0, "the_quick.rs");
     });
+}
+
+#[gpui::test]
+async fn test_quick_open_prefix_hands_off_to_command_palette(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(path!("/src"), json!({ "main.rs": "" }))
+        .await;
+
+    let project = Project::test(app_state.fs.clone(), [path!("/src").as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    let command_palette_toggled = Rc::new(Cell::new(false));
+    workspace.update(cx, |workspace, _| {
+        let command_palette_toggled = command_palette_toggled.clone();
+        workspace.register_action(move |_, _: &zed_actions::command_palette::Toggle, _, _| {
+            command_palette_toggled.set(true);
+        });
+    });
+
+    open_file_picker(&workspace, cx);
+    simulate_input(cx, ">");
+
+    assert!(command_palette_toggled.get());
+    workspace.read_with(cx, |workspace, cx| {
+        assert!(workspace.active_modal::<FileFinder>(cx).is_none());
+    });
+}
+
+#[gpui::test]
+async fn test_editor_quick_open_prefix_needs_an_editor(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(path!("/src"), json!({ "main.rs": "" }))
+        .await;
+
+    let project = Project::test(app_state.fs.clone(), [path!("/src").as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    // With no editor open there is no outline to show, so `@` stays a file query.
+    let picker = open_file_picker(&workspace, cx);
+    simulate_input(cx, "@");
+
+    assert_eq!(picker.read_with(cx, |picker, cx| picker.query(cx)), "@");
+    workspace.read_with(cx, |workspace, cx| {
+        assert!(workspace.active_modal::<FileFinder>(cx).is_some());
+    });
+}
+
+#[gpui::test]
+async fn test_seed_query_with_quick_open_prefix_stays_in_file_finder(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(path!("/src"), json!({ "main.c": "#include" }))
+        .await;
+
+    let project = Project::test(app_state.fs.clone(), [path!("/src").as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    open_queried_buffer("main", 1, "main.c", &workspace, cx).await;
+    select_range_in_active_editor(&workspace, cx, Point::new(0, 0)..Point::new(0, 8));
+
+    let project_symbols_toggled = Rc::new(Cell::new(false));
+    workspace.update(cx, |workspace, _| {
+        let project_symbols_toggled = project_symbols_toggled.clone();
+        workspace.register_action(move |_, _: &workspace::ToggleProjectSymbols, _, _| {
+            project_symbols_toggled.set(true);
+        });
+    });
+
+    cx.dispatch_action(ToggleFileFinder {
+        separate_history: true,
+        include_ignored: None,
+    });
+    cx.executor().advance_clock(SEARCH_DEBOUNCE);
+    cx.run_until_parked();
+
+    let picker = active_file_picker(&workspace, cx);
+    assert_eq!(
+        picker.read_with(cx, |picker, cx| picker.query(cx)),
+        "#include"
+    );
+    assert!(!project_symbols_toggled.get());
 }
 
 #[test]

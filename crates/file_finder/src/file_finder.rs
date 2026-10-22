@@ -229,6 +229,7 @@ impl FileFinder {
         picker.update(cx, |picker, cx| {
             picker.delegate.focus_handle = picker_focus_handle.clone();
             if let Some(seed_query) = seed_query {
+                picker.delegate.seed_query = Some(seed_query.clone());
                 picker.set_query(&seed_query, window, cx);
                 picker.select_query(window, cx);
             }
@@ -432,6 +433,44 @@ pub struct FileFinderDelegate {
     include_ignored: Option<bool>,
     include_ignored_refresh: Task<()>,
     debounce_next_refresh: bool,
+    /// A query pre-filled from the editor selection must not switch pickers: a selected
+    /// `#include` would otherwise open project symbols the moment the finder appears.
+    seed_query: Option<String>,
+}
+
+/// Pickers that the file finder hands off to when the query starts with their
+/// prefix character, mirroring VS Code's quick open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuickOpenMode {
+    Commands,
+    OutlineSymbols,
+    ProjectSymbols,
+    GoToLine,
+}
+
+impl QuickOpenMode {
+    fn for_query(query: &str) -> Option<Self> {
+        match query.chars().next()? {
+            '>' => Some(Self::Commands),
+            '@' => Some(Self::OutlineSymbols),
+            '#' => Some(Self::ProjectSymbols),
+            ':' => Some(Self::GoToLine),
+            _ => None,
+        }
+    }
+
+    fn needs_editor(self) -> bool {
+        matches!(self, Self::OutlineSymbols | Self::GoToLine)
+    }
+
+    fn action(self) -> Box<dyn Action> {
+        match self {
+            Self::Commands => Box::new(zed_actions::command_palette::Toggle),
+            Self::OutlineSymbols => Box::new(zed_actions::outline::ToggleOutline),
+            Self::ProjectSymbols => Box::new(workspace::ToggleProjectSymbols),
+            Self::GoToLine => Box::new(editor::actions::ToggleGoToLine),
+        }
+    }
 }
 
 /// Use a custom ordering for file finder: the regular one
@@ -1047,7 +1086,38 @@ impl FileFinderDelegate {
             include_ignored: include_ignored.or(FileFinderSettings::get_global(cx).include_ignored),
             include_ignored_refresh: Task::ready(()),
             debounce_next_refresh: false,
+            seed_query: None,
         }
+    }
+
+    /// Returns whether the file finder is being replaced by the picker for `mode`.
+    fn switch_to_quick_open_mode(
+        &self,
+        mode: QuickOpenMode,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> bool {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return false;
+        };
+        let editor = workspace.read(cx).active_item_as::<Editor>(cx);
+        if mode.needs_editor() && editor.is_none() {
+            return false;
+        }
+
+        // The picker is mid-update here, so dismissing it has to wait.
+        window.defer(cx, move |window, cx| {
+            workspace.update(cx, |workspace, cx| workspace.hide_modal(window, cx));
+            // Outline and go-to-line are editor actions, but dismissing the finder returns
+            // focus to wherever it was opened from, which may be a terminal or a panel.
+            if mode.needs_editor()
+                && let Some(editor) = editor
+            {
+                window.focus(&editor.focus_handle(cx), cx);
+            }
+            window.dispatch_action(mode.action(), cx);
+        });
+        true
     }
 
     fn subscribe_to_updates(
@@ -1928,6 +1998,13 @@ impl PickerDelegate for FileFinderDelegate {
     ) -> Task<()> {
         let debounce_refresh = mem::take(&mut self.debounce_next_refresh);
         let raw_query = raw_query.trim();
+
+        if self.seed_query.as_deref() != Some(raw_query)
+            && let Some(mode) = QuickOpenMode::for_query(raw_query)
+            && self.switch_to_quick_open_mode(mode, window, cx)
+        {
+            return Task::ready(());
+        }
 
         let raw_query = match &raw_query.get(0..2) {
             Some(".\\" | "./") => &raw_query[2..],
