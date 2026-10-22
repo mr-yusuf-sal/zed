@@ -55,8 +55,8 @@ impl Engine {
 pub struct ObjectNode {
     pub name: SharedString,
     pub kind: ObjectKind,
-    /// Driver-defined address of this node, passed back to `children` and `preview`. Opaque to
-    /// the UI so engines can encode whatever they need (schema-qualified names, key prefixes).
+    /// Driver-defined address of this node, passed back to `children`, `preview` and
+    /// `definition`. Opaque to the UI so engines can encode whatever they need.
     pub path: Vec<SharedString>,
     pub has_children: bool,
     /// Shown dimmed after the name: a row count, a column type, a Redis value type.
@@ -72,7 +72,29 @@ pub enum ObjectKind {
     Column,
     Index,
     Collection,
+    /// A Redis key that holds a value. A key that is also a prefix of other keys stays a `Key`
+    /// and has children.
     Key,
+    /// A grouping with no value of its own, such as a Redis key prefix.
+    Folder,
+    /// A function or stored procedure.
+    Routine,
+    Sequence,
+}
+
+impl ObjectKind {
+    /// Whether double-clicking the node opens its data in a tab.
+    pub fn is_previewable(self) -> bool {
+        matches!(
+            self,
+            ObjectKind::Table | ObjectKind::View | ObjectKind::Collection | ObjectKind::Key
+        )
+    }
+
+    /// Whether the node has source text that can be opened in a query tab.
+    pub fn has_definition(self) -> bool {
+        matches!(self, ObjectKind::Routine | ObjectKind::View)
+    }
 }
 
 /// A grid of already-stringified values. Drivers do the type conversion because only they know
@@ -89,6 +111,9 @@ pub struct ResultSet {
     /// Server-side notices worth surfacing (Postgres NOTICE, ClickHouse warnings).
     pub notices: Vec<SharedString>,
     pub truncated: bool,
+    /// Present when every row came from one table, collection or key and can be addressed for
+    /// an update. `None` makes the result read-only.
+    pub edit_target: Option<EditTarget>,
 }
 
 impl ResultSet {
@@ -98,10 +123,46 @@ impl ResultSet {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EditTarget {
+    /// The tree path of the object the rows came from, exactly as it was passed to `preview`.
+    pub path: Vec<SharedString>,
+    /// Indexes into `ResultSet::columns` that together identify a row.
+    pub key_columns: Vec<usize>,
+    /// Indexes into `ResultSet::columns` that can be shown but not changed.
+    pub read_only_columns: Vec<usize>,
+}
+
+/// One cell change, built by the UI from an [`EditTarget`] and handed back to the driver that
+/// produced it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CellEdit {
+    /// `EditTarget::path` of the result the cell is in.
+    pub path: Vec<SharedString>,
+    /// The edited row's key: each key column's name and its value as displayed.
+    pub key: Vec<(SharedString, Option<SharedString>)>,
+    pub column: SharedString,
+    /// The new value as typed. `None` sets NULL.
+    pub value: Option<String>,
+}
+
+/// A name the query editor offers as a completion. Keywords and commands are not here: they
+/// are static per engine and live in `completion.rs`. This is what only the server knows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogEntry {
+    pub label: SharedString,
+    /// `Database`, `Schema`, `Table`, `View`, `Column`, `Collection`, `Key` or `Routine`.
+    pub kind: ObjectKind,
+    /// The schema of a table, the table of a column, the database of a collection.
+    pub parent: Option<SharedString>,
+    /// A column's type, a key's value type.
+    pub detail: Option<SharedString>,
+}
+
 /// How a driver reaches its server. Passwords are deliberately absent: they live in the OS
 /// credential store and are fetched just before connecting, so a config can be serialised to
 /// disk without carrying a secret.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ConnectionConfig {
     pub name: String,
     pub engine: Engine,
@@ -138,15 +199,59 @@ impl fmt::Display for ConnectionConfig {
 
 /// Implemented once per engine. Every method runs on the Quarry tokio runtime, never on a gpui
 /// executor, so implementations are free to use driver crates that demand tokio.
+///
+/// A future returned by any of these may be dropped part-way through: that is how a query is
+/// cancelled. Implementations must leave the driver usable afterwards, reconnecting on next
+/// use if the protocol cannot recover from an abandoned request.
 #[async_trait::async_trait]
 pub trait Driver: Send + Sync {
-    /// Lists the children of `path`. An empty path asks for the top level, which is databases
-    /// for MongoDB and ClickHouse, schemas for the SQL servers, and key prefixes for Redis.
+    /// Lists the children of `path`. An empty path asks for the top level.
     async fn children(&self, path: &[SharedString]) -> Result<Vec<ObjectNode>>;
 
-    /// Runs whatever the user typed. The driver decides what that means for its engine.
-    async fn query(&self, text: &str, row_limit: usize) -> Result<ResultSet>;
+    /// Runs one statement — the caller has already split the editor text — against
+    /// `database`, or the connection's default when `None`. Returns every result set the
+    /// statement produced, in order. A statement that changes data instead of returning it
+    /// yields one `ResultSet` with `rows_affected` set and no columns.
+    async fn query(
+        &self,
+        statement: &str,
+        database: Option<&str>,
+        row_limit: usize,
+    ) -> Result<Vec<ResultSet>>;
 
-    /// The first page of a table or collection, for double-clicking an object in the tree.
+    /// The first page of a table, collection or key, for double-clicking it in the tree. Sets
+    /// `edit_target` when the rows can be updated in place.
     async fn preview(&self, path: &[SharedString], row_limit: usize) -> Result<ResultSet>;
+
+    /// Asks the server to stop whatever this driver is currently running. Best effort: the
+    /// caller also drops the future that is running it.
+    async fn cancel(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// The databases the query editor can be pointed at, for its database picker. Empty when
+    /// the engine has only one namespace per connection.
+    async fn databases(&self) -> Result<Vec<SharedString>>;
+
+    /// The database queries run in when the editor has not picked one.
+    fn default_database(&self) -> Option<SharedString>;
+
+    /// Names in `database` (or the default) for the editor's completions: schemas, tables,
+    /// views, columns, routines, collections, keys. Expected to be capped so a huge catalog
+    /// costs a bounded amount.
+    async fn catalog(&self, database: Option<&str>) -> Result<Vec<CatalogEntry>>;
+
+    /// Source text of a view or routine, opened in a query tab.
+    async fn definition(&self, path: &[SharedString]) -> Result<String> {
+        anyhow::bail!("{} has no definition to show", path.join("."))
+    }
+
+    /// Applies one cell change and returns how many rows it touched. Implementations must
+    /// refuse rather than guess when the key does not identify the row.
+    async fn update_cell(&self, edit: &CellEdit) -> Result<u64> {
+        anyhow::bail!(
+            "editing {} is not supported for this engine",
+            edit.path.join(".")
+        )
+    }
 }

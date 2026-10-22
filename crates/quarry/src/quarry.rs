@@ -4,6 +4,7 @@
 //! The engine-specific parts live behind [`driver::Driver`]. Everything above that — the tree,
 //! the query view, credential handling — is written once and knows nothing about Postgres.
 
+pub mod completion;
 pub mod connection_store;
 pub mod driver;
 pub mod drivers;
@@ -11,6 +12,7 @@ pub mod panel;
 pub mod query_view;
 pub mod result_table;
 pub mod runtime;
+pub mod statements;
 
 use anyhow::{Context as _, Result, anyhow};
 use driver::{ConnectionConfig, Driver, Engine};
@@ -22,6 +24,7 @@ pub fn init(cx: &mut App) {
     QuarryRuntime::init(cx);
     connection_store::ConnectionStore::init(cx);
     panel::init(cx);
+    workspace::register_serializable_item::<query_view::QueryView>(cx);
 }
 
 /// Opens a connection, fetching the password from the OS credential store on the way.
@@ -46,6 +49,35 @@ pub async fn connect(config: ConnectionConfig, cx: &mut gpui::AsyncApp) -> Resul
         .map(|(username, _)| username.clone())
         .or_else(|| config.username.clone());
 
+    open_driver(config, username, password, cx).await
+}
+
+/// Connects with `password` instead of the saved one, for the Test button on the connection
+/// form: the point is to try what was just typed before it is saved anywhere. A blank password
+/// falls back to the saved one, which is what saving the form would do too.
+pub async fn test_connection(
+    config: ConnectionConfig,
+    password: Option<String>,
+    cx: &mut gpui::AsyncApp,
+) -> Result<()> {
+    match password {
+        Some(password) => {
+            let username = config.username.clone();
+            open_driver(config, username, Some(password), cx).await?;
+        }
+        None => {
+            connect(config, cx).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn open_driver(
+    config: ConnectionConfig,
+    username: Option<String>,
+    password: Option<String>,
+    cx: &mut gpui::AsyncApp,
+) -> Result<Arc<dyn Driver>> {
     let runtime = cx
         .update(|cx| QuarryRuntime::global(cx))
         .ok_or_else(|| anyhow!("the Quarry runtime failed to start; see the log"))?;
