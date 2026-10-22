@@ -82,6 +82,8 @@ const TREE_INDENT: f32 = 20.0;
 const TABLE_COLUMN_COUNT: usize = 4;
 const COLUMN_WIDTHS_KEY: &str = "git_graph_column_widths";
 const COLUMN_WIDTHS_PATH_HISTORY_KEY: &str = "git_graph_path_history_column_widths";
+const HIDDEN_COLUMNS_KEY: &str = "git_graph_hidden_columns";
+const HIDDEN_COLUMNS_PATH_HISTORY_KEY: &str = "git_graph_path_history_hidden_columns";
 const DETAIL_PANEL_POSITION_KEY: &str = "git_graph_detail_panel_position";
 const DETAIL_PANEL_RATIOS_KEY: &str = "git_graph_detail_panel_ratios";
 const ROW_VERTICAL_PADDING: Pixels = px(4.0);
@@ -1757,14 +1759,7 @@ impl GitGraph {
             })
         };
         Self::restore_and_persist_column_widths(&column_widths, &log_source, cx);
-        let column_visibility = TableRow::from_element(
-            false,
-            if matches!(log_source, LogSource::Path(_)) {
-                TABLE_COLUMN_COUNT
-            } else {
-                TABLE_COLUMN_COUNT + 1
-            },
-        );
+        let column_visibility = Self::restore_column_visibility(&log_source, cx);
         let mut row_height = Self::row_height(window, cx);
 
         cx.observe_global_in::<settings::SettingsStore>(window, move |this, window, cx| {
@@ -1985,6 +1980,48 @@ impl GitGraph {
                 async move { kvp.write_kvp(key.to_string(), json).await.log_err() },
             )
             .detach();
+        })
+        .detach();
+    }
+
+    fn hidden_columns_key(log_source: &LogSource) -> &'static str {
+        if matches!(log_source, LogSource::Path(_)) {
+            HIDDEN_COLUMNS_PATH_HISTORY_KEY
+        } else {
+            HIDDEN_COLUMNS_KEY
+        }
+    }
+
+    /// Like the column widths, the hidden columns are global: closing a git graph and opening a
+    /// new one keeps the columns hidden last. A restored item still applies its own saved mask
+    /// on top of this.
+    fn restore_column_visibility(log_source: &LogSource, cx: &App) -> TableRow<bool> {
+        let cols = if matches!(log_source, LogSource::Path(_)) {
+            TABLE_COLUMN_COUNT
+        } else {
+            TABLE_COLUMN_COUNT + 1
+        };
+        let saved_mask = KeyValueStore::global(cx)
+            .read_kvp(Self::hidden_columns_key(log_source))
+            .log_err()
+            .flatten()
+            .and_then(|value| value.parse::<i32>().log_err())
+            .map(|bits| persistence::deserialize_hidden_columns(bits, cols))
+            .filter(|mask| mask.iter().any(|is_hidden| !is_hidden));
+        match saved_mask {
+            Some(mask) => TableRow::from_vec(mask, cols),
+            None => TableRow::from_element(false, cols),
+        }
+    }
+
+    fn persist_column_visibility(&self, cx: &mut Context<Self>) {
+        let key = Self::hidden_columns_key(&self.log_source);
+        let bits = persistence::serialize_hidden_columns(self.column_visibility.as_slice());
+        let kvp = KeyValueStore::global(cx);
+        cx.background_spawn(async move {
+            kvp.write_kvp(key.to_string(), bits.to_string())
+                .await
+                .log_err()
         })
         .detach();
     }
@@ -3044,7 +3081,8 @@ impl GitGraph {
     fn toggle_column_visibility(&mut self, col_idx: usize, cx: &mut Context<Self>) {
         if let Some(slot) = self.column_visibility.as_mut_slice().get_mut(col_idx) {
             *slot = !*slot;
-            // Column visibility is persisted per item, so schedule a workspace serialization.
+            self.persist_column_visibility(cx);
+            // Column visibility is also persisted per item, so schedule a workspace serialization.
             cx.emit(ItemEvent::Edit);
         }
     }
