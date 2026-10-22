@@ -3421,6 +3421,7 @@ impl GitGraph {
                 DetailPanelPosition::Right => this.min_w(px(300.)).h_full(),
                 DetailPanelPosition::Bottom => this.min_h(px(160.)).w_full(),
             })
+            .overflow_hidden()
             .bg(cx.theme().colors().editor_background)
             .flex_basis(DefiniteLength::Fraction(
                 self.commit_details_split_state.read(cx).detail_ratio(),
@@ -3703,6 +3704,7 @@ impl GitGraph {
                 v_flex()
                     .min_w_0()
                     .flex_1()
+                    .min_h(px(120.))
                     .overflow_hidden()
                     .child(
                         h_flex()
@@ -4569,17 +4571,15 @@ impl GitGraph {
 
         let collapsed = self.commit_details_message_collapsed;
 
-        div()
-            // Using grid over flexbox because the structure of this side
-            // panel prvents taffy from calculating a concrete width correctly,
-            // which causes problems with text reflow when using flexbox.
-            // grid, on the other hand, doesn't appear to give taffy the same
-            // problems.
+        // A flex column rather than a grid so the message can give up height to
+        // the changed files list: grid rows never shrink below their content,
+        // which let a long message push the file list out of the panel.
+        v_flex()
             .w_full()
+            .min_h_0()
+            .overflow_hidden()
             .py_2()
             .pl_2()
-            .grid()
-            .grid_cols(1)
             .gap_1()
             .child(
                 h_flex()
@@ -4602,18 +4602,33 @@ impl GitGraph {
             )
             .when(!collapsed, |this| {
                 this.child(
-                    div()
+                    v_flex()
                         .relative()
                         .w_full()
+                        .min_h_0()
                         .child(
                             div()
                                 .id("commit-message")
                                 .text_sm()
                                 .w_full()
+                                .min_h_0()
                                 .max_h(line_height * 12.)
                                 .overflow_y_scroll()
                                 .track_scroll(scroll_handle)
-                                .child(MarkdownElement::new(message.clone(), message_style)),
+                                .child(
+                                    // Grid over flexbox because the structure of this side
+                                    // panel prevents taffy from calculating a concrete width
+                                    // correctly, which causes problems with text reflow when
+                                    // using flexbox. Grid doesn't give taffy the same problems.
+                                    div()
+                                        .w_full()
+                                        .grid()
+                                        .grid_cols(1)
+                                        .child(MarkdownElement::new(
+                                            message.clone(),
+                                            message_style,
+                                        )),
+                                ),
                         )
                         .vertical_scrollbar_for(scroll_handle, window, cx),
                 )
