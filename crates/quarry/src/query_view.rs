@@ -325,6 +325,12 @@ impl QueryView {
     }
 
     fn run_all(&mut self, _: &RunAll, _window: &mut Window, cx: &mut Context<Self>) {
+        self.run_everything(cx);
+    }
+
+    /// Runs every statement in the editor, for a tab that was opened to run a statement the
+    /// panel wrote, such as "Select Top 100".
+    pub fn run_everything(&mut self, cx: &mut Context<Self>) {
         let text = self.editor.read(cx).text(cx);
         self.execute(vec![text], cx);
     }

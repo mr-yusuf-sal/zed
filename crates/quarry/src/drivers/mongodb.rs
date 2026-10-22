@@ -154,6 +154,13 @@ fn render(value: &Bson) -> Option<SharedString> {
     }
 }
 
+/// A command as it is typed in the query editor: relaxed extended JSON, so an ObjectId reads
+/// `{"$oid": ...}` and runs back as one, pretty-printed without blank lines, which would split it.
+fn to_json(document: Document) -> String {
+    let json = Bson::Document(document).into_relaxed_extjson();
+    serde_json::to_string_pretty(&json).unwrap_or_else(|_| json.to_string())
+}
+
 /// Reads text typed into a cell back into BSON: extended JSON when it parses, so `42`, `true`,
 /// `{"a": 1}` and `{"$oid": "..."}` keep their types, and a plain string otherwise.
 fn parse_value(text: &str) -> Bson {
@@ -474,6 +481,87 @@ impl Driver for MongoDriver {
             }
         }
         Ok(entries)
+    }
+
+    /// The commands that recreate the collection: `create` with whatever options it has (a
+    /// validator, capping, a view's pipeline), then `createIndexes` for every index but `_id_`,
+    /// which `create` makes itself.
+    async fn create_script(&self, path: &[SharedString]) -> Result<String> {
+        let [database, collection, ..] = path else {
+            bail!("expected a database and a collection, got {path:?}");
+        };
+        let database_handle = self.client.database(database);
+        let specification = database_handle
+            .list_collections()
+            .filter(doc! { "name": collection.as_ref() })
+            .await
+            .with_context(|| format!("reading {database}.{collection}"))?
+            .try_next()
+            .await
+            .with_context(|| format!("reading {database}.{collection}"))?
+            .with_context(|| format!("{database}.{collection} was not found"))?;
+
+        let mut create = doc! { "create": collection.as_ref() };
+        let options = mongodb::bson::to_document(&specification.options)
+            .context("reading the collection's options")?;
+        for (name, value) in options {
+            if !matches!(value, Bson::Null) {
+                create.insert(name, value);
+            }
+        }
+        let mut script = vec![to_json(create)];
+
+        if !matches!(specification.collection_type, CollectionType::View) {
+            let indexes: Vec<Document> = database_handle
+                .run_cursor_command(doc! { "listIndexes": collection.as_ref() })
+                .await
+                .with_context(|| format!("listing the indexes of {collection}"))?
+                .try_collect()
+                .await
+                .with_context(|| format!("listing the indexes of {collection}"))?;
+            let indexes: Vec<Bson> = indexes
+                .into_iter()
+                .filter(|index| index.get_str("name").ok() != Some("_id_"))
+                .map(|mut index| {
+                    // The index format version and namespace are the server's to choose.
+                    index.remove("v");
+                    index.remove("ns");
+                    Bson::Document(index)
+                })
+                .collect();
+            if !indexes.is_empty() {
+                script.push(to_json(doc! {
+                    "createIndexes": collection.as_ref(),
+                    "indexes": indexes,
+                }));
+            }
+        }
+        // A blank line between commands is what the editor splits MongoDB commands on.
+        Ok(script.join("\n\n") + "\n")
+    }
+
+    fn qualified_name(&self, path: &[SharedString]) -> Option<String> {
+        match path {
+            [database, collection, ..] => Some(format!("{database}.{collection}")),
+            [database] => Some(database.to_string()),
+            [] => None,
+        }
+    }
+
+    fn select_statement(&self, path: &[SharedString], limit: usize) -> Option<String> {
+        let [_, collection] = path else {
+            return None;
+        };
+        Some(to_json(
+            doc! { "find": collection.as_ref(), "filter": {}, "limit": limit as i64 },
+        ))
+    }
+
+    fn count_statement(&self, path: &[SharedString]) -> Option<String> {
+        let [_, collection] = path else {
+            return None;
+        };
+        Some(to_json(doc! { "count": collection.as_ref(), "query": {} }))
     }
 
     async fn update_cell(&self, edit: &CellEdit) -> Result<u64> {

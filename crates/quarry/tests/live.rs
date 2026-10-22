@@ -12,7 +12,7 @@
 //! broken driver or a broken panel, and that guess is expensive to get wrong. Every test leaves
 //! the data as it found it: edits are made and then reverted.
 
-use quarry::driver::{CellEdit, Driver, ObjectKind, ObjectNode, ResultSet};
+use quarry::driver::{CellEdit, Driver, Engine, ObjectKind, ObjectNode, ResultSet};
 use quarry::drivers::{postgres::PostgresDriver, sqlserver::SqlServerDriver};
 use std::{sync::Arc, time::Duration};
 use ui::SharedString;
@@ -1098,5 +1098,139 @@ fn sqlserver_cancel() {
         task.await
             .expect("joining the query")
             .expect("the slow batch");
+    });
+}
+
+/// Runs every statement of `script` the way the query editor would split it.
+async fn run_script(driver: &dyn Driver, script: &str, engine: Engine, database: Option<&str>) {
+    for range in quarry::statements::split(script, engine) {
+        let statement = &script[range];
+        driver
+            .query(statement, database, 10)
+            .await
+            .unwrap_or_else(|error| panic!("running {statement}: {error:#}"));
+    }
+}
+
+#[test]
+#[ignore = "needs a live postgres"]
+fn postgres_create_script_round_trips() {
+    runtime().block_on(async {
+        let driver = postgres().await;
+        let original = driver
+            .create_script(&path(&["app", "shop", "orders"]))
+            .await
+            .expect("create script");
+        println!("{original}");
+        assert!(original.starts_with("CREATE TABLE \"shop\".\"orders\" (\n"));
+        assert!(original.contains("PRIMARY KEY (id)"));
+        assert!(original.contains("FOREIGN KEY (customer_id) REFERENCES shop.customers(id)"));
+        assert!(original.contains("CREATE INDEX orders_customer_id_idx ON shop.orders"));
+
+        // Recreated in a scratch schema, the copy must describe itself the same way.
+        driver
+            .query(
+                "DROP SCHEMA IF EXISTS quarry_live_ddl CASCADE; CREATE SCHEMA quarry_live_ddl",
+                None,
+                10,
+            )
+            .await
+            .expect("creating the scratch schema");
+        let moved = original
+            .replace("\"shop\".\"orders\"", "\"quarry_live_ddl\".\"orders\"")
+            .replace("ON shop.orders ", "ON quarry_live_ddl.orders ");
+        run_script(driver.as_ref(), &moved, Engine::Postgres, None).await;
+        let copy = driver
+            .create_script(&path(&["app", "quarry_live_ddl", "orders"]))
+            .await
+            .expect("create script of the copy");
+        driver
+            .query("DROP SCHEMA quarry_live_ddl CASCADE", None, 10)
+            .await
+            .expect("dropping the scratch schema");
+        assert_eq!(copy, moved);
+
+        let view = driver
+            .create_script(&path(&["app", "shop", "customer_summary"]))
+            .await
+            .expect("create script of a view");
+        assert!(view.starts_with("CREATE OR REPLACE VIEW"));
+
+        assert_eq!(
+            driver
+                .select_statement(&path(&["app", "shop", "orders"]), 100)
+                .as_deref(),
+            Some("SELECT * FROM \"shop\".\"orders\" LIMIT 100;")
+        );
+        let count = only(
+            driver
+                .query(
+                    &driver
+                        .count_statement(&path(&["app", "shop", "orders"]))
+                        .expect("count statement"),
+                    Some("app"),
+                    10,
+                )
+                .await
+                .expect("counting"),
+        );
+        assert!(cell(&count, 0, 0).is_some());
+    });
+}
+
+#[test]
+#[ignore = "needs a live sql server"]
+fn sqlserver_create_script_round_trips() {
+    runtime().block_on(async {
+        let driver = sqlserver().await;
+        let original = driver
+            .create_script(&path(&["app", "sales", "Stores"]))
+            .await
+            .expect("create script");
+        println!("{original}");
+        assert!(original.starts_with("CREATE TABLE [sales].[Stores] (\n"));
+        assert!(original.contains("IDENTITY(1, 1) NOT NULL"));
+        assert!(original.contains("PRIMARY KEY CLUSTERED ([StoreId])"));
+        assert!(original.contains("REFERENCES [sales].[Regions] ([RegionId])"));
+
+        driver
+            .query(
+                "IF SCHEMA_ID('quarry_live_ddl') IS NULL EXEC('CREATE SCHEMA quarry_live_ddl')",
+                Some("app"),
+                10,
+            )
+            .await
+            .expect("creating the scratch schema");
+        driver
+            .query(
+                "DROP TABLE IF EXISTS quarry_live_ddl.Stores",
+                Some("app"),
+                10,
+            )
+            .await
+            .expect("clearing the scratch table");
+        // Constraint names are unique per schema, so they can stay as they are.
+        let moved = original.replace("[sales].[Stores]", "[quarry_live_ddl].[Stores]");
+        run_script(driver.as_ref(), &moved, Engine::SqlServer, Some("app")).await;
+        let copy = driver
+            .create_script(&path(&["app", "quarry_live_ddl", "Stores"]))
+            .await
+            .expect("create script of the copy");
+        driver
+            .query(
+                "DROP TABLE quarry_live_ddl.Stores; DROP SCHEMA quarry_live_ddl;",
+                Some("app"),
+                10,
+            )
+            .await
+            .expect("dropping the scratch schema");
+        assert_eq!(copy, moved);
+
+        assert_eq!(
+            driver
+                .select_statement(&path(&["app", "sales", "Stores"]), 100)
+                .as_deref(),
+            Some("SELECT TOP (100) * FROM [sales].[Stores];")
+        );
     });
 }
