@@ -88,6 +88,11 @@ pub struct QueryView {
     catalog: Rc<RefCell<Vec<CatalogEntry>>>,
     results: Vec<ResultSet>,
     active_result: usize,
+    /// Narrows the grid to rows with a cell containing this text.
+    search: Entity<Editor>,
+    /// For each row in the grid, the row of the active result it shows. The search hides rows,
+    /// so a grid row number is not a result row number.
+    visible_rows: Vec<usize>,
     status: Status,
     pending_edit: Option<PendingEdit>,
     running: Option<Task<()>>,
@@ -123,6 +128,12 @@ impl QueryView {
             editor
         });
 
+        let search = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Search results…", window, cx);
+            editor
+        });
+
         let table = cx.new(|cx| {
             let mut table = TableView::new(window, cx);
             table.set_selection_enabled(true);
@@ -130,9 +141,16 @@ impl QueryView {
         });
 
         let subscriptions = vec![
+            cx.subscribe(&search, |this, _, event, cx| {
+                if matches!(event, EditorEvent::BufferEdited) {
+                    this.refresh_table(cx);
+                }
+            }),
             cx.subscribe_in(&table, window, |this, _, event, window, cx| {
-                if let TableViewEvent::CellDoubleClicked(cell) = event {
-                    this.start_edit(cell.row.0, cell.col.0, window, cx);
+                if let TableViewEvent::CellDoubleClicked(cell) = event
+                    && let Some(row) = this.visible_rows.get(cell.row.0).copied()
+                {
+                    this.start_edit(row, cell.col.0, window, cx);
                 }
             }),
             // Saving the tab's text is what makes it survive a restart; doing it on every edit
@@ -156,6 +174,8 @@ impl QueryView {
             catalog,
             results: Vec::new(),
             active_result: 0,
+            search,
+            visible_rows: Vec::new(),
             status: Status::Idle,
             pending_edit: None,
             running: None,
@@ -494,11 +514,21 @@ impl QueryView {
     }
 
     fn select_result(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(result) = self.results.get(index) else {
+        if index >= self.results.len() {
+            return;
+        }
+        self.active_result = index;
+        self.refresh_table(cx);
+    }
+
+    /// Shows the active result in the grid, narrowed to the rows the search matches.
+    fn refresh_table(&mut self, cx: &mut Context<Self>) {
+        let Some(result) = self.results.get(self.active_result) else {
             return;
         };
-        self.active_result = index;
-        let contents = result_table::to_table_content(result);
+        let query = self.search.read(cx).text(cx);
+        self.visible_rows = result_table::matching_rows(result, &query);
+        let contents = result_table::to_table_content(result, &self.visible_rows);
         self.table
             .update(cx, |table, cx| table.set_contents(contents, cx));
         cx.notify();
@@ -803,6 +833,9 @@ impl QueryView {
                 )
             })
             .child(div().flex_1())
+            .when(has_result, |toolbar| {
+                toolbar.child(div().w_48().child(self.search.clone()))
+            })
             .child(self.render_history_menu(this.clone(), cx))
             .child(
                 IconButton::new("quarry-copy-csv", IconName::Copy)
@@ -994,6 +1027,11 @@ impl QueryView {
                     Some(result) => result_summary(result),
                     None => "Done".to_string(),
                 };
+                if let Some(result) = self.active()
+                    && self.visible_rows.len() < result.rows.len()
+                {
+                    text.push_str(&format!(" · {} match the search", self.visible_rows.len()));
+                }
                 if *statements > 1 {
                     text.push_str(&format!(" · {statements} statements"));
                 }
