@@ -264,6 +264,18 @@ struct ParsedCatNumberedCode {
     line_count: usize,
 }
 
+/// The Agent/Task tool call whose subagent made `tool_call`, as Claude Code
+/// tags it in `_meta.claudeCode.parentToolUseId`.
+fn subagent_parent_tool_call_id(tool_call: &ToolCall) -> Option<acp_v1::ToolCallId> {
+    let parent_id = tool_call
+        .meta
+        .as_ref()?
+        .get("claudeCode")?
+        .get("parentToolUseId")?
+        .as_str()?;
+    Some(acp_v1::ToolCallId::new(parent_id))
+}
+
 /// A user message as one line of plain text: mention links (`[@name](uri)`)
 /// shrink to their `@name` label and whitespace collapses.
 fn sticky_message_text(markdown: &str) -> String {
@@ -624,6 +636,13 @@ pub struct ThreadView {
     sticky_user_message_ix: Option<usize>,
     pub session_capabilities: SharedSessionCapabilities,
     pub expanded_tool_call_raw_inputs: HashSet<acp_v1::ToolCallId>,
+    /// Agent tool calls whose subagent's tool calls are all shown, rather than
+    /// only the latest.
+    expanded_subagent_activity: HashSet<acp_v1::ToolCallId>,
+    /// The launching tool call of each subagent tool call seen so far. A tool
+    /// call update replaces the whole `_meta`, so the tag that names the
+    /// parent is remembered rather than read from the latest one only.
+    subagent_parent_ids: RefCell<HashMap<acp_v1::ToolCallId, acp_v1::ToolCallId>>,
     collapsed_sandbox_authorization_details: HashSet<acp_v1::ToolCallId>,
     collapsed_sandbox_network_details: HashSet<acp_v1::ToolCallId>,
     /// Sandbox escalation prompts whose "surprising Unicode" warning the user
@@ -1070,6 +1089,8 @@ impl ThreadView {
             last_token_limit_telemetry: None,
             thread_feedback: Default::default(),
             expanded_tool_call_raw_inputs: HashSet::default(),
+            expanded_subagent_activity: HashSet::default(),
+            subagent_parent_ids: RefCell::default(),
             collapsed_sandbox_authorization_details: HashSet::default(),
             collapsed_sandbox_network_details: HashSet::default(),
             acknowledged_confusable_warnings: HashSet::default(),
@@ -7181,6 +7202,14 @@ impl ThreadView {
                 }
             }
             AgentThreadEntry::ToolCall(tool_call) => {
+                // A subagent's tool calls render inside the card of the tool call
+                // that launched it; see `render_subagent_activity`.
+                if let Some(parent_id) = self.subagent_parent_id(tool_call)
+                    && self.thread.read(cx).tool_call(&parent_id).is_some()
+                {
+                    return Empty.into_any();
+                }
+
                 // A canceled tool call that produced visible output is still worth
                 // showing, but one that was canceled before producing anything just
                 // renders as a useless "Canceled" card — hide those entirely.
@@ -9086,47 +9115,158 @@ impl ThreadView {
             layout.id_str()
         )));
 
-        div().w_full().id(container_id).map(|this| {
-            if tool_call.is_subagent() {
-                this.child(
-                    self.render_subagent_tool_call(
+        div()
+            .w_full()
+            .id(container_id)
+            .map(|this| {
+                if tool_call.is_subagent() {
+                    this.child(
+                        self.render_subagent_tool_call(
+                            active_session_id,
+                            entry_ix,
+                            tool_call,
+                            tool_call
+                                .subagent_session_info
+                                .as_ref()
+                                .map(|i| i.session_id.clone()),
+                            focus_handle,
+                            window,
+                            cx,
+                        ),
+                    )
+                } else if has_terminals {
+                    this.children(tool_call.terminals().map(|terminal| {
+                        self.render_terminal_tool_call(
+                            active_session_id,
+                            entry_ix,
+                            terminal,
+                            tool_call,
+                            focus_handle,
+                            layout,
+                            window,
+                            cx,
+                        )
+                    }))
+                } else {
+                    this.child(self.render_tool_call(
                         active_session_id,
                         entry_ix,
-                        tool_call,
-                        tool_call
-                            .subagent_session_info
-                            .as_ref()
-                            .map(|i| i.session_id.clone()),
-                        focus_handle,
-                        window,
-                        cx,
-                    ),
-                )
-            } else if has_terminals {
-                this.children(tool_call.terminals().map(|terminal| {
-                    self.render_terminal_tool_call(
-                        active_session_id,
-                        entry_ix,
-                        terminal,
                         tool_call,
                         focus_handle,
                         layout,
                         window,
                         cx,
-                    )
-                }))
-            } else {
-                this.child(self.render_tool_call(
+                    ))
+                }
+            })
+            .when(layout == ToolCallLayout::Standalone, |this| {
+                this.children(self.render_subagent_activity(
                     active_session_id,
                     entry_ix,
                     tool_call,
                     focus_handle,
-                    layout,
                     window,
                     cx,
                 ))
-            }
-        })
+            })
+    }
+
+    fn subagent_parent_id(&self, tool_call: &ToolCall) -> Option<acp_v1::ToolCallId> {
+        let mut parent_ids = self.subagent_parent_ids.borrow_mut();
+        if let Some(parent_id) = subagent_parent_tool_call_id(tool_call) {
+            parent_ids.insert(tool_call.id.clone(), parent_id.clone());
+            return Some(parent_id);
+        }
+        parent_ids.get(&tool_call.id).cloned()
+    }
+
+    /// The tool calls of the subagent that `tool_call` launched. Claude Code
+    /// sends them as ordinary tool calls of the parent session, tagged with
+    /// the id of the launching Agent/Task tool call. Collapsed, only the latest
+    /// one (and any waiting for permission) shows, as the subagent's progress.
+    fn render_subagent_activity(
+        &self,
+        active_session_id: &acp_v1::SessionId,
+        entry_ix: usize,
+        tool_call: &ToolCall,
+        focus_handle: &FocusHandle,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let children = self
+            .thread
+            .read(cx)
+            .entries()
+            .iter()
+            .enumerate()
+            .filter_map(|(child_ix, entry)| match entry {
+                AgentThreadEntry::ToolCall(child)
+                    if self.subagent_parent_id(child).as_ref() == Some(&tool_call.id) =>
+                {
+                    Some((child_ix, child))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let last_child_ix = children.last()?.0;
+
+        let expanded = self.expanded_subagent_activity.contains(&tool_call.id);
+        let title: SharedString = if children.len() == 1 {
+            "Subagent · 1 tool call".into()
+        } else {
+            format!("Subagent · {} tool calls", children.len()).into()
+        };
+
+        Some(
+            v_flex()
+                .ml_5()
+                .mr_5()
+                .mb_1p5()
+                .border_l_2()
+                .border_color(cx.theme().colors().border_variant)
+                .child(
+                    h_flex()
+                        .id(("subagent-activity", entry_ix))
+                        .pl_2()
+                        .gap_1()
+                        .cursor_pointer()
+                        .child(Disclosure::new(
+                            ("subagent-activity-disclosure", entry_ix),
+                            expanded,
+                        ))
+                        .child(Label::new(title).size(LabelSize::Small).color(Color::Muted))
+                        .on_click(cx.listener({
+                            let id = tool_call.id.clone();
+                            move |this, _, _, cx| {
+                                if !this.expanded_subagent_activity.remove(&id) {
+                                    this.expanded_subagent_activity.insert(id.clone());
+                                }
+                                cx.notify();
+                            }
+                        })),
+                )
+                .children(
+                    children
+                        .into_iter()
+                        .filter(|(child_ix, child)| {
+                            expanded
+                                || *child_ix == last_child_ix
+                                || child.authorization_id().is_some()
+                        })
+                        .map(|(child_ix, child)| {
+                            self.render_any_tool_call(
+                                active_session_id,
+                                child_ix,
+                                child,
+                                focus_handle,
+                                ToolCallLayout::Standalone,
+                                window,
+                                cx,
+                            )
+                        }),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_tool_call(
