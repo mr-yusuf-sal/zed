@@ -14,6 +14,8 @@ pub mod telemetry_log;
 pub mod visual_tests;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows_only_instance;
+#[cfg(target_os = "windows")]
+mod windows_tray;
 
 use agent_settings::{UserAgentsMdState, init_user_agents_md};
 use agent_ui::AgentDiffToolbar;
@@ -435,6 +437,8 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
     })
     .detach();
 
+    #[cfg(target_os = "windows")]
+    windows_tray::init(cx);
     init_cursor_hide_mode(cx);
     init_app_appearance(cx);
     init_reduce_motion(cx);
@@ -491,6 +495,10 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
 
         let multi_workspace_handle = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
+            #[cfg(target_os = "windows")]
+            if windows_tray::hide_instead_of_closing(window, cx) {
+                return false;
+            }
             multi_workspace_handle
                 .update(cx, |multi_workspace, cx| {
                     // We'll handle closing asynchronously

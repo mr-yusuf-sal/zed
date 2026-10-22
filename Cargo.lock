@@ -23276,6 +23276,7 @@ dependencies = [
  "prompt_store",
  "proto",
  "quarry",
+ "raw-window-handle",
  "rayon",
  "recent_projects",
  "release_channel",

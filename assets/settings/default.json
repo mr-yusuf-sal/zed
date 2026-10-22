@@ -225,11 +225,13 @@
   //         "on_new_window": "launchpad"
   "on_new_window": "launchpad",
   // What to do when the last window is closed.
-  // May take 2 values:
+  // May take 3 values:
   //  1. Use the current platform's convention
   //         "on_last_window_closed": "platform_default"
   //  2. Always quit the application
   //         "on_last_window_closed": "quit_app",
+  //  3. Hide the window to the system tray and keep Zed running (Windows only)
+  //         "on_last_window_closed": "hide_to_tray",
   "on_last_window_closed": "platform_default",
   // The text rendering mode to use.
   // May take 3 values:
@@ -2940,6 +2942,16 @@
   //   "W": "workspace::Save"
   // }
   "command_aliases": {},
+  // System-wide shortcuts that bring Zed to the front, even from the system
+  // tray, and then run an action in that window. A `null` action only brings
+  // Zed to the front. Windows only.
+  //
+  // Examples:
+  // {
+  //   "ctrl-alt-z": null,
+  //   "ctrl-alt-t": "terminal_panel::Toggle"
+  // }
+  "global_hotkeys": {},
   // ssh_connections is an array of ssh connections.
   // You can configure these from `project: Open Remote` in the command palette.
   // Zed's ssh support will pull configuration from your ~/.ssh too.

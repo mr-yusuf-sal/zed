@@ -243,7 +243,8 @@ nix = { workspace = true, features = ["user"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 etw_tracing.workspace = true
-windows = { workspace = true, features = ["Win32_System_Console", "Win32_System_Pipes"] }
+raw-window-handle.workspace = true
+windows = { workspace = true, features = ["Win32_System_Console", "Win32_System_Pipes", "Win32_UI_Input_KeyboardAndMouse"] }
 gpui = { workspace = true, features = ["profiler", "windows-manifest"] }
 
 [target.'cfg(target_os = "windows")'.build-dependencies]

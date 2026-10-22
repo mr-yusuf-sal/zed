@@ -820,6 +820,11 @@ impl PlatformWindow for WindowsWindow {
                 this.set_window_placement().log_err();
 
                 unsafe {
+                    // An app may hide its window (e.g. to the system tray) instead of
+                    // closing it; activating it must bring it back.
+                    if !IsWindowVisible(hwnd).as_bool() {
+                        ShowWindow(hwnd, SW_SHOW).as_bool();
+                    }
                     // If the window is minimized, restore it.
                     if IsIconic(hwnd).as_bool() {
                         ShowWindowAsync(hwnd, SW_RESTORE).ok().log_err();
