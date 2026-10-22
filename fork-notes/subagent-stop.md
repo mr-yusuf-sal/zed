@@ -78,7 +78,7 @@ that subagent. Claude Code calls `query.stopTask(taskId)`, and the subagent then
 4. Run `cargo check`, then `cargo test -p agent_servers -p acp_thread -p agent_host`, then
    clippy. `script/clippy` stops on `disallowed_methods` lints that `agent_host` already
    had; run `cargo clippy ... -- --deny warnings -A clippy::disallowed_methods`.
-5. Commit, push, then `tools\ZedFork\build.ps1 -Install -Publish`.
+5. Commit, push, then `script\fork\build.ps1 -Install -Publish`.
 
 ## Not possible cleanly: stopping a background bash process
 
