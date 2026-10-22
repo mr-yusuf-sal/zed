@@ -43,6 +43,7 @@ use language_model::{
 use notifications::status_toast::StatusToast;
 use project::ResolvedPath;
 use settings::{update_settings_file, update_settings_file_with_completion};
+use terminal::terminal_settings::TerminalSettings;
 use ui::{
     ButtonLike, CalloutBorderPosition, Checkbox, SpinnerLabel, SpinnerVariant, SplitButton,
     SplitButtonStyle, Tab, ToggleState,
@@ -55,6 +56,10 @@ use super::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
 };
 use super::*;
+
+/// How many of a command's last output lines an expanded terminal card shows
+/// until the user asks for all of it.
+const TERMINAL_TAIL_LINES: usize = 7;
 
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
 
@@ -8625,6 +8630,29 @@ impl ThreadView {
             .entry(entry_ix)
             .and_then(|entry| entry.terminal(terminal));
 
+        let output_lines = terminal_view.as_ref().map(|terminal_view| {
+            match terminal_view.read(cx).content_mode(window, cx) {
+                terminal_view::ContentMode::Inline {
+                    displayed_lines, ..
+                } => displayed_lines,
+                terminal_view::ContentMode::Scrollable => usize::MAX,
+            }
+        });
+        let has_hidden_output = output_lines.is_some_and(|lines| lines > TERMINAL_TAIL_LINES);
+        let show_full_output = self
+            .entry_view_state
+            .read(cx)
+            .is_terminal_output_full(&tool_call.id);
+        let show_tail = has_hidden_output && !show_full_output;
+        // Matches the height the terminal element gives each line in embedded
+        // mode, under the `text_ui_sm` this card sets.
+        let tail_height = {
+            let line_height = f32::from(TextSize::Small.rems(cx).to_pixels(window.rem_size()))
+                * TerminalSettings::get_global(cx).line_height.value();
+            let scale_factor = window.scale_factor().max(1.);
+            px((line_height * TERMINAL_TAIL_LINES as f32 * scale_factor).ceil() / scale_factor)
+        };
+
         v_flex()
             .when(layout == ToolCallLayout::Standalone, |this| {
                 this.my_1p5()
@@ -8648,11 +8676,25 @@ impl ThreadView {
                         .text_ui_sm(cx)
                         .h_full()
                         .children(terminal_view.map(|terminal_view| {
-                            let element = if terminal_view
+                            let is_scrollable = terminal_view
                                 .read(cx)
                                 .content_mode(window, cx)
-                                .is_scrollable()
-                            {
+                                .is_scrollable();
+                            let element = if show_tail && is_scrollable {
+                                // A scrollable terminal follows its output, so a
+                                // short viewport already shows the last lines.
+                                div().h(tail_height).child(terminal_view).into_any_element()
+                            } else if show_tail {
+                                // An inline terminal is as tall as its output;
+                                // pinning it to the bottom of a clipped box
+                                // leaves only its last lines visible.
+                                v_flex()
+                                    .h(tail_height)
+                                    .overflow_hidden()
+                                    .justify_end()
+                                    .child(div().flex_none().child(terminal_view))
+                                    .into_any_element()
+                            } else if is_scrollable {
                                 div().h_72().child(terminal_view).into_any_element()
                             } else {
                                 terminal_view.into_any_element()
@@ -8665,7 +8707,45 @@ impl ThreadView {
                                 }))
                                 .child(element)
                                 .into_any_element()
-                        })),
+                        }))
+                        .when(has_hidden_output, |this| {
+                            this.child(
+                                h_flex().w_full().justify_center().py_0p5().child(
+                                    Button::new(
+                                        SharedString::from(format!(
+                                            "terminal-output-toggle-{}",
+                                            terminal.entity_id()
+                                        )),
+                                        if show_full_output {
+                                            "Show Less"
+                                        } else {
+                                            "Show All Output"
+                                        },
+                                    )
+                                    .label_size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .end_icon(
+                                        Icon::new(if show_full_output {
+                                            IconName::ChevronUp
+                                        } else {
+                                            IconName::ChevronDown
+                                        })
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                    )
+                                    .on_click(cx.listener({
+                                        let id = tool_call.id.clone();
+                                        move |this, _event, window, cx| {
+                                            this.entry_view_state.update(cx, |state, _cx| {
+                                                state.toggle_terminal_output_full(&id);
+                                            });
+                                            this.refresh_thread_search(window, cx);
+                                            cx.notify();
+                                        }
+                                    })),
+                                ),
+                            )
+                        }),
                 )
             })
             .when_some(permission_request, |this, request| {
