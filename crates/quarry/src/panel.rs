@@ -8,8 +8,9 @@ use anyhow::Result;
 use collections::HashMap;
 use editor::Editor;
 use gpui::{
-    Anchor, AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, Pixels, PromptLevel, Render, Task, WeakEntity, Window, actions, px,
+    Anchor, AnyElement, App, AppContext as _, ClipboardItem, Context, DismissEvent, Entity,
+    EventEmitter, FocusHandle, Focusable, MouseButton, MouseDownEvent, Pixels, Point, PromptLevel,
+    Render, Subscription, Task, WeakEntity, Window, actions, anchored, deferred, px,
 };
 use std::sync::Arc;
 use ui::{
@@ -32,6 +33,68 @@ actions!(
 );
 
 const PREVIEW_ROW_LIMIT: usize = 500;
+const SELECT_ROW_LIMIT: usize = 100;
+
+#[derive(Clone, Copy)]
+enum Script {
+    Definition,
+    Create,
+}
+
+/// The actions on a saved connection, shared by its "⋯" button and its right-click menu.
+fn connection_menu(
+    menu: ContextMenu,
+    panel: WeakEntity<QuarryPanel>,
+    index: usize,
+    connected: bool,
+    busy: bool,
+) -> ContextMenu {
+    let update = |action: fn(&mut QuarryPanel, usize, &mut Window, &mut Context<QuarryPanel>)| {
+        let panel = panel.clone();
+        move |window: &mut Window, cx: &mut App| {
+            panel
+                .update(cx, |this, cx| action(this, index, window, cx))
+                .log_err();
+        }
+    };
+    menu.entry(
+        "New Query",
+        None,
+        update(|this, index, window, cx| this.new_query(index, None, window, cx)),
+    )
+    .separator()
+    .when(!busy, |menu| {
+        menu.entry(
+            "Refresh",
+            None,
+            update(|this, index, _, cx| this.refresh(index, cx)),
+        )
+    })
+    .when(connected, |menu| {
+        menu.entry(
+            "Disconnect",
+            None,
+            update(|this, index, _, cx| this.disconnect(index, cx)),
+        )
+    })
+    .separator()
+    .entry(
+        "Edit Connection",
+        None,
+        update(|this, index, window, cx| this.start_editing(index, window, cx)),
+    )
+    .entry(
+        "Set Password",
+        None,
+        update(|this, index, window, cx| this.start_password_prompt(index, window, cx)),
+    )
+    .separator()
+    .entry(
+        "Delete Connection",
+        None,
+        update(|this, index, window, cx| this.confirm_delete(index, window, cx)),
+    )
+}
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
@@ -128,6 +191,7 @@ pub struct QuarryPanel {
     filter: Entity<Editor>,
     width: Option<Pixels>,
     position: DockPosition,
+    context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     _tasks: Vec<Task<()>>,
 }
 
@@ -174,6 +238,7 @@ impl QuarryPanel {
             filter,
             width: None,
             position: DockPosition::Left,
+            context_menu: None,
             _tasks: Vec::new(),
         }
     }
@@ -735,11 +800,13 @@ impl QuarryPanel {
         self._tasks.push(task);
     }
 
-    /// Opens a view's or routine's source in a query tab, ready to be edited and run.
-    fn open_definition(
+    /// Opens a view's or routine's source, or a table's CREATE script, in a query tab, ready to
+    /// be edited and run.
+    fn open_script(
         &mut self,
         index: usize,
         node: &ObjectNode,
+        script: Script,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -755,7 +822,12 @@ impl QuarryPanel {
         };
         let path = node.path.clone();
         let name = node.name.clone();
-        let definition = runtime.spawn(async move { driver.definition(&path).await });
+        let definition = runtime.spawn(async move {
+            match script {
+                Script::Definition => driver.definition(&path).await,
+                Script::Create => driver.create_script(&path).await,
+            }
+        });
         let database = node.path.first().cloned();
         let task = cx.spawn_in(window, async move |this, cx| {
             let definition = definition.await;
@@ -765,7 +837,10 @@ impl QuarryPanel {
                 };
                 match definition {
                     Ok(text) => {
-                        let title = SharedString::from(format!("{name} (definition)"));
+                        let title = SharedString::from(match script {
+                            Script::Definition => format!("{name} (definition)"),
+                            Script::Create => format!("{name} (create)"),
+                        });
                         this.open_tab(index, database, title, Some(text), window, cx);
                     }
                     Err(error) => {
@@ -892,18 +967,25 @@ impl QuarryPanel {
                         .tooltip(Tooltip::text("Open Definition"))
                         .on_click(cx.listener(
                             move |this, _, window, cx| {
-                                this.open_definition(index, &node, window, cx);
+                                this.open_script(index, &node, Script::Definition, window, cx);
                             },
                         )),
                     ),
                 )
+            })
+            .on_mouse_down(MouseButton::Right, {
+                let node = node.clone();
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.deploy_node_menu(index, node.clone(), event.position, window, cx);
+                })
             })
             .on_click(
                 cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                     if event.click_count() >= 2 && previewable {
                         this.open_preview(index, &node, window, cx);
                     } else if event.click_count() >= 2 && has_definition {
-                        this.open_definition(index, &node, window, cx);
+                        this.open_script(index, &node, Script::Definition, window, cx);
                     } else if event.click_count() == 1 && node.has_children {
                         this.toggle_expanded(index, &node, cx);
                     }
@@ -963,52 +1045,218 @@ impl QuarryPanel {
         .menu(move |window, cx| {
             let panel = panel.clone();
             Some(ContextMenu::build(window, cx, move |menu, _, _| {
-                let update = |action: fn(
-                    &mut QuarryPanel,
-                    usize,
-                    &mut Window,
-                    &mut Context<QuarryPanel>,
-                )| {
+                connection_menu(menu, panel, index, connected, busy)
+            }))
+        })
+    }
+
+    fn deploy_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        menu: Entity<ContextMenu>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
+            this.context_menu.take();
+            cx.notify();
+        });
+        self.context_menu = Some((menu, position, subscription));
+        cx.notify();
+    }
+
+    fn deploy_connection_menu(
+        &mut self,
+        index: usize,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let state = self.states.get(index);
+        let connected = state.is_some_and(|state| state.driver.is_some());
+        let busy = state.is_some_and(|state| state.busy);
+        let panel = cx.entity().downgrade();
+        let menu = ContextMenu::build(window, cx, move |menu, _, _| {
+            connection_menu(menu, panel, index, connected, busy)
+        });
+        self.deploy_context_menu(position, menu, window, cx);
+    }
+
+    /// What can be done with one object in the tree. Every entry is something the driver says
+    /// it can do for that object, so a Redis key prefix offers less than a Postgres table.
+    fn deploy_node_menu(
+        &mut self,
+        index: usize,
+        node: ObjectNode,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(driver) = self
+            .states
+            .get(index)
+            .and_then(|state| state.driver.clone())
+        else {
+            return;
+        };
+        let is_data = matches!(
+            node.kind,
+            ObjectKind::Table | ObjectKind::View | ObjectKind::Collection
+        );
+        let select = is_data
+            .then(|| driver.select_statement(&node.path, SELECT_ROW_LIMIT))
+            .flatten();
+        let count = is_data
+            .then(|| driver.count_statement(&node.path))
+            .flatten();
+        let qualified_name = driver.qualified_name(&node.path);
+        let panel = cx.entity().downgrade();
+
+        let menu = ContextMenu::build(window, cx, move |menu, _, _| {
+            let update =
+                |action: Box<dyn Fn(&mut QuarryPanel, &mut Window, &mut Context<QuarryPanel>)>| {
                     let panel = panel.clone();
                     move |window: &mut Window, cx: &mut App| {
                         panel
-                            .update(cx, |this, cx| action(this, index, window, cx))
+                            .update(cx, |this, cx| action(this, window, cx))
                             .log_err();
                     }
                 };
-                menu.when(!busy, |menu| {
+            let database = node.path.first().cloned();
+            let name = node.name.clone();
+            menu.when(node.kind.is_previewable(), |menu| {
+                let node = node.clone();
+                menu.entry(
+                    "Open Data",
+                    None,
+                    update(Box::new(move |this, window, cx| {
+                        this.open_preview(index, &node, window, cx)
+                    })),
+                )
+            })
+            .when_some(select, |menu, statement| {
+                let database = database.clone();
+                let title = SharedString::from(format!("{name} (top {SELECT_ROW_LIMIT})"));
+                menu.entry(
+                    format!("Select Top {SELECT_ROW_LIMIT}"),
+                    None,
+                    update(Box::new(move |this, window, cx| {
+                        this.run_in_tab(
+                            index,
+                            database.clone(),
+                            title.clone(),
+                            statement.clone(),
+                            window,
+                            cx,
+                        )
+                    })),
+                )
+            })
+            .when_some(count, |menu, statement| {
+                let database = database.clone();
+                let title = SharedString::from(format!("{name} (count)"));
+                menu.entry(
+                    "Count Rows",
+                    None,
+                    update(Box::new(move |this, window, cx| {
+                        this.run_in_tab(
+                            index,
+                            database.clone(),
+                            title.clone(),
+                            statement.clone(),
+                            window,
+                            cx,
+                        )
+                    })),
+                )
+            })
+            .when(
+                matches!(node.kind, ObjectKind::Database | ObjectKind::Schema),
+                |menu| {
+                    let database = database.clone();
                     menu.entry(
-                        "Refresh",
+                        "New Query Here",
                         None,
-                        update(|this, index, _, cx| this.refresh(index, cx)),
+                        update(Box::new(move |this, window, cx| {
+                            this.new_query(index, database.clone(), window, cx)
+                        })),
                     )
+                },
+            )
+            .separator()
+            .when(node.kind.has_definition(), |menu| {
+                let node = node.clone();
+                menu.entry(
+                    "Open Definition",
+                    None,
+                    update(Box::new(move |this, window, cx| {
+                        this.open_script(index, &node, Script::Definition, window, cx)
+                    })),
+                )
+            })
+            .when(is_data, |menu| {
+                let node = node.clone();
+                menu.entry(
+                    "Open CREATE Script",
+                    None,
+                    update(Box::new(move |this, window, cx| {
+                        this.open_script(index, &node, Script::Create, window, cx)
+                    })),
+                )
+            })
+            .entry("Copy Name", None, {
+                let name = name.clone();
+                move |_, cx| cx.write_to_clipboard(ClipboardItem::new_string(name.to_string()))
+            })
+            .when_some(qualified_name, |menu, qualified_name| {
+                menu.entry("Copy Qualified Name", None, move |_, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(qualified_name.clone()))
                 })
-                .when(connected, |menu| {
-                    menu.entry(
-                        "Disconnect",
-                        None,
-                        update(|this, index, _, cx| this.disconnect(index, cx)),
-                    )
-                })
-                .separator()
-                .entry(
-                    "Edit Connection",
+            })
+            .when(node.has_children, |menu| {
+                let path = node.path.clone();
+                menu.separator().entry(
+                    "Refresh",
                     None,
-                    update(|this, index, window, cx| this.start_editing(index, window, cx)),
+                    update(Box::new(move |this, _, cx| {
+                        this.reload_node(index, path.clone(), cx)
+                    })),
                 )
-                .entry(
-                    "Set Password",
-                    None,
-                    update(|this, index, window, cx| this.start_password_prompt(index, window, cx)),
-                )
-                .separator()
-                .entry(
-                    "Delete Connection",
-                    None,
-                    update(|this, index, window, cx| this.confirm_delete(index, window, cx)),
-                )
-            }))
-        })
+            })
+        });
+        self.deploy_context_menu(position, menu, window, cx);
+    }
+
+    /// Forgets what was loaded under `path` and loads it again, so a table created since the
+    /// folder was opened shows up without reconnecting the whole server.
+    fn reload_node(&mut self, index: usize, path: Vec<SharedString>, cx: &mut Context<Self>) {
+        let Some(state) = self.states.get_mut(index) else {
+            return;
+        };
+        state
+            .children
+            .retain(|loaded, _| !loaded.starts_with(&path));
+        if !state.expanded.contains(&path) {
+            state.expanded.push(path.clone());
+        }
+        self.load_children(index, path, cx);
+        cx.notify();
+    }
+
+    /// Opens `statement` in a new query tab and runs it straight away.
+    fn run_in_tab(
+        &mut self,
+        index: usize,
+        database: Option<SharedString>,
+        title: SharedString,
+        statement: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(view) = self.open_tab(index, database, title, Some(statement), window, cx) {
+            view.update(cx, |view, cx| view.run_everything(cx));
+        }
     }
 
     fn render_connection(
@@ -1076,6 +1324,13 @@ impl QuarryPanel {
                             })),
                     )
                     .child(self.render_connection_menu(index, connected, busy, cx))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.deploy_connection_menu(index, event.position, window, cx);
+                        }),
+                    )
                     .on_click(cx.listener(move |this, _, _window, cx| {
                         this.connect(index, cx);
                     })),
@@ -1301,6 +1556,15 @@ impl Render for QuarryPanel {
                         )
                     }),
             )
+            .children(self.context_menu.as_ref().map(|(menu, position, _)| {
+                deferred(
+                    anchored()
+                        .position(*position)
+                        .anchor(Anchor::TopLeft)
+                        .child(menu.clone()),
+                )
+                .with_priority(1)
+            }))
             .into_any_element()
             .into_any()
     }

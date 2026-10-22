@@ -246,6 +246,31 @@ pub trait Driver: Send + Sync {
         anyhow::bail!("{} has no definition to show", path.join("."))
     }
 
+    /// A script that recreates the table, view or collection at `path`: columns, keys,
+    /// constraints and indexes, in the engine's own syntax and split the way the query editor
+    /// splits statements, so it can be run as it is.
+    async fn create_script(&self, path: &[SharedString]) -> Result<String> {
+        anyhow::bail!("{} has no CREATE script to show", path.join("."))
+    }
+
+    /// The name of the object at `path` as it is written in a query, quoted where the engine
+    /// needs it. `None` for nodes a query cannot name, such as a Redis key prefix.
+    fn qualified_name(&self, _path: &[SharedString]) -> Option<String> {
+        None
+    }
+
+    /// A statement reading the first `limit` rows of the object at `path`, for opening it as an
+    /// editable query rather than a bare preview.
+    fn select_statement(&self, _path: &[SharedString], _limit: usize) -> Option<String> {
+        None
+    }
+
+    /// A statement counting the rows of the object at `path` exactly. The tree only shows the
+    /// planner's estimate, which can be far off.
+    fn count_statement(&self, _path: &[SharedString]) -> Option<String> {
+        None
+    }
+
     /// Applies one cell change and returns how many rows it touched. Implementations must
     /// refuse rather than guess when the key does not identify the row.
     async fn update_cell(&self, edit: &CellEdit) -> Result<u64> {

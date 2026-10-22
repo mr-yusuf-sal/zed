@@ -752,6 +752,266 @@ impl Driver for SqlServerDriver {
             })
     }
 
+    async fn create_script(&self, path: &[SharedString]) -> Result<String> {
+        let [database, schema, table] = path else {
+            bail!("expected database, schema and table, got {path:?}");
+        };
+        let database_ident = quote_ident(database);
+        let qualified = three_part_name(database, schema, table);
+        let object = quote_literal(&qualified);
+        let kind = first_column(
+            self.rows(&format!(
+                "SELECT RTRIM(o.type) FROM {database_ident}.sys.objects o
+                 WHERE o.object_id = OBJECT_ID({object})"
+            ))
+            .await?,
+        )
+        .into_iter()
+        .next()
+        .with_context(|| format!("{qualified} was not found"))?;
+        if kind.as_ref() != "U" {
+            return self.definition(path).await;
+        }
+        // Two-part in the script: it is meant to be run in a database of the user's choosing,
+        // which is what the editor's database picker is for.
+        let table_name = format!("{}.{}", quote_ident(schema), quote_ident(table));
+
+        let columns = self
+            .rows(&format!(
+                "SELECT c.name, t.name, c.max_length, c.precision, c.scale, c.is_nullable,
+                        c.is_identity, CAST(ic.seed_value AS nvarchar(100)),
+                        CAST(ic.increment_value AS nvarchar(100)), cc.definition, cc.is_persisted,
+                        dc.definition
+                 FROM {database_ident}.sys.columns c
+                 JOIN {database_ident}.sys.types t ON t.user_type_id = c.user_type_id
+                 LEFT JOIN {database_ident}.sys.identity_columns ic
+                   ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+                 LEFT JOIN {database_ident}.sys.computed_columns cc
+                   ON cc.object_id = c.object_id AND cc.column_id = c.column_id
+                 LEFT JOIN {database_ident}.sys.default_constraints dc
+                   ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id
+                 WHERE c.object_id = OBJECT_ID({object})
+                 ORDER BY c.column_id"
+            ))
+            .await?;
+        let keys = self
+            .rows(&format!(
+                "SELECT kc.name, kc.type, i.type_desc,
+                        STRING_AGG(QUOTENAME(c.name)
+                                   + CASE WHEN ic.is_descending_key = 1 THEN ' DESC' ELSE '' END,
+                                   ', ') WITHIN GROUP (ORDER BY ic.key_ordinal)
+                 FROM {database_ident}.sys.key_constraints kc
+                 JOIN {database_ident}.sys.indexes i
+                   ON i.object_id = kc.parent_object_id AND i.index_id = kc.unique_index_id
+                 JOIN {database_ident}.sys.index_columns ic
+                   ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+                 JOIN {database_ident}.sys.columns c
+                   ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+                 WHERE kc.parent_object_id = OBJECT_ID({object})
+                 GROUP BY kc.name, kc.type, i.type_desc
+                 ORDER BY CASE kc.type WHEN 'PK' THEN 0 ELSE 1 END, kc.name"
+            ))
+            .await?;
+        let checks = self
+            .rows(&format!(
+                "SELECT name, definition FROM {database_ident}.sys.check_constraints
+                 WHERE parent_object_id = OBJECT_ID({object}) ORDER BY name"
+            ))
+            .await?;
+        let foreign_keys = self
+            .rows(&format!(
+                "SELECT fk.name,
+                        STRING_AGG(QUOTENAME(pc.name), ', ')
+                          WITHIN GROUP (ORDER BY fkc.constraint_column_id),
+                        QUOTENAME(rs.name) + '.' + QUOTENAME(rt.name),
+                        STRING_AGG(QUOTENAME(rc.name), ', ')
+                          WITHIN GROUP (ORDER BY fkc.constraint_column_id),
+                        fk.delete_referential_action_desc, fk.update_referential_action_desc
+                 FROM {database_ident}.sys.foreign_keys fk
+                 JOIN {database_ident}.sys.foreign_key_columns fkc
+                   ON fkc.constraint_object_id = fk.object_id
+                 JOIN {database_ident}.sys.columns pc
+                   ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id
+                 JOIN {database_ident}.sys.columns rc
+                   ON rc.object_id = fkc.referenced_object_id
+                  AND rc.column_id = fkc.referenced_column_id
+                 JOIN {database_ident}.sys.tables rt ON rt.object_id = fk.referenced_object_id
+                 JOIN {database_ident}.sys.schemas rs ON rs.schema_id = rt.schema_id
+                 WHERE fk.parent_object_id = OBJECT_ID({object})
+                 GROUP BY fk.name, rs.name, rt.name, fk.delete_referential_action_desc,
+                          fk.update_referential_action_desc
+                 ORDER BY fk.name"
+            ))
+            .await?;
+        let indexes = self
+            .rows(&format!(
+                "SELECT i.name, i.is_unique, i.type_desc,
+                        STRING_AGG(CASE WHEN ic.is_included_column = 0 THEN QUOTENAME(c.name)
+                                   + CASE WHEN ic.is_descending_key = 1 THEN ' DESC' ELSE '' END
+                                   END, ', ') WITHIN GROUP (ORDER BY ic.key_ordinal),
+                        STRING_AGG(CASE WHEN ic.is_included_column = 1 THEN QUOTENAME(c.name) END,
+                                   ', '),
+                        i.filter_definition
+                 FROM {database_ident}.sys.indexes i
+                 JOIN {database_ident}.sys.index_columns ic
+                   ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+                 JOIN {database_ident}.sys.columns c
+                   ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+                 WHERE i.object_id = OBJECT_ID({object}) AND i.type > 0
+                   AND i.is_primary_key = 0 AND i.is_unique_constraint = 0
+                 GROUP BY i.name, i.is_unique, i.type_desc, i.filter_definition
+                 ORDER BY i.name"
+            ))
+            .await?;
+
+        let mut lines: Vec<String> = columns
+            .into_iter()
+            .filter_map(|row| {
+                let mut values = row.into_iter();
+                let name = values.next().flatten()?;
+                let type_name = values.next().flatten()?;
+                let numbers: Vec<Option<i64>> = values
+                    .by_ref()
+                    .take(3)
+                    .map(|value| value.and_then(|value| value.parse().ok()))
+                    .collect();
+                let nullable = values.next().flatten().as_deref() == Some("1");
+                let identity = values.next().flatten().as_deref() == Some("1");
+                let seed = values.next().flatten();
+                let increment = values.next().flatten();
+                let computed = values.next().flatten();
+                let persisted = values.next().flatten().as_deref() == Some("1");
+                let default = values.next().flatten();
+                let mut line = format!("    {}", quote_ident(&name));
+                if let Some(computed) = computed {
+                    line.push_str(&format!(" AS {computed}"));
+                    if persisted {
+                        line.push_str(" PERSISTED");
+                    }
+                    return Some(line);
+                }
+                line.push_str(&format!(" {}", column_type(&type_name, &numbers)));
+                if identity {
+                    line.push_str(&format!(
+                        " IDENTITY({}, {})",
+                        seed.as_deref().unwrap_or("1"),
+                        increment.as_deref().unwrap_or("1")
+                    ));
+                }
+                line.push_str(if nullable { " NULL" } else { " NOT NULL" });
+                if let Some(default) = default {
+                    line.push_str(&format!(" DEFAULT {default}"));
+                }
+                Some(line)
+            })
+            .collect();
+        lines.extend(keys.into_iter().filter_map(|row| {
+            let mut values = row.into_iter();
+            let name = values.next().flatten()?;
+            let kind = values.next().flatten()?;
+            let index_type = values.next().flatten()?;
+            let columns = values.next().flatten()?;
+            Some(format!(
+                "    CONSTRAINT {} {} {index_type} ({columns})",
+                quote_ident(&name),
+                if kind.as_ref() == "PK" {
+                    "PRIMARY KEY"
+                } else {
+                    "UNIQUE"
+                },
+            ))
+        }));
+        lines.extend(checks.into_iter().filter_map(|row| {
+            let mut values = row.into_iter();
+            let name = values.next().flatten()?;
+            let definition = values.next().flatten()?;
+            Some(format!(
+                "    CONSTRAINT {} CHECK {definition}",
+                quote_ident(&name)
+            ))
+        }));
+        lines.extend(foreign_keys.into_iter().filter_map(|row| {
+            let mut values = row.into_iter();
+            let name = values.next().flatten()?;
+            let columns = values.next().flatten()?;
+            let referenced_table = values.next().flatten()?;
+            let referenced_columns = values.next().flatten()?;
+            let on_delete = values.next().flatten();
+            let on_update = values.next().flatten();
+            let mut line = format!(
+                "    CONSTRAINT {} FOREIGN KEY ({columns}) REFERENCES {referenced_table} ({referenced_columns})",
+                quote_ident(&name)
+            );
+            for (clause, action) in [("DELETE", on_delete), ("UPDATE", on_update)] {
+                if let Some(action) = action.filter(|action| action.as_ref() != "NO_ACTION") {
+                    line.push_str(&format!(" ON {clause} {}", action.replace('_', " ")));
+                }
+            }
+            Some(line)
+        }));
+
+        // GO between statements because that is what the editor splits T-SQL batches on.
+        let mut script = format!(
+            "CREATE TABLE {table_name} (\n{}\n);\nGO\n",
+            lines.join(",\n")
+        );
+        for row in indexes {
+            let mut values = row.into_iter();
+            let Some(name) = values.next().flatten() else {
+                continue;
+            };
+            let unique = values.next().flatten().as_deref() == Some("1");
+            let index_type = values.next().flatten().unwrap_or_default();
+            let key_columns = values.next().flatten();
+            let included = values.next().flatten();
+            let filter = values.next().flatten();
+            let name = quote_ident(&name);
+            let statement = if index_type.contains("COLUMNSTORE") {
+                // A columnstore index lists its columns as included ones and has no key.
+                match (index_type.starts_with("NONCLUSTERED"), included) {
+                    (true, Some(included)) => {
+                        format!("CREATE {index_type} INDEX {name} ON {table_name} ({included})")
+                    }
+                    _ => format!("CREATE {index_type} INDEX {name} ON {table_name}"),
+                }
+            } else {
+                let mut statement = format!(
+                    "CREATE {}{index_type} INDEX {name} ON {table_name} ({})",
+                    if unique { "UNIQUE " } else { "" },
+                    key_columns.unwrap_or_default()
+                );
+                if let Some(included) = included {
+                    statement.push_str(&format!(" INCLUDE ({included})"));
+                }
+                if let Some(filter) = filter {
+                    statement.push_str(&format!(" WHERE {filter}"));
+                }
+                statement
+            };
+            script.push_str(&format!("\n{statement};\nGO\n"));
+        }
+        Ok(script)
+    }
+
+    fn qualified_name(&self, path: &[SharedString]) -> Option<String> {
+        match path {
+            [_, schema, table] => Some(format!("{}.{}", quote_ident(schema), quote_ident(table))),
+            [_, schema] => Some(quote_ident(schema)),
+            [database] => Some(quote_ident(database)),
+            _ => None,
+        }
+    }
+
+    fn select_statement(&self, path: &[SharedString], limit: usize) -> Option<String> {
+        let table = self.qualified_name(path).filter(|_| path.len() == 3)?;
+        Some(format!("SELECT TOP ({limit}) * FROM {table};"))
+    }
+
+    fn count_statement(&self, path: &[SharedString]) -> Option<String> {
+        let table = self.qualified_name(path).filter(|_| path.len() == 3)?;
+        Some(format!("SELECT COUNT_BIG(*) FROM {table};"))
+    }
+
     async fn update_cell(&self, edit: &CellEdit) -> Result<u64> {
         let [database, schema, table] = edit.path.as_slice() else {
             bail!("expected database, schema and table, got {:?}", edit.path);
