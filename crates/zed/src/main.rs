@@ -967,6 +967,15 @@ fn main() {
             }),
         };
 
+        // Windows are created hidden and shown when first activated, so suppressing
+        // activation until the session is restored leaves them in the system tray.
+        #[cfg(target_os = "windows")]
+        let start_hidden = args.hidden;
+        #[cfg(target_os = "windows")]
+        if start_hidden {
+            gpui_windows::set_activation_suppressed(true);
+        }
+
         let (first_window_tx, first_window_rx) = oneshot::channel::<()>();
         let first_window_tx = Rc::new(RefCell::new(Some(first_window_tx)));
         let _first_window_subscription = cx.observe_new::<MultiWorkspace>(move |_, _, _| {
@@ -976,6 +985,16 @@ fn main() {
         });
 
         let restore_finished = cx.background_spawn(restore_task).shared();
+
+        #[cfg(target_os = "windows")]
+        if start_hidden {
+            let restore_finished = restore_finished.clone();
+            cx.spawn(async move |_| {
+                restore_finished.await;
+                gpui_windows::set_activation_suppressed(false);
+            })
+            .detach();
+        }
 
         cx.spawn({
             let db = workspace::WorkspaceDb::global(cx);
@@ -1775,6 +1794,11 @@ struct Args {
     #[cfg(target_os = "windows")]
     #[arg(hide = true)]
     foreground: bool,
+
+    /// Start with every window hidden, so Zed comes up in the system tray. Only used on Windows.
+    #[arg(long)]
+    #[cfg(target_os = "windows")]
+    hidden: bool,
 
     /// The dock action to perform. This is used on Windows only.
     #[arg(long)]

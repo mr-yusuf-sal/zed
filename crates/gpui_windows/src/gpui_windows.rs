@@ -39,5 +39,6 @@ pub(crate) use window::*;
 pub(crate) use wrapper::*;
 
 pub use platform::WindowsPlatform;
+pub use window::set_activation_suppressed;
 
 pub(crate) use windows::Win32::Foundation::HWND;
