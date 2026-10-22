@@ -38,6 +38,17 @@ use thiserror::Error;
 use util::ResultExt as _;
 use util::path_list::PathList;
 
+use anyhow::{Context as _, Result};
+use gpui::{App, AppContext as _, AsyncApp, Entity, SharedString, Subscription, Task, WeakEntity};
+
+use acp_thread::{AcpThread, AuthRequired, LoadError, TerminalProviderEvent};
+use terminal::TerminalBuilder;
+use terminal::terminal_settings::{AlternateScroll, CursorShape};
+
+use crate::{CLAUDE_AGENT_ID, CURSOR_ID, GEMINI_ID};
+
+pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
+const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
 const EXIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 fn mcp_configurations_for_project(
@@ -542,33 +553,732 @@ fn with_v2_terminal_notifications<Handler: HandleDispatchFrom<Agent>>(
     )
 }
 
-fn with_v2_session_notifications<Handler: HandleDispatchFrom<Agent>>(
-    builder: V2Builder<Client, Handler>,
-    mut dispatch: impl FnMut(
-        InboundSessionNotification,
-        usize,
-    ) -> Result<(), agent_client_protocol::Error>
-    + Send
-    + 'static,
-) -> V2Builder<Client, impl HandleDispatchFrom<Agent>> {
-    builder.on_receive_notification(
-        async move |notification: acp_v2::UpdateSessionNotification,
-                    connection: V2ConnectionTo<Agent>| {
-            let encoded_bytes = notification_size(&notification)?;
-            let notification = match InboundSessionNotification::try_from(notification) {
-                Ok(notification) => notification,
-                Err(notification) => {
-                    return Ok(Handled::No {
-                        message: (notification, connection),
-                        retry: false,
-                    });
+fn client_capabilities_for_agent(
+    agent_id: &AgentId,
+    beta_features_enabled: bool,
+) -> acp::ClientCapabilities {
+    let mut meta = acp::Meta::from_iter([
+        ("terminal_output".into(), true.into()),
+        ("terminal-auth".into(), true.into()),
+    ]);
+
+    if agent_id.as_ref() == CURSOR_ID {
+        meta.insert(PARAMETERIZED_MODEL_PICKER_META_KEY.into(), true.into());
+    }
+
+    let mut session_capabilities = acp::ClientSessionCapabilities::new().config_options(
+        acp::SessionConfigOptionsCapabilities::new()
+            .boolean(acp::BooleanConfigOptionCapabilities::new()),
+    );
+    if beta_features_enabled {
+        session_capabilities = session_capabilities
+            .compaction(acp::CompactionCapabilities::new())
+            .notices(acp::NoticeCapabilities::new());
+    }
+
+    acp::ClientCapabilities::new()
+        .fs(acp::FileSystemCapabilities::new()
+            .read_text_file(true)
+            .write_text_file(true))
+        .terminal(true)
+        .auth(acp::AuthCapabilities::new().terminal(true))
+        .session(session_capabilities)
+        .elicitation(
+            acp::ElicitationCapabilities::new()
+                .form(acp::ElicitationFormCapabilities::new())
+                .url(acp::ElicitationUrlCapabilities::new()),
+        )
+        .meta(meta)
+}
+
+impl AcpConnection {
+    pub fn subscribe_debug_messages(
+        &self,
+    ) -> (
+        Vec<AcpDebugMessage>,
+        async_channel::Receiver<AcpDebugMessage>,
+    ) {
+        self.debug_log.subscribe()
+    }
+
+    pub async fn stdio(
+        agent_id: AgentId,
+        project: Entity<Project>,
+        command: AgentServerCommand,
+        agent_server_store: WeakEntity<AgentServerStore>,
+        default_mode: Option<acp::SessionModeId>,
+        default_config_options: HashMap<String, AgentConfigOptionValue>,
+        cx: &mut AsyncApp,
+    ) -> Result<Self> {
+        let original_command = command.clone();
+        // Claude Code's turns can run for a long time, so its sessions are kept
+        // going in an agent host when Zed quits.
+        let hosted = agent_id.as_ref() == CLAUDE_AGENT_ID;
+        let transport::StdioProcess {
+            child,
+            status,
+            incoming,
+            outgoing,
+            stderr,
+            debug_log,
+        } = transport::spawn_stdio(&project, command, hosted, cx).await?;
+        let sessions = Rc::new(RefCell::new(HashMap::default()));
+
+        let (release_channel, version): (Option<&str>, String) = cx.update(|cx| {
+            (
+                release_channel::ReleaseChannel::try_global(cx)
+                    .map(|release_channel| release_channel.display_name()),
+                release_channel::AppVersion::global(cx).to_string(),
+            )
+        });
+
+        let client_session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>> =
+            Rc::new(RefCell::new(None));
+        let request_elicitations = cx.new(|_| ElicitationStore::default());
+
+        // Set up the foreground dispatch channel for bridging Send handler
+        // closures to the !Send foreground thread.
+        let (dispatch_tx, dispatch_rx) = mpsc::unbounded::<ForegroundWork>();
+
+        let transport = Lines::new(outgoing, incoming);
+        let stderr_task = cx
+            .background_spawn(async move {
+                stderr.await.log_err();
+            })
+            .shared();
+
+        let (connection_tx, connection_rx) = futures::channel::oneshot::channel();
+        let connection_future =
+            connect_client_future("zed", transport, dispatch_tx.clone(), connection_tx);
+        let io_task = cx.background_spawn(async move {
+            if let Err(err) = connection_future.await {
+                log::error!("ACP connection error: {err}");
+            }
+        });
+
+        let connection_rx = async move {
+            connection_rx
+                .await
+                .context("Failed to receive ACP connection handle")
+        }
+        .boxed_local();
+        let status_fut = status
+            .map(|status| {
+                status.map_err(|error| anyhow!("failed to wait for agent server exit: {error}"))
+            })
+            .boxed_local();
+        let (connection, status_fut) = match futures::future::select(connection_rx, status_fut)
+            .await
+        {
+            futures::future::Either::Left((connection, status_fut)) => (connection?, status_fut),
+            futures::future::Either::Right((status, _connection_rx)) => {
+                return Err(
+                    exited_load_error_after_drain(status?, stderr_task, &debug_log, cx)
+                        .await
+                        .into(),
+                );
+            }
+        };
+
+        // Set up the foreground dispatch loop to process work items from handlers.
+        let dispatch_context = ClientContext {
+            sessions: sessions.clone(),
+            session_list: client_session_list.clone(),
+            request_elicitations: request_elicitations.clone(),
+        };
+        let dispatch_task = cx.spawn({
+            let mut dispatch_rx = dispatch_rx;
+            async move |cx| {
+                while let Some(work) = dispatch_rx.next().await {
+                    work.run(cx, &dispatch_context);
+                }
+            }
+        });
+        let drained = {
+            let connection = connection.clone();
+            let stderr_task = stderr_task.clone();
+            let dispatch_tx = dispatch_tx.clone();
+            async move {
+                let incoming = async move {
+                    // EOF follows SDK dispatch, but model updates are still queued on the foreground.
+                    connection.incoming_closed().await;
+                    let (acknowledgment, received) = futures::channel::oneshot::channel();
+                    let barrier: ForegroundWork = Box::new(ForegroundBarrier { acknowledgment });
+                    if let Err(error) = dispatch_tx.unbounded_send(barrier) {
+                        error.into_inner().reject();
+                        return;
+                    }
+                    received
+                        .await
+                        .context("ACP foreground dispatch closed during exit drain")
+                        .log_err();
+                };
+                futures::join!(incoming, stderr_task);
+            }
+        };
+
+        let beta_features_enabled = cx.update(|cx| cx.has_flag::<AcpBetaFeatureFlag>());
+        let initialize_response = connection
+            .send_request(
+                acp::InitializeRequest::new(ProtocolVersion::V1)
+                    .client_capabilities(client_capabilities_for_agent(
+                        &agent_id,
+                        beta_features_enabled,
+                    ))
+                    .client_info(
+                        acp::Implementation::new("zed", version)
+                            .title(release_channel.map(ToOwned::to_owned)),
+                    ),
+            )
+            .block_task()
+            .boxed_local();
+        let (response, status_fut) =
+            match futures::future::select(initialize_response, status_fut).await {
+                futures::future::Either::Left((Ok(response), status_fut)) => (response, status_fut),
+                futures::future::Either::Left((Err(error), status_fut)) => {
+                    let timer = cx
+                        .background_executor()
+                        .timer(std::time::Duration::from_millis(250))
+                        .boxed_local();
+                    if let futures::future::Either::Left((status, _timer)) =
+                        futures::future::select(status_fut, timer).await
+                    {
+                        return Err(exited_load_error_after_drain(
+                            status?, drained, &debug_log, cx,
+                        )
+                        .await
+                        .into());
+                    }
+
+                    return Err(error.into());
+                }
+                futures::future::Either::Right((status, _initialize_response)) => {
+                    return Err(
+                        exited_load_error_after_drain(status?, drained, &debug_log, cx)
+                            .await
+                            .into(),
+                    );
                 }
             };
-            dispatch(notification, encoded_bytes)?;
-            Ok(Handled::Yes)
-        },
-        agent_client_protocol::on_receive_notification!(),
-    )
+
+        if response.protocol_version < MINIMUM_SUPPORTED_VERSION {
+            return Err(UnsupportedVersion.into());
+        }
+
+        let wait_task = cx.spawn({
+            let sessions = sessions.clone();
+            let debug_log = debug_log.clone();
+            async move |cx| {
+                let status = status_fut.await?;
+                let load_error =
+                    exited_load_error_after_drain(status, drained, &debug_log, cx).await;
+                emit_load_error_to_all_sessions(&sessions, load_error, cx);
+                anyhow::Ok(())
+            }
+        });
+
+        let agent_info = response.agent_info;
+        let telemetry_id = agent_info
+            .as_ref()
+            // Use the one the agent provides if we have one
+            .map(|info| SharedString::from(info.name.clone()))
+            // Otherwise, just use the name
+            .unwrap_or_else(|| agent_id.0.clone());
+        let agent_version = agent_info
+            .and_then(|info| (!info.version.is_empty()).then(|| SharedString::from(info.version)));
+        let agent_supports_delete = response
+            .agent_capabilities
+            .session_capabilities
+            .delete
+            .is_some();
+
+        let session_list = if response
+            .agent_capabilities
+            .session_capabilities
+            .list
+            .is_some()
+        {
+            let list = Rc::new(AcpSessionList::new(
+                connection.clone(),
+                agent_supports_delete,
+            ));
+            *client_session_list.borrow_mut() = Some(list.clone());
+            Some(list)
+        } else {
+            None
+        };
+
+        // TODO: Remove this override once Google team releases their official auth methods
+        let auth_methods = if agent_id.0.as_ref() == GEMINI_ID {
+            let mut gemini_args = original_command.args.clone();
+            gemini_args.retain(|a| a != "--experimental-acp" && a != "--acp");
+            let value = serde_json::json!({
+                "label": "gemini /auth",
+                "command": original_command.path.to_string_lossy(),
+                "args": gemini_args,
+                "env": original_command.env.unwrap_or_default(),
+            });
+            let meta = acp_v2::Meta::from_iter([("terminal-auth".to_string(), value)]);
+            vec![acp_v2::AuthMethod::Agent(
+                acp_v2::AuthMethodAgent::new(GEMINI_TERMINAL_AUTH_METHOD_ID, "Login")
+                    .description("Login with your Google or Vertex AI account")
+                    .meta(meta),
+            )]
+        } else {
+            acp_thread::auth_methods::from_v1(response.auth_methods)?
+        };
+        let defaults = AcpConnectionDefaults::new(default_mode, default_config_options);
+        let settings_subscription = cx.update({
+            let agent_id = agent_id.clone();
+            let defaults = defaults.clone();
+            move |cx| defaults.observe_settings(agent_id, cx)
+        });
+
+        Ok(Self {
+            id: agent_id,
+            auth_methods,
+            agent_server_store,
+            connection,
+            telemetry_id,
+            agent_version,
+            sessions,
+            pending_sessions: RefCell::new(HashMap::default()),
+            agent_capabilities: response.agent_capabilities,
+            request_elicitations,
+            defaults,
+            session_list,
+            debug_log,
+            _settings_subscription: settings_subscription,
+            _io_task: io_task,
+            dispatch_tx,
+            _dispatch_task: dispatch_task,
+            _wait_task: wait_task,
+            _stderr_task: stderr_task,
+            child,
+        })
+    }
+
+    pub fn prompt_capabilities(&self) -> acp_v2::PromptCapabilities {
+        acp_thread::prompt_capabilities::from_v1(
+            self.agent_capabilities.prompt_capabilities.clone(),
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn new_for_test(
+        connection: ConnectionTo<Agent>,
+        sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
+        agent_capabilities: acp::AgentCapabilities,
+        request_elicitations: Entity<ElicitationStore>,
+        agent_server_store: WeakEntity<AgentServerStore>,
+        io_task: Task<()>,
+        dispatch_tx: mpsc::UnboundedSender<ForegroundWork>,
+        dispatch_task: Task<()>,
+        cx: &mut App,
+    ) -> Self {
+        let agent_id = AgentId::new("test");
+        let defaults = AcpConnectionDefaults::default();
+        let settings_subscription = defaults.observe_settings(agent_id.clone(), cx);
+
+        Self {
+            id: agent_id,
+            telemetry_id: "test".into(),
+            agent_version: None,
+            connection,
+            sessions,
+            pending_sessions: RefCell::new(HashMap::default()),
+            auth_methods: vec![],
+            agent_server_store,
+            agent_capabilities,
+            request_elicitations,
+            defaults,
+            child: None,
+            session_list: None,
+            debug_log: AcpDebugLog::default(),
+            _settings_subscription: settings_subscription,
+            _io_task: io_task,
+            dispatch_tx,
+            _dispatch_task: dispatch_task,
+            _wait_task: Task::ready(Ok(())),
+            _stderr_task: Task::ready(()).shared(),
+        }
+    }
+
+    fn session_directories_from_work_dirs(
+        &self,
+        work_dirs: &PathList,
+    ) -> Result<SessionDirectories> {
+        let supports_additional_directories = self.supports_session_additional_directories();
+        session_directories_from_work_dirs(work_dirs, supports_additional_directories)
+    }
+
+    fn register_session(
+        self: &Rc<Self>,
+        session_id: acp::SessionId,
+        thread: &Entity<AcpThread>,
+        session_modes: Option<Rc<RefCell<acp::SessionModeState>>>,
+        config_options: Option<ConfigOptions>,
+        default_config_task: Option<Task<()>>,
+        cx: &mut App,
+    ) {
+        let release_subscription = cx.observe_release(thread, {
+            let session_id = session_id.clone();
+            let thread = thread.downgrade();
+            let this = Rc::downgrade(self);
+            move |_, cx| {
+                if let Some(this) = this.upgrade() {
+                    this.release_session(session_id, thread, cx);
+                }
+            }
+        });
+        self.sessions.borrow_mut().insert(
+            session_id,
+            AcpSession {
+                thread: thread.downgrade(),
+                suppress_abort_err: false,
+                session_modes,
+                config_options,
+                default_config_task,
+                _release_subscription: release_subscription,
+            },
+        );
+    }
+
+    fn remove_session(&self, session_id: &acp::SessionId, thread_id: gpui::EntityId) {
+        let mut sessions = self.sessions.borrow_mut();
+        if sessions
+            .get(session_id)
+            .is_some_and(|session| session.thread.entity_id() == thread_id)
+        {
+            sessions.remove(session_id);
+        }
+    }
+
+    fn remove_pending_session(&self, session_id: &acp::SessionId, thread_id: gpui::EntityId) {
+        let mut sessions = self.pending_sessions.borrow_mut();
+        if sessions
+            .get(session_id)
+            .is_some_and(|session| session.thread.entity_id() == thread_id)
+        {
+            sessions.remove(session_id);
+        }
+    }
+
+    fn release_session(
+        self: &Rc<Self>,
+        session_id: acp::SessionId,
+        thread: WeakEntity<AcpThread>,
+        cx: &mut App,
+    ) {
+        if self.pending_sessions.borrow().contains_key(&session_id)
+            || !self
+                .sessions
+                .borrow()
+                .get(&session_id)
+                .is_some_and(|session| session.thread.entity_id() == thread.entity_id())
+        {
+            return;
+        }
+
+        if let Some(session) = self.sessions.borrow_mut().get_mut(&session_id) {
+            session.default_config_task.take();
+        }
+
+        let task = cx
+            .spawn({
+                let this = Rc::downgrade(self);
+                let connection = self.connection.clone();
+                let dispatch_tx = self.dispatch_tx.clone();
+                let supports_close = self.agent_supports_session_close();
+                let session_id = session_id.clone();
+                let thread_id = thread.entity_id();
+                async move |_| {
+                    let result = close_session_and_drain(
+                        &connection,
+                        session_id.clone(),
+                        supports_close,
+                        &dispatch_tx,
+                    )
+                    .await;
+                    if let Some(this) = this.upgrade() {
+                        this.remove_session(&session_id, thread_id);
+                        this.remove_pending_session(&session_id, thread_id);
+                    }
+                    result.map_err(Arc::new)
+                }
+            })
+            .shared();
+        self.pending_sessions
+            .borrow_mut()
+            .insert(session_id, PendingAcpSession { thread, task });
+    }
+
+    fn agent_supports_session_close(&self) -> bool {
+        self.agent_capabilities.session_capabilities.close.is_some()
+    }
+
+    fn open_or_create_session(
+        self: Rc<Self>,
+        session_id: acp::SessionId,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        title: Option<SharedString>,
+        rpc_call: impl FnOnce(
+            ConnectionTo<Agent>,
+            acp::SessionId,
+            SessionDirectories,
+        )
+            -> futures::future::LocalBoxFuture<'static, Result<SessionConfigResponse>>
+        + 'static,
+        cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        // Active callers share the thread; an abandoned operation must finish
+        // before a replacement can receive notifications under the same ID.
+        let pending = self
+            .pending_sessions
+            .borrow()
+            .get(&session_id)
+            .map(|pending| (pending.thread.clone(), pending.task.clone()));
+        if let Some((thread, task)) = pending {
+            if let Some(thread) = thread.upgrade() {
+                return cx.foreground_executor().spawn(async move {
+                    task.await.map_err(|err| anyhow!(err))?;
+                    Ok(thread)
+                });
+            }
+            return cx.spawn(async move |cx| {
+                task.await.log_err();
+                cx.update(|cx| {
+                    self.open_or_create_session(session_id, project, work_dirs, title, rpc_call, cx)
+                })
+                .await
+            });
+        }
+
+        let previous_thread = self
+            .sessions
+            .borrow()
+            .get(&session_id)
+            .map(|session| session.thread.clone());
+        if let Some(thread) = previous_thread {
+            if let Some(thread) = thread.upgrade() {
+                return Task::ready(Ok(thread));
+            }
+            // Entity-release effects may not have run yet when a view reopens.
+            self.release_session(session_id.clone(), thread, cx);
+            return self
+                .open_or_create_session(session_id, project, work_dirs, title, rpc_call, cx);
+        }
+
+        let directories = match self.session_directories_from_work_dirs(&work_dirs) {
+            Ok(directories) => directories,
+            Err(error) => return Task::ready(Err(error)),
+        };
+
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let thread = cx.new(|cx| {
+            AcpThread::new(
+                None,
+                title,
+                Some(work_dirs),
+                self.clone(),
+                project,
+                action_log,
+                session_id.clone(),
+                watch::Receiver::constant(self.prompt_capabilities()),
+                cx,
+            )
+        });
+        self.register_session(session_id.clone(), &thread, None, None, None, cx);
+
+        // The connection owns this task, so retaining the thread (which owns the
+        // connection) here would keep both alive after all callers abandon the load.
+        let shared_task: Shared<Task<Result<(), Arc<anyhow::Error>>>> = cx
+            .spawn({
+                let session_id = session_id.clone();
+                let this = Rc::downgrade(&self);
+                let thread = thread.downgrade();
+                let connection = self.connection.clone();
+                let dispatch_tx = self.dispatch_tx.clone();
+                let supports_close = self.agent_supports_session_close();
+                async move |cx| {
+                    if thread.upgrade().is_none() {
+                        if let Some(this) = this.upgrade() {
+                            this.remove_session(&session_id, thread.entity_id());
+                            this.remove_pending_session(&session_id, thread.entity_id());
+                        }
+                        return Ok(());
+                    }
+
+                    let response =
+                        rpc_call(connection.clone(), session_id.clone(), directories).await;
+                    if response.is_err() {
+                        // Do not let replay from a failed load reach its replacement.
+                        drain_foreground_queue(&dispatch_tx).await.log_err();
+                    }
+                    let Some(connection_state) = this.upgrade() else {
+                        return Ok(());
+                    };
+                    let (modes, config_options) = match response
+                        .and_then(|response| config_state(response.modes, response.config_options))
+                    {
+                        Ok(state) => state,
+                        Err(error) => {
+                            connection_state.remove_session(&session_id, thread.entity_id());
+                            connection_state
+                                .remove_pending_session(&session_id, thread.entity_id());
+                            return Err(Arc::new(error));
+                        }
+                    };
+
+                    if let Some(_thread) = thread.upgrade() {
+                        {
+                            let mut sessions = connection_state.sessions.borrow_mut();
+                            let Some(session) = sessions
+                                .get_mut(&session_id)
+                                .filter(|session| session.thread.entity_id() == thread.entity_id())
+                            else {
+                                connection_state
+                                    .remove_pending_session(&session_id, thread.entity_id());
+                                return Err(Arc::new(anyhow!(
+                                    "session was closed or replaced before load completed"
+                                )));
+                            };
+                            session.session_modes = modes;
+                            session.config_options = config_options.clone();
+                            session.default_config_task = config_options.as_ref().map(|options| {
+                                connection_state.apply_default_config_options(
+                                    &session_id,
+                                    options,
+                                    cx,
+                                )
+                            });
+                        }
+                        connection_state.remove_pending_session(&session_id, thread.entity_id());
+                        return Ok(());
+                    }
+
+                    drop(connection_state);
+                    let result = close_session_and_drain(
+                        &connection,
+                        session_id.clone(),
+                        supports_close,
+                        &dispatch_tx,
+                    )
+                    .await;
+                    if let Some(this) = this.upgrade() {
+                        this.remove_session(&session_id, thread.entity_id());
+                        this.remove_pending_session(&session_id, thread.entity_id());
+                    }
+                    result.map_err(Arc::new)
+                }
+            })
+            .shared();
+
+        self.pending_sessions.borrow_mut().insert(
+            session_id,
+            PendingAcpSession {
+                thread: thread.downgrade(),
+                task: shared_task.clone(),
+            },
+        );
+
+        cx.foreground_executor().spawn(async move {
+            shared_task.await.map_err(|err| anyhow!(err))?;
+            Ok(thread)
+        })
+    }
+
+    fn apply_default_config_options(
+        &self,
+        session_id: &acp::SessionId,
+        config_options: &ConfigOptions,
+        cx: &mut AsyncApp,
+    ) -> Task<()> {
+        let id = self.id.clone();
+        let defaults = self.defaults.clone();
+        let session_id = session_id.clone();
+        let config_options = config_options.clone();
+        let connection = self.connection.clone();
+        cx.spawn(async move |_| {
+            let mut attempted_defaults = Vec::new();
+            loop {
+                let current_options = config_options.config_options.borrow().clone();
+                let next_default = current_options.iter().find_map(|option| {
+                    // Retry deferred or reset defaults after dependent changes, but
+                    // do not repeat an attempt in the same state if defaults conflict.
+                    if attempted_defaults.iter().any(|(config_id, options)| {
+                        config_id == &option.config_id && options == &current_options
+                    }) {
+                        return None;
+                    }
+                    let value = defaults.config_option(option.config_id.0.as_ref())?;
+                    let already_set = match &option.kind {
+                        acp_v2::SessionConfigKind::Select(select) => {
+                            value.as_value_id() == Some(select.current_value.0.as_ref())
+                        }
+                        acp_v2::SessionConfigKind::Boolean(boolean) => {
+                            value.as_bool() == Some(boolean.current_value)
+                        }
+                        _ => false,
+                    };
+                    if already_set {
+                        return None;
+                    }
+                    Some((option.clone(), value))
+                });
+                let Some((config_option, default_value)) = next_default else {
+                    break;
+                };
+                attempted_defaults.push((config_option.config_id.clone(), current_options));
+
+                let value_to_apply = match &config_option.kind {
+                    acp_v2::SessionConfigKind::Select(select) => default_value
+                        .as_value_id()
+                        .and_then(|value_id| match &select.options {
+                            acp_v2::SessionConfigSelectOptions::Ungrouped(options) => options
+                                .iter()
+                                .any(|opt| &*opt.value.0 == value_id)
+                                .then(|| {
+                                    acp_v2::SessionConfigOptionValue::id(value_id.to_string())
+                                }),
+                            acp_v2::SessionConfigSelectOptions::Grouped(groups) => groups
+                                .iter()
+                                .any(|group| {
+                                    group.options.iter().any(|opt| &*opt.value.0 == value_id)
+                                })
+                                .then(|| {
+                                    acp_v2::SessionConfigOptionValue::id(value_id.to_string())
+                                }),
+                            _ => None,
+                        }),
+                    acp_v2::SessionConfigKind::Boolean(_) => default_value
+                        .as_bool()
+                        .map(acp_v2::SessionConfigOptionValue::boolean),
+                    _ => None,
+                };
+
+                let Some(value_to_apply) = value_to_apply else {
+                    log::warn!(
+                        "`{}` is not a valid value for config option `{}` in {}",
+                        default_value,
+                        config_option.config_id.0,
+                        id
+                    );
+                    continue;
+                };
+                config_options
+                    .set_config_option(
+                        &connection,
+                        session_id.clone(),
+                        config_option.config_id,
+                        value_to_apply,
+                    )
+                    .await
+                    .log_err();
+            }
+        })
+    }
 }
 
 fn with_v2_client_ingress<Handler: HandleDispatchFrom<Agent>>(

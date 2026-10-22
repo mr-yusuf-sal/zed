@@ -70,6 +70,7 @@ action_log = { workspace = true, optional = true }
 activity_indicator.workspace = true
 agent-client-protocol.workspace = true
 agent.workspace = true
+agent_host.workspace = true
 agent_servers = { workspace = true, optional = true }
 agent_settings.workspace = true
 agent_skills.workspace = true

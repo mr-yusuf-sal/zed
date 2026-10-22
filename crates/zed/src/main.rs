@@ -225,6 +225,15 @@ fn main() {
         return;
     }
 
+    // `zed --agent-host` Makes zed run an agent server that outlives the editor
+    if let Some(socket) = &args.agent_host {
+        if let Err(error) = agent_host::run(socket) {
+            eprintln!("agent host failed: {error:#}");
+            process::exit(1);
+        }
+        return;
+    }
+
     #[cfg(target_os = "windows")]
     if args.record_etw_trace {
         let Some(etw_socket) = args.etw_socket else {
@@ -298,6 +307,7 @@ fn main() {
         };
     }
     ztracing::init();
+    agent_host::enable();
 
     #[cfg(unix)]
     util::increase_open_file_limit().log_err();
@@ -1754,6 +1764,11 @@ struct Args {
     /// process communicating over a socket.
     #[arg(long, hide = true)]
     crash_handler: Option<PathBuf>,
+
+    /// Used for running an agent server in a process that keeps going when
+    /// Zed quits, communicating with Zed over a socket.
+    #[arg(long, hide = true)]
+    agent_host: Option<PathBuf>,
 
     /// Run zed in the foreground, only used on Windows, to match the behavior on macOS.
     #[arg(long)]
