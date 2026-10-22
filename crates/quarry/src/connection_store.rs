@@ -55,6 +55,14 @@ impl ConnectionStore {
         cx.notify();
     }
 
+    pub fn replace(&mut self, index: usize, config: ConnectionConfig, cx: &mut Context<Self>) {
+        if let Some(slot) = self.connections.get_mut(index) {
+            *slot = config;
+            self.persist(cx);
+            cx.notify();
+        }
+    }
+
     pub fn remove(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.connections.len() {
             self.connections.remove(index);
@@ -147,6 +155,32 @@ pub fn parse_connection_url(input: &str) -> Result<ConnectionConfig> {
     })
 }
 
+/// The inverse of [`parse_connection_url`], used to pre-fill the form when a connection is
+/// edited. It never contains a password, since the config does not have one.
+pub fn connection_url(config: &ConnectionConfig) -> String {
+    let scheme = match config.engine {
+        Engine::Postgres => "postgres",
+        Engine::SqlServer => "mssql",
+        Engine::MongoDb => "mongodb",
+        Engine::Redis => "redis",
+        Engine::ClickHouse => "clickhouse",
+    };
+    let user = config
+        .username
+        .as_deref()
+        .map(|user| format!("{user}@"))
+        .unwrap_or_default();
+    let database = config
+        .database
+        .as_deref()
+        .map(|database| format!("/{database}"))
+        .unwrap_or_default();
+    format!(
+        "{scheme}://{user}{}:{}{database}",
+        config.host, config.port
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,6 +210,19 @@ mod tests {
         // The config is serialised to disk, so nothing about the password may survive parsing.
         let json = serde_json::to_string(&config).unwrap();
         assert!(!json.contains("hunter2"), "password leaked into {json}");
+    }
+
+    #[test]
+    fn connection_url_round_trips_through_the_parser() {
+        for url in [
+            "postgres://app@localhost:55432/app",
+            "mssql://sa@localhost:1433/app",
+            "redis://localhost:6380",
+            "clickhouse://app@localhost:18123/app",
+        ] {
+            let config = parse_connection_url(url).unwrap();
+            assert_eq!(connection_url(&config), url);
+        }
     }
 
     #[test]
