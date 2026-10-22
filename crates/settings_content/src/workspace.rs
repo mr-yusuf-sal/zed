@@ -121,6 +121,13 @@ pub struct WorkspaceSettingsContent {
     ///
     /// Default: auto (nothing on macOS, "app quit" otherwise)
     pub on_last_window_closed: Option<OnLastWindowClosed>,
+    /// System-wide keyboard shortcuts that bring Zed to the front, even while
+    /// it is hidden in the system tray, and then run the given action in that
+    /// window. A `null` action only brings Zed to the front. Windows only.
+    ///
+    /// Default: {}
+    #[serde(default)]
+    pub global_hotkeys: HashMap<String, Option<String>>,
     /// Whether to resize all the panels in a dock when resizing the dock.
     ///
     /// Default: ["left"]
@@ -760,6 +767,9 @@ pub enum OnLastWindowClosed {
     PlatformDefault,
     /// Quit the application the last window is closed
     QuitApp,
+    /// Hide the last window to the system tray instead of closing it, so it
+    /// comes back instantly. Windows only.
+    HideToTray,
 }
 
 #[derive(
@@ -792,6 +802,7 @@ impl OnLastWindowClosed {
         match self {
             OnLastWindowClosed::PlatformDefault => false,
             OnLastWindowClosed::QuitApp => true,
+            OnLastWindowClosed::HideToTray => false,
         }
     }
 }
