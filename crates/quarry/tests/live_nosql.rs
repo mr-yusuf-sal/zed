@@ -941,3 +941,41 @@ fn docker_discovery_finds_the_quarry_containers() {
     assert_eq!(sqlserver.password.as_deref(), Some("Quarry_Pass123!"));
     assert_eq!(servers.len(), 5);
 }
+
+#[test]
+#[ignore = "needs the quarry mongodb on :27018"]
+fn mongodb_password_with_uri_characters() {
+    runtime().block_on(async {
+        let admin = mongo_driver().await;
+        let drop = "{\"dropUser\": \"quarry_live_odd\"}";
+        admin.query(drop, Some("admin"), 10).await.ok();
+        admin
+            .query(
+                "{\"createUser\": \"quarry_live_odd\", \"pwd\": \"p@ss:w/rd%\", \
+                 \"roles\": [{\"role\": \"read\", \"db\": \"app\"}]}",
+                Some("admin"),
+                10,
+            )
+            .await
+            .expect("creating the user");
+        let connected = MongoDriver::connect(
+            "localhost",
+            27018,
+            Some("app"),
+            Some("quarry_live_odd"),
+            Some("p@ss:w/rd%"),
+        )
+        .await;
+        // `ping` needs no login, so it is listing collections that proves the password worked.
+        let listed = match connected {
+            Ok(driver) => driver.children(&path(&["app"])).await,
+            Err(error) => Err(error),
+        };
+        admin
+            .query(drop, Some("admin"), 10)
+            .await
+            .expect("dropping the user");
+        let collections = listed.expect("logging in with a password full of URI characters");
+        assert!(!collections.is_empty());
+    });
+}

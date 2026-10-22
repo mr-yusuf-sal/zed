@@ -5,6 +5,7 @@ use anyhow::{Context as _, Result, bail};
 use futures::{TryStreamExt as _, future::join_all};
 use mongodb::{
     bson::{Bson, DateTime, Document, doc, oid::ObjectId},
+    options::{ClientOptions, Credential},
     results::CollectionType,
 };
 use ui::SharedString;
@@ -42,14 +43,20 @@ impl MongoDriver {
         username: Option<&str>,
         password: Option<&str>,
     ) -> Result<Self> {
-        let credentials = match (username, password) {
-            (Some(user), Some(password)) => format!("{user}:{password}@"),
-            (Some(user), None) => format!("{user}@"),
-            _ => String::new(),
-        };
-        let uri = format!("mongodb://{credentials}{host}:{port}");
-        let client = mongodb::Client::with_uri_str(&uri)
+        let mut options = ClientOptions::parse(format!("mongodb://{host}:{port}"))
             .await
+            .with_context(|| format!("connecting to mongodb at {host}:{port}"))?;
+        // Given as a credential rather than spliced into the URI, where a password containing
+        // `@`, `:` or `/` would have to be percent-encoded to parse at all.
+        if let Some(username) = username {
+            options.credential = Some(
+                Credential::builder()
+                    .username(username.to_string())
+                    .password(password.map(str::to_string))
+                    .build(),
+            );
+        }
+        let client = mongodb::Client::with_options(options)
             .with_context(|| format!("connecting to mongodb at {host}:{port}"))?;
 
         let database = database.filter(|database| !database.is_empty());
