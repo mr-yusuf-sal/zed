@@ -8,34 +8,25 @@ Bu dosya fork'a özel bir çalışma notudur (upstream'e gitmez). İş bitince s
 |---|---|
 | `a121ebb447` | Detay paneli yerleşimi: tek satırlık başlık (avatar + yazar/tarih + butonlar), e-posta/SHA/"View on" yan yana sarılan satırda, alt konumda detaylar solda / dosyalar sağda iki sütun. |
 | `93aad1e861` | Shift+tık ve Shift+↑/↓ ile aralık seçimi ve "N commits selected" paneli (Cherry-pick / Revert / Copy SHAs). Commit ve ref menülerine Checkout, Create Branch Here, Merge, Rebase, Cherry-pick, Revert, Reset (Soft/Mixed/Hard + onay) eklendi. Arama çubuğuna Fetch / Pull / Push butonları eklendi (ahead/behind sayılarıyla). |
+| (bu commit) | Ctrl/Cmd+tık ile commit ekleyip çıkarma ve tam 2 commit seçiliyken "Compare" (panelde buton, menüde "Compare Commits"). Karşılaştırma `CommitView::open_comparison` ile açılıyor ve eski commit'ten yenisine ne değiştiğini gösteriyor. |
 
 Kullanılan tasarım kararları:
 - Merge / rebase / cherry-pick / revert / reset **terminal task'ı** olarak çalışıyor (`run_git_in_terminal`, `git_graph.rs`). Sebebi: `Repository`'de bu işler için job yok ve bunlar conflict'te duran komutlar. Terminal başarı olunca kapanıyor (`HideStrategy::OnSuccess`), hata/conflict'te açık kalıyor.
 - Fetch/Pull/Push butonları `git::Fetch` / `git::Pull` / `git::Push` aksiyonlarını dispatch ediyor. Bu aksiyonlar git panel'in **aktif repo**'su üzerinde çalışıyor, o yüzden graph başka bir repoyu gösteriyorsa butonlar pasif.
 - "Create Branch Here", `CreateTagModal`'ı kullanıyor. Modal artık `CreateRefKind { Tag, Branch }` alıyor (`git_ui.rs`). Branch'i `git switch -c` ile oluşturduğu için branch'e de geçiyor.
 - Commit menüsüne dışarıdan entry eklemek için `CommitContextMenuData.extra_entries` eklendi (`commit_context_menu.rs`).
+- Seçim modeli aralık değil küme: `multi_selected_idxs: Rc<BTreeSet<usize>>` + `selection_anchor_idx`. Boş küme = sadece `selected_entry_idx` seçili, böylece tek commit'lik kod yolları değişmedi. Ctrl/Cmd+tık satırı ekleyip çıkarıyor ve anchor'ı o satıra taşıyor; Shift+tık anchor'dan tıklanan satıra aralığı yeniden kuruyor (ctrl ile eklenmiş diğer satırlar düşüyor, dosya listelerindeki gibi).
+- Karşılaştırmada "eski" ve "yeni" graph'taki sıraya göre: alttaki satır eski. Fark `git diff <eski> <yeni>` ile iki commit'in ağaçları arasında alınıyor; aradaki geçmişe ya da merge-base'e bakılmıyor.
+- Backend: `RealGitRepository::load_commit` artık `eski..yeni` biçimindeki string'i görünce (`split_revision_range`, `repository.rs`) `git show` yerine `git diff -z --no-renames --raw --no-abbrev <eski> <yeni> --` çalıştırıyor; raw çıktı aynı olduğu için ayrıştırma ve cat-file kısmı değişmedi. `git show A..B` aralıktaki her commit'in değişikliğini art arda bastığı için (aynı dosya birden çok kez çıkıyor) kullanılamazdı. Aralıkta shallow kontrolü backend'de atlanıyor: `rev-parse --verify A..B^{commit}` shallow bir klonda "Needed a single revision" hatası veriyor (shallow olmayan repoda `shallow` dosyası olmadığından kontrol zaten rev-parse'a gelmeden dönüyordu). UI da `ignore_shallow_boundary = true` geçiyor. `A...B` ve ucu boş aralıklar bölünmüyor, eskisi gibi `git show`'a gidiyor. Remote (collab) tarafında string proto'dan olduğu gibi geçiyor, proto değişikliği yok.
+- `CommitView`: `older_commit: Option<CommitDetails>` alanı eklendi; `commit` karşılaştırmada yeni commit'in gerçek detayları, yani `commit.sha` her zaman tek bir SHA. Karşılaştırmada ayrı bir başlık çiziliyor ("Changes from abc1234 to def5678" + iki commit'in konusu; avatar, yazar ve SHA kopyalama yok). Sekme başlığı `abc1234..def5678`, tooltip'te iki commit'in konusu, dosya buffer adları `abc1234..def5678 - dosya`. Mevcut sekmeyi bulma `revision()` ile yapılıyor, böylece aynı karşılaştırma tekrar açılınca aynı sekme yenileniyor ve yeni commit tek başına açılınca karşılaştırma sekmesinin yerine geçmiyor. Toolbar'da "View on <provider>" gizli (permalink tek commit'e gidiyor), "Show in Git Graph" yeni commit'i açıyor. "Open File in Project" çalışma ağacındaki dosyayı açtığı için değişmedi.
 
 Bilinen sınırlamalar:
 - Remote branch'te "Checkout", remote öneki olmadan `git switch <ad>` çalıştırıyor. Aynı adda ama başka yerde duran bir local branch varsa, menünün açıldığı commit'e değil ona geçer.
 - Menüler, terminal task'ları ve toolbar henüz çalışan bir build'de denenmedi (clippy + git_ui testleri geçiyor).
-
-## Yarım kalan: 1) Ctrl+tık seçimi + iki commit'i karşılaştırma
-
-Branch: **`wip/git-graph-multi-select-compare`** (origin'de, commit `33902e2ebc`). **Derlenmiyor.**
-
-Yapılanlar:
-- Seçim modeli aralıktan kümeye çevrildi: `multi_selected_idxs: Rc<BTreeSet<usize>>` + `selection_anchor_idx`. Boş küme = sadece `selected_entry_idx` seçili. Render closure'ları için `SelectedRows` snapshot'ı var.
-- `toggle_selection` (ctrl/cmd+tık), `extend_selection` (shift, aralığı yeniden kuruyor), `selected_indices`, `selected_comparison` (eski, yeni) yazıldı.
-- Çoklu seçim panelinde ve menüsünde "Compare" var (tam 2 commit seçiliyken aktif).
-- `test_shift_and_ctrl_selection` testi ctrl+tık ve karşılaştırma sırasını kapsıyor.
-
-Eksikler:
-1. `CommitView::open_comparison(older, newer, repo, workspace, window, cx)` yazılmalı (`commit_view.rs`).
-   - Diff: `repo.load_commit_diff(format!("{older}..{newer}"), true, cx)`. `ignore_shallow_boundary = true` olmalı, çünkü shallow kontrolü `rev-parse A..B^{commit}` yapıp hata verir.
-   - Detaylar: `show_commit(newer)` sonucundan `CommitDetails` kurulup `sha` alanına aralık, `message` alanına "Comparing abc1234..def5678" yazılabilir.
-   - Dikkat: `CommitView` `commit.sha`'yı tek commit varsayarak birçok yerde kullanıyor: SHA kopyalama (~satır 713/746), "View on GitHub" ve permalink (~783/840), sekme başlığı (~1193/1199), mevcut sekmeyi bulma (~263), dosyayı commit'te açma (~535-629). Karşılaştırma modunda bunlar gizlenmeli veya düzgün davranmalı. En temizi `CommitView`'e `comparison: Option<(older, newer)>` alanı eklemek.
-2. Git backend: `RealGitRepository::load_commit` (`crates/git/src/repository.rs` ~1458) şu an `git show --format= -z --no-renames --raw --no-abbrev --first-parent <commit>` çalıştırıyor. `commit` içinde `..` varsa yerine `git diff -z --no-renames --raw --no-abbrev <older> <newer> --` çalışmalı. Çıktı aynı raw formatta olduğu için `parse_git_diff_raw` ve cat-file kısmı aynen kalır. Remote (collab) tarafında string proto'dan olduğu gibi geçiyor, ek değişiklik gerekmez. `FakeGitRepository` için test gerekiyorsa orayı da ele almak lazım.
-3. Derleme, clippy (`cargo clippy -p git_ui --all-targets`), `cargo test -p git_ui --lib`, sonra `custom`'a cherry-pick/merge, commit ve push. İş bitince WIP branch'i silinebilir.
+- Ctrl+tık seçimi ve karşılaştırma görünümü de çalışan bir Zed'de denenmedi; başlığın ve sekmenin görünüşü sadece koddan biliniyor. Testler seçim mantığını, sekmenin yeniden kullanılmasını (fake repo, boş diff) ve gerçek git ile `load_commit`'in aralık davranışını kapsıyor.
+- Collab'da host da bu kodu çalıştırmalı: eski bir host `A..B`'yi hâlâ `git show`'a verir ve yanlış (art arda) diff döner. Collab yolu test edilmedi.
+- `git diff` veya `show` başarısız olursa karşılaştırma sekmesi hiç açılmıyor ve hata sadece log'a düşüyor (tek commit açma yolu da böyle davranıyor).
+- `FakeGitRepository::load_commit` her string için boş diff döndüğünden değiştirilmedi; fake repo'da karşılaştırmanın dosya içeriği test edilemiyor.
 
 ## Yapılacaklar
 
