@@ -407,9 +407,14 @@ impl Driver for ClickHouseDriver {
         // No edit target: ClickHouse tables have no row identity to address an update by, and
         // an ALTER TABLE ... UPDATE mutation is an asynchronous rewrite of whole parts, not an
         // in-place edit of one cell.
+        //
+        // One thread, because without an ORDER BY a parallel read returns blocks in whichever
+        // order its threads finish them: past the first block, some 65,000 rows in, the same
+        // OFFSET gives different rows from one run to the next. A single thread reads the parts
+        // in their stored order, which is what lets a page continue the one before it.
         self.execute(
             &format!(
-                "SELECT * FROM {}.{} LIMIT {} OFFSET {offset}",
+                "SELECT * FROM {}.{} LIMIT {} OFFSET {offset} SETTINGS max_threads = 1",
                 quote_ident(database),
                 quote_ident(table),
                 row_limit + 1

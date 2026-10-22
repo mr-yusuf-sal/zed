@@ -506,6 +506,131 @@ fn postgres_preview_and_edit() {
     });
 }
 
+/// Reads a scratch table holding the keys 1 to 25 in its first column in pages of 10, each
+/// starting at the number of rows already read, which is how "Load More" asks for them.
+async fn check_pages(driver: &dyn Driver, table: &[SharedString]) {
+    let first = driver.preview_page(table, 10, 0).await.expect("first page");
+    let second = driver
+        .preview_page(table, 10, 10)
+        .await
+        .expect("second page");
+    let last = driver.preview_page(table, 10, 20).await.expect("last page");
+    let past_the_end = driver
+        .preview_page(table, 10, 1000)
+        .await
+        .expect("a page past the end");
+    let both = driver
+        .preview(table, 20)
+        .await
+        .expect("the first two pages at once");
+    println!(
+        "pages: {} + {} + {} rows, past the end {}",
+        first.rows.len(),
+        second.rows.len(),
+        last.rows.len(),
+        past_the_end.rows.len()
+    );
+
+    assert!(first.truncated);
+    assert!(second.truncated);
+    assert_eq!(last.rows.len(), 5);
+    assert!(!last.truncated);
+    let paged: Vec<_> = first.rows.iter().chain(&second.rows).cloned().collect();
+    assert_eq!(
+        paged, both.rows,
+        "the second page does not pick up where the first stopped"
+    );
+    let mut keys: Vec<i64> = [&first, &second, &last]
+        .into_iter()
+        .flat_map(|page| (0..page.rows.len()).map(move |row| cell(page, row, 0)))
+        .map(|key| key.and_then(|key| key.parse().ok()).expect("a numeric key"))
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, (1..=25).collect::<Vec<_>>());
+    assert!(past_the_end.rows.is_empty());
+    assert!(!past_the_end.truncated);
+    assert!(first.edit_target.is_some());
+    assert_eq!(second.edit_target, first.edit_target);
+}
+
+#[test]
+#[ignore = "needs a live postgres"]
+fn postgres_preview_pages() {
+    runtime().block_on(async {
+        let driver = postgres().await;
+        for statement in [
+            "DROP TABLE IF EXISTS public.quarry_live_pages",
+            "CREATE TABLE public.quarry_live_pages (n integer PRIMARY KEY, note text)",
+            "INSERT INTO public.quarry_live_pages
+             SELECT n, 'row ' || n FROM generate_series(1, 25) AS n",
+        ] {
+            driver
+                .query(statement, None, 10)
+                .await
+                .unwrap_or_else(|error| panic!("{statement}: {error:#}"));
+        }
+        check_pages(
+            driver.as_ref(),
+            &path(&["app", "public", "quarry_live_pages"]),
+        )
+        .await;
+        driver
+            .query("DROP TABLE public.quarry_live_pages", None, 10)
+            .await
+            .expect("dropping the scratch table");
+    });
+}
+
+#[test]
+#[ignore = "needs a live postgres"]
+fn postgres_preview_does_not_join_another_scan() {
+    runtime().block_on(async {
+        let driver = postgres().await;
+        let run = |statement: &'static str| {
+            let driver = driver.clone();
+            async move {
+                driver
+                    .query(statement, None, 10)
+                    .await
+                    .unwrap_or_else(|error| panic!("{statement}: {error:#}"))
+            }
+        };
+        // Some 60MB: past a quarter of the default shared_buffers, the size from which Postgres
+        // starts a new scan of a table where another session's scan of it has got to.
+        run("DROP TABLE IF EXISTS public.quarry_live_big").await;
+        run("CREATE TABLE public.quarry_live_big AS
+             SELECT n, repeat('x', 200) AS pad FROM generate_series(1, 250000) AS n")
+        .await;
+        let large_enough = only(
+            run("SELECT pg_relation_size('public.quarry_live_big') * 4
+                    > pg_size_bytes(current_setting('shared_buffers'))")
+            .await,
+        );
+        assert_eq!(
+            cell(&large_enough, 0, 0).as_deref(),
+            Some("t"),
+            "shared_buffers is too large for this table to share a scan, so the test proves nothing"
+        );
+        // The editor's session stops half-way through a scan of the table.
+        run("BEGIN").await;
+        run("DECLARE quarry_live_scan NO SCROLL CURSOR FOR SELECT n FROM public.quarry_live_big")
+            .await;
+        run("FETCH 125000 FROM quarry_live_scan").await;
+        let page = driver
+            .preview_page(&path(&["app", "public", "quarry_live_big"]), 5, 0)
+            .await
+            .expect("previewing during the other scan");
+        run("ROLLBACK").await;
+        run("DROP TABLE public.quarry_live_big").await;
+        println!("first row during the other scan: {:?}", cell(&page, 0, 0));
+        assert_eq!(
+            cell(&page, 0, 0).as_deref(),
+            Some("1"),
+            "the preview started where the other session's scan was"
+        );
+    });
+}
+
 #[test]
 #[ignore = "needs a live postgres"]
 fn postgres_definitions_and_catalog() {
@@ -998,6 +1123,33 @@ fn sqlserver_preview_and_edit() {
             .await
             .expect_err("updating with a partial key");
         println!("partial key: {too_many:#}");
+    });
+}
+
+#[test]
+#[ignore = "needs a live sql server"]
+fn sqlserver_preview_pages() {
+    runtime().block_on(async {
+        let driver = sqlserver().await;
+        for statement in [
+            "DROP TABLE IF EXISTS dbo.quarry_live_pages",
+            "CREATE TABLE dbo.quarry_live_pages (n int PRIMARY KEY, note nvarchar(20))",
+            "INSERT INTO dbo.quarry_live_pages
+             SELECT TOP (25) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), N'row'
+             FROM sys.all_objects",
+        ] {
+            driver
+                .query(statement, Some("app"), 10)
+                .await
+                .unwrap_or_else(|error| panic!("{statement}: {error:#}"));
+        }
+        // The first page is read with TOP and the ones after it with OFFSET ... FETCH, so this
+        // is also what shows the two agree on the order.
+        check_pages(driver.as_ref(), &path(&["app", "dbo", "quarry_live_pages"])).await;
+        driver
+            .query("DROP TABLE dbo.quarry_live_pages", Some("app"), 10)
+            .await
+            .expect("dropping the scratch table");
     });
 }
 
