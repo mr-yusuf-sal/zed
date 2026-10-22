@@ -1,7 +1,12 @@
-use crate::driver::{Driver, ObjectKind, ObjectNode, ResultSet};
+use crate::driver::{
+    CatalogEntry, CellEdit, Driver, EditTarget, ObjectKind, ObjectNode, ResultSet,
+};
 use anyhow::{Context as _, Result, bail};
-use futures::TryStreamExt as _;
-use mongodb::bson::{Bson, Document, doc};
+use futures::{TryStreamExt as _, future::join_all};
+use mongodb::{
+    bson::{Bson, DateTime, Document, doc, oid::ObjectId},
+    results::CollectionType,
+};
 use ui::SharedString;
 
 /// MongoDB stores documents, not rows, and two documents in one collection need not share a
@@ -16,6 +21,18 @@ pub struct MongoDriver {
     client: mongodb::Client,
     default_database: Option<String>,
 }
+
+/// Databases every server has and nobody browses for their data.
+const SYSTEM_DATABASES: [&str; 3] = ["admin", "local", "config"];
+
+/// Commands whose reply is a cursor. These go through `run_cursor_command`, which follows
+/// `getMore` in the cursor's own session; a hand-rolled `getMore` from another implicit
+/// session is rejected by the server.
+const CURSOR_COMMANDS: [&str; 4] = ["find", "aggregate", "listCollections", "listIndexes"];
+
+/// Bounds the catalog on a database with an unreasonable number of collections, since each one
+/// costs a sampled document.
+const CATALOG_COLLECTION_LIMIT: usize = 200;
 
 impl MongoDriver {
     pub async fn connect(
@@ -35,6 +52,7 @@ impl MongoDriver {
             .await
             .with_context(|| format!("connecting to mongodb at {host}:{port}"))?;
 
+        let database = database.filter(|database| !database.is_empty());
         // with_uri_str is lazy, so ping to turn a bad host or password into an error here
         // rather than on the first expansion of the tree.
         client
@@ -47,6 +65,70 @@ impl MongoDriver {
             client,
             default_database: database.map(str::to_string),
         })
+    }
+
+    async fn collections(&self, database: &str) -> Result<Vec<(String, CollectionType)>> {
+        let mut collections: Vec<(String, CollectionType)> = self
+            .client
+            .database(database)
+            .list_collections()
+            .await
+            .with_context(|| format!("listing collections in {database}"))?
+            .map_ok(|specification| (specification.name, specification.collection_type))
+            .try_collect()
+            .await
+            .with_context(|| format!("listing collections in {database}"))?;
+        collections.retain(|(name, _)| !name.starts_with("system."));
+        collections.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(collections)
+    }
+
+    /// One document's top-level fields and their types. A collection has no schema, so one
+    /// sample is a hint about its shape, not a description of it.
+    async fn sample_fields(
+        &self,
+        database: &str,
+        collection: &str,
+    ) -> Result<Vec<(String, &'static str)>> {
+        let document = self
+            .client
+            .database(database)
+            .collection::<Document>(collection)
+            .find_one(doc! {})
+            .await
+            .with_context(|| format!("sampling {database}.{collection}"))?;
+        Ok(document
+            .into_iter()
+            .flat_map(|document| document.into_iter())
+            .map(|(name, value)| (name, type_name(&value)))
+            .collect())
+    }
+}
+
+/// The names the shell and `$type` use, which are what someone reading the tree will know.
+fn type_name(value: &Bson) -> &'static str {
+    match value {
+        Bson::Double(_) => "double",
+        Bson::String(_) => "string",
+        Bson::Array(_) => "array",
+        Bson::Document(_) => "object",
+        Bson::Boolean(_) => "bool",
+        Bson::Null => "null",
+        Bson::RegularExpression(_) => "regex",
+        Bson::JavaScriptCode(_) => "javascript",
+        Bson::JavaScriptCodeWithScope(_) => "javascriptWithScope",
+        Bson::Int32(_) => "int",
+        Bson::Int64(_) => "long",
+        Bson::Timestamp(_) => "timestamp",
+        Bson::Binary(_) => "binData",
+        Bson::ObjectId(_) => "objectId",
+        Bson::DateTime(_) => "date",
+        Bson::Symbol(_) => "symbol",
+        Bson::Decimal128(_) => "decimal",
+        Bson::Undefined => "undefined",
+        Bson::MaxKey => "maxKey",
+        Bson::MinKey => "minKey",
+        Bson::DbPointer(_) => "dbPointer",
     }
 }
 
@@ -70,6 +152,37 @@ fn render(value: &Bson) -> Option<SharedString> {
                 .unwrap_or_else(|_| format!("{other:?}")),
         )),
     }
+}
+
+/// Reads text typed into a cell back into BSON: extended JSON when it parses, so `42`, `true`,
+/// `{"a": 1}` and `{"$oid": "..."}` keep their types, and a plain string otherwise.
+fn parse_value(text: &str) -> Bson {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|json| Bson::try_from(json).ok())
+        .unwrap_or_else(|| Bson::String(text.to_string()))
+}
+
+/// Every value a displayed `_id` could have been. The grid shows an ObjectId as bare hex and a
+/// number as digits, so the text alone does not say which it was; the caller asks the server
+/// which of these actually exists.
+fn id_candidates(displayed: Option<&str>) -> Vec<Bson> {
+    let Some(displayed) = displayed else {
+        return vec![Bson::Null];
+    };
+    let mut candidates = Vec::new();
+    if let Ok(id) = ObjectId::parse_str(displayed) {
+        candidates.push(Bson::ObjectId(id));
+    }
+    let parsed = parse_value(displayed);
+    if !candidates.contains(&parsed) {
+        candidates.push(parsed);
+    }
+    let text = Bson::String(displayed.to_string());
+    if !candidates.contains(&text) {
+        candidates.push(text);
+    }
+    candidates
 }
 
 fn to_result_set(documents: Vec<Document>, truncated: bool) -> ResultSet {
@@ -98,9 +211,29 @@ fn to_result_set(documents: Vec<Document>, truncated: bool) -> ResultSet {
     ResultSet {
         columns,
         rows,
-        rows_affected: None,
-        notices: Vec::new(),
         truncated,
+        ..ResultSet::default()
+    }
+}
+
+/// Write commands report success with `ok: 1` even when individual writes failed, so the
+/// failures have to be dug out of `writeErrors` to be noticed at all.
+fn write_errors(response: &Document) -> Option<String> {
+    let errors = response.get_array("writeErrors").ok()?;
+    let messages: Vec<String> = errors
+        .iter()
+        .filter_map(|error| error.as_document()?.get_str("errmsg").ok())
+        .map(str::to_string)
+        .collect();
+    (!messages.is_empty()).then(|| messages.join("; "))
+}
+
+fn count(response: &Document, field: &str) -> Option<u64> {
+    match response.get(field)? {
+        Bson::Int32(n) => u64::try_from(*n).ok(),
+        Bson::Int64(n) => u64::try_from(*n).ok(),
+        Bson::Double(n) => Some(*n as u64),
+        _ => None,
     }
 }
 
@@ -108,90 +241,144 @@ fn to_result_set(documents: Vec<Document>, truncated: bool) -> ResultSet {
 impl Driver for MongoDriver {
     async fn children(&self, path: &[SharedString]) -> Result<Vec<ObjectNode>> {
         match path {
-            [] => {
-                let names = self
-                    .client
-                    .list_database_names()
-                    .await
-                    .context("listing databases")?;
-                Ok(names
-                    .into_iter()
-                    .filter(|name| !matches!(name.as_str(), "admin" | "local" | "config"))
-                    .map(|name| {
-                        let name = SharedString::from(name);
-                        ObjectNode {
-                            path: vec![name.clone()],
-                            name,
-                            kind: ObjectKind::Database,
-                            has_children: true,
-                            detail: None,
-                        }
-                    })
-                    .collect())
-            }
+            [] => Ok(self
+                .databases()
+                .await?
+                .into_iter()
+                .map(|name| ObjectNode {
+                    path: vec![name.clone()],
+                    name,
+                    kind: ObjectKind::Database,
+                    has_children: true,
+                    detail: None,
+                })
+                .collect()),
             [database] => {
-                let names = self
-                    .client
-                    .database(database)
-                    .list_collection_names()
-                    .await
-                    .with_context(|| format!("listing collections in {database}"))?;
-                Ok(names
+                let collections = self.collections(database).await?;
+                let database_handle = self.client.database(database);
+                // Estimated counts come from collection metadata, not a scan, so asking for all
+                // of them at once is cheap. A view has no metadata count and is left blank.
+                let counts = join_all(collections.iter().map(|(name, kind)| {
+                    let collection = database_handle.collection::<Document>(name);
+                    let is_view = matches!(kind, CollectionType::View);
+                    async move {
+                        if is_view {
+                            None
+                        } else {
+                            collection.estimated_document_count().await.ok()
+                        }
+                    }
+                }))
+                .await;
+                Ok(collections
                     .into_iter()
-                    .map(|name| {
+                    .zip(counts)
+                    .map(|((name, kind), count)| {
                         let name = SharedString::from(name);
                         ObjectNode {
                             path: vec![database.clone(), name.clone()],
                             name,
                             kind: ObjectKind::Collection,
-                            // A collection has no schema to expand into.
-                            has_children: false,
-                            detail: None,
+                            has_children: count != Some(0),
+                            detail: match (kind, count) {
+                                (CollectionType::View, _) => Some(SharedString::from("view")),
+                                (_, Some(count)) => {
+                                    Some(SharedString::from(format!("~{count} docs")))
+                                }
+                                _ => None,
+                            },
                         }
                     })
                     .collect())
             }
+            [database, collection] => Ok(self
+                .sample_fields(database, collection)
+                .await?
+                .into_iter()
+                .map(|(field, kind)| {
+                    let name = SharedString::from(field);
+                    ObjectNode {
+                        path: vec![database.clone(), collection.clone(), name.clone()],
+                        name,
+                        kind: ObjectKind::Column,
+                        has_children: false,
+                        detail: Some(SharedString::from(kind)),
+                    }
+                })
+                .collect()),
             _ => Ok(Vec::new()),
         }
     }
 
     /// Takes a raw command document, the same thing `db.runCommand(...)` takes, because that is
     /// the one form that can express every operation rather than a hand-rolled subset.
-    async fn query(&self, text: &str, row_limit: usize) -> Result<ResultSet> {
-        let command: Document = serde_json::from_str::<serde_json::Value>(text)
-            .context("the query must be a JSON command document, e.g. {\"find\": \"users\"}")
-            .and_then(|json| {
-                mongodb::bson::to_document(&json).context("converting the command to BSON")
-            })?;
+    async fn query(
+        &self,
+        statement: &str,
+        database: Option<&str>,
+        row_limit: usize,
+    ) -> Result<Vec<ResultSet>> {
+        let json = serde_json::from_str::<serde_json::Value>(statement)
+            .context("the query must be a JSON command document, e.g. {\"find\": \"users\"}")?;
+        let serde_json::Value::Object(json) = json else {
+            bail!("the query must be a JSON object, e.g. {{\"find\": \"users\"}}");
+        };
+        // Extended JSON, so `{"_id": {"$oid": "..."}}` in a filter is an ObjectId rather than a
+        // nested document with a `$oid` field.
+        let mut command = Document::try_from(json).context("converting the command to BSON")?;
 
-        let database = command
-            .get_str("$db")
-            .ok()
-            .map(str::to_string)
-            .or_else(|| self.default_database.clone())
-            .context("no database: add \"$db\" to the command or put one in the connection URL")?;
+        // A `$db` written into the command is the most specific choice there is, so it wins
+        // over the editor's database picker. It is removed because the driver adds its own.
+        let database = match command.remove("$db") {
+            Some(Bson::String(database)) => Some(database),
+            Some(other) => bail!("\"$db\" must be a string, got {other}"),
+            None => None,
+        }
+        .or_else(|| database.map(str::to_string))
+        .or_else(|| self.default_database.clone())
+        .context(
+            "no database: pick one, add \"$db\" to the command or put one in the connection",
+        )?;
+        let database = self.client.database(&database);
 
-        let response = self
-            .client
-            .database(&database)
+        let command_name = command.keys().next().cloned().unwrap_or_default();
+        if CURSOR_COMMANDS.contains(&command_name.as_str()) && !command.contains_key("explain") {
+            let mut cursor = database
+                .run_cursor_command(command)
+                .await
+                .context("running the command")?;
+            let mut documents = Vec::new();
+            // One more than asked for is how the view learns the page was cut short. Dropping
+            // the cursor afterwards makes the driver kill it on the server.
+            while documents.len() <= row_limit
+                && let Some(document) = cursor.try_next().await.context("reading results")?
+            {
+                documents.push(document);
+            }
+            let truncated = documents.len() > row_limit;
+            documents.truncate(row_limit);
+            return Ok(vec![to_result_set(documents, truncated)]);
+        }
+
+        let response = database
             .run_command(command)
             .await
             .context("running the command")?;
-
-        // A find returns its documents inside cursor.firstBatch; everything else is better
-        // shown as the single response document it is.
-        if let Ok(cursor) = response.get_document("cursor") {
-            if let Ok(batch) = cursor.get_array("firstBatch") {
-                let truncated = batch.len() > row_limit;
-                let documents = batch
-                    .iter()
-                    .take(row_limit)
-                    .filter_map(|value| value.as_document().cloned())
-                    .collect();
-                return Ok(to_result_set(documents, truncated));
-            }
+        if let Some(errors) = write_errors(&response) {
+            bail!("{errors}");
         }
-        Ok(to_result_set(vec![response], false))
+        let rows_affected = match command_name.as_str() {
+            "update" => count(&response, "nModified"),
+            "insert" | "delete" => count(&response, "n"),
+            _ => None,
+        };
+        if let Some(rows_affected) = rows_affected {
+            return Ok(vec![ResultSet {
+                rows_affected: Some(rows_affected),
+                ..ResultSet::default()
+            }]);
+        }
+        Ok(vec![to_result_set(vec![response], false)])
     }
 
     async fn preview(&self, path: &[SharedString], row_limit: usize) -> Result<ResultSet> {
@@ -211,6 +398,153 @@ impl Driver for MongoDriver {
         let mut documents: Vec<Document> = cursor.try_collect().await.context("reading rows")?;
         let truncated = documents.len() > row_limit;
         documents.truncate(row_limit);
-        Ok(to_result_set(documents, truncated))
+        let mut result = to_result_set(documents, truncated);
+        result.edit_target = result
+            .columns
+            .iter()
+            .position(|column| column.as_ref() == "_id")
+            .map(|id_column| EditTarget {
+                path: vec![database.clone(), collection.clone()],
+                key_columns: vec![id_column],
+                read_only_columns: vec![id_column],
+            });
+        Ok(result)
+    }
+
+    async fn databases(&self) -> Result<Vec<SharedString>> {
+        let mut names: Vec<String> = self
+            .client
+            .list_database_names()
+            .await
+            .context("listing databases")?
+            .into_iter()
+            .filter(|name| !SYSTEM_DATABASES.contains(&name.as_str()))
+            .collect();
+        // A database that does not exist yet still belongs in the picker if the connection
+        // names it: the first insert is what creates it.
+        if let Some(default_database) = &self.default_database
+            && !names.contains(default_database)
+        {
+            names.push(default_database.clone());
+        }
+        names.sort();
+        Ok(names.into_iter().map(SharedString::from).collect())
+    }
+
+    fn default_database(&self) -> Option<SharedString> {
+        self.default_database.clone().map(SharedString::from)
+    }
+
+    async fn catalog(&self, database: Option<&str>) -> Result<Vec<CatalogEntry>> {
+        let Some(database) = database
+            .map(str::to_string)
+            .or_else(|| self.default_database.clone())
+        else {
+            return Ok(Vec::new());
+        };
+        let mut collections = self.collections(&database).await?;
+        collections.truncate(CATALOG_COLLECTION_LIMIT);
+        let database_name = SharedString::from(database.clone());
+
+        let fields = join_all(
+            collections
+                .iter()
+                .map(|(name, _)| self.sample_fields(&database, name)),
+        )
+        .await;
+
+        let mut entries = Vec::new();
+        for ((name, _), fields) in collections.into_iter().zip(fields) {
+            let collection = SharedString::from(name);
+            entries.push(CatalogEntry {
+                label: collection.clone(),
+                kind: ObjectKind::Collection,
+                parent: Some(database_name.clone()),
+                detail: None,
+            });
+            // A collection that cannot be sampled, a view over a missing source for instance,
+            // still has a name worth completing.
+            for (field, kind) in fields.unwrap_or_default() {
+                entries.push(CatalogEntry {
+                    label: SharedString::from(field),
+                    kind: ObjectKind::Column,
+                    parent: Some(collection.clone()),
+                    detail: Some(SharedString::from(kind)),
+                });
+            }
+        }
+        Ok(entries)
+    }
+
+    async fn update_cell(&self, edit: &CellEdit) -> Result<u64> {
+        let [database, collection, ..] = edit.path.as_slice() else {
+            bail!("expected a database and a collection, got {:?}", edit.path);
+        };
+        let field = edit.column.as_ref();
+        if field == "_id" {
+            bail!("_id cannot be changed; a document's identity is fixed");
+        }
+        // `$set` reads a dot as a path into a nested document and a leading `$` as an operator,
+        // so such a column name would update something other than the cell that was edited.
+        if field.contains('.') || field.starts_with('$') {
+            bail!("the field {field:?} cannot be addressed by an update");
+        }
+        let displayed_id = edit
+            .key
+            .iter()
+            .find(|(name, _)| name.as_ref() == "_id")
+            .map(|(_, value)| value.as_ref().map(|value| value.as_ref()))
+            .context("the edit does not say which document to change")?;
+
+        let collection = self
+            .client
+            .database(database)
+            .collection::<Document>(collection);
+        let filter = doc! { "_id": { "$in": id_candidates(displayed_id) } };
+        let matches: Vec<Document> = collection
+            .find(filter)
+            .limit(2)
+            .await
+            .context("finding the document")?
+            .try_collect()
+            .await
+            .context("finding the document")?;
+        let [document] = matches.as_slice() else {
+            bail!(
+                "{} documents match _id {}; refusing to guess which one to change",
+                matches.len(),
+                displayed_id.unwrap_or("null")
+            );
+        };
+        let id = document.get("_id").cloned().unwrap_or(Bson::Null);
+
+        let value = match edit.value.as_deref() {
+            None => Bson::Null,
+            // Dates and ObjectIds are displayed as plain text, so typing one back would store a
+            // string. Keep the field's type when the text still reads as that type.
+            Some(text) => match document.get(field) {
+                Some(Bson::DateTime(_)) => DateTime::parse_rfc3339_str(text.trim())
+                    .map(Bson::DateTime)
+                    .unwrap_or_else(|_| parse_value(text)),
+                Some(Bson::ObjectId(_)) => ObjectId::parse_str(text.trim())
+                    .map(Bson::ObjectId)
+                    .unwrap_or_else(|_| parse_value(text)),
+                _ => parse_value(text),
+            },
+        };
+
+        let mut assignment = Document::new();
+        assignment.insert(field, value);
+        let result = collection
+            .update_one(doc! { "_id": id }, doc! { "$set": assignment })
+            .await
+            .context("updating the document")?;
+        if result.matched_count != 1 {
+            bail!(
+                "the update matched {} documents instead of one",
+                result.matched_count
+            );
+        }
+        Ok(result.matched_count)
     }
 }
