@@ -1,5 +1,6 @@
 use crate::{
     connection_store::{ConnectionStore, connection_url, parse_connection_url},
+    docker::DiscoveredServer,
     driver::{ConnectionConfig, Driver, Environment, ObjectKind, ObjectNode},
     query_view::{QueryView, environment_badge},
     runtime::QuarryRuntime,
@@ -210,6 +211,10 @@ pub struct QuarryPanel {
     width: Option<Pixels>,
     position: DockPosition,
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
+    /// Set while `docker inspect` is running for "Add from Docker Containers".
+    discovering: Option<Task<()>>,
+    /// A one-line message under the header, such as why Docker discovery found nothing.
+    notice: Option<(SharedString, Color)>,
     /// Folders whose connections are hidden. Not persisted: a restart opens every folder.
     collapsed_folders: HashSet<String>,
     _tasks: Vec<Task<()>>,
@@ -260,6 +265,8 @@ impl QuarryPanel {
             position: DockPosition::Left,
             context_menu: None,
             collapsed_folders: HashSet::default(),
+            discovering: None,
+            notice: None,
             _tasks: Vec::new(),
         }
     }
@@ -436,6 +443,114 @@ impl QuarryPanel {
             self.save_password(&config, password, cx);
             self.forget_password_if_unused(&previous, cx);
         }
+    }
+
+    /// Asks Docker for running database containers and offers the ones not saved yet in a menu
+    /// at `position`.
+    fn discover_docker(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.notice = Some(("Looking for database containers…".into(), Color::Muted));
+        let discovery = cx.background_spawn(crate::docker::discover());
+        self.discovering = Some(cx.spawn_in(window, async move |this, cx| {
+            let discovered = discovery.await;
+            this.update_in(cx, |this, window, cx| {
+                this.discovering = None;
+                this.notice = None;
+                match discovered {
+                    Ok(servers) => this.offer_discovered(servers, position, window, cx),
+                    Err(error) => {
+                        this.notice = Some((format!("{error:#}").into(), Color::Error));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn offer_discovered(
+        &mut self,
+        servers: Vec<DiscoveredServer>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let total = servers.len();
+        let new: Vec<DiscoveredServer> = {
+            let saved = self.store.read(cx).connections();
+            servers
+                .into_iter()
+                .filter(|server| {
+                    !saved.iter().any(|config| {
+                        config.credential_url() == server.config.credential_url()
+                            && config.username == server.config.username
+                            && config.database == server.config.database
+                    })
+                })
+                .collect()
+        };
+        if new.is_empty() {
+            let notice = if total == 0 {
+                "No running container publishes a PostgreSQL, SQL Server, MongoDB, Redis or \
+                 ClickHouse port"
+                    .to_string()
+            } else {
+                format!("All {total} database container(s) are already saved")
+            };
+            self.notice = Some((notice.into(), Color::Muted));
+            return;
+        }
+        let panel = cx.entity().downgrade();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            menu = menu.header("Docker Containers");
+            if new.len() > 1 {
+                let panel = panel.clone();
+                let all = new.clone();
+                menu = menu
+                    .entry(format!("Add All {}", all.len()), None, move |_, cx| {
+                        panel
+                            .update(cx, |this, cx| {
+                                for server in all.clone() {
+                                    this.add_discovered(server, cx);
+                                }
+                            })
+                            .log_err();
+                    })
+                    .separator();
+            }
+            for server in new {
+                let panel = panel.clone();
+                let label = format!(
+                    "{} · {} {}:{}",
+                    server.container,
+                    server.config.engine.label(),
+                    server.config.host,
+                    server.config.port
+                );
+                menu = menu.entry(label, None, move |_, cx| {
+                    panel
+                        .update(cx, |this, cx| this.add_discovered(server.clone(), cx))
+                        .log_err();
+                });
+            }
+            menu
+        });
+        self.deploy_context_menu(position, menu, window, cx);
+    }
+
+    /// Saves a discovered container as a connection, filing the password its environment
+    /// gave in the OS credential store like a typed one.
+    fn add_discovered(&mut self, server: DiscoveredServer, cx: &mut Context<Self>) {
+        if let Some(password) = server.password {
+            self.save_password(&server.config, password, cx);
+        }
+        self.store
+            .update(cx, |store, cx| store.add(server.config, cx));
     }
 
     /// Adds a copy of the connection, for pointing the same server at another database or
@@ -1549,14 +1664,52 @@ impl Render for QuarryPanel {
                             .color(Color::Muted),
                     )
                     .child(
-                        IconButton::new("quarry-add", IconName::Plus)
-                            .icon_size(IconSize::Small)
-                            .tooltip(|_, cx| Tooltip::simple("Add Connection", cx))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.start_adding(window, cx);
-                            })),
+                        h_flex()
+                            .gap_0p5()
+                            .child(
+                                IconButton::new("quarry-docker", IconName::Box)
+                                    .icon_size(IconSize::Small)
+                                    .disabled(self.discovering.is_some())
+                                    .tooltip(|_, cx| {
+                                        Tooltip::simple("Add from Docker Containers", cx)
+                                    })
+                                    .on_click(cx.listener(
+                                        |this, event: &gpui::ClickEvent, window, cx| {
+                                            this.discover_docker(event.position(), window, cx);
+                                        },
+                                    )),
+                            )
+                            .child(
+                                IconButton::new("quarry-add", IconName::Plus)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(|_, cx| Tooltip::simple("Add Connection", cx))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.start_adding(window, cx);
+                                    })),
+                            ),
                     ),
             )
+            .children(self.notice.clone().map(|(notice, color)| {
+                h_flex()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Label::new(notice).size(LabelSize::XSmall).color(color)),
+                    )
+                    .child(
+                        IconButton::new("quarry-dismiss-notice", IconName::Close)
+                            .icon_size(IconSize::XSmall)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.notice = None;
+                                cx.notify();
+                            })),
+                    )
+            }))
             .children(self.draft.as_ref().map(|draft| {
                 let editing_name = draft
                     .editing

@@ -6,6 +6,7 @@
 
 pub mod completion;
 pub mod connection_store;
+pub mod docker;
 pub mod driver;
 pub mod drivers;
 pub mod panel;

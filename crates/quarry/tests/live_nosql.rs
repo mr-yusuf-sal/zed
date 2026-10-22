@@ -909,3 +909,35 @@ fn clickhouse_create_script() {
         assert_eq!(rows.rows.len(), 5);
     });
 }
+
+#[test]
+#[ignore = "needs the quarry containers running under docker"]
+fn docker_discovery_finds_the_quarry_containers() {
+    let servers =
+        futures::executor::block_on(quarry::docker::discover()).expect("asking docker");
+    for server in &servers {
+        println!(
+            "{} → {} {}:{} user={:?} db={:?} password={}",
+            server.container,
+            server.config.engine.label(),
+            server.config.host,
+            server.config.port,
+            server.config.username,
+            server.config.database,
+            server.password.is_some()
+        );
+    }
+    let mongo = servers
+        .iter()
+        .find(|server| server.container == "quarry-mongodb")
+        .expect("the mongodb container");
+    assert_eq!(mongo.config.port, 27018);
+    assert_eq!(mongo.config.username.as_deref(), Some("app"));
+    assert_eq!(mongo.password.as_deref(), Some("app"));
+    let sqlserver = servers
+        .iter()
+        .find(|server| server.container == "quarry-sqlserver")
+        .expect("the sql server container");
+    assert_eq!(sqlserver.password.as_deref(), Some("Quarry_Pass123!"));
+    assert_eq!(servers.len(), 5);
+}
