@@ -1,5 +1,5 @@
 //! Keeps this fork in step with the companion server in incapon (`workers/zed-fork`): it
-//! installs builds published from `tools\ZedFork\build.ps1 -Publish`, and syncs the user's
+//! installs builds published from `script\fork\build.ps1 -Publish`, and syncs the user's
 //! config files and Claude Code sessions between machines under the GitHub account they
 //! signed in to Zed with.
 
