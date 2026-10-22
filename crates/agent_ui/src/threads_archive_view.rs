@@ -261,6 +261,15 @@ impl ThreadsArchiveView {
         handle.focus(window, cx);
     }
 
+    pub fn show_only_archived(&mut self, cx: &mut Context<Self>) {
+        self.thread_filter = ThreadFilter::ArchivedOnly;
+        self.update_items(cx);
+    }
+
+    pub fn is_showing_only_archived(&self) -> bool {
+        self.thread_filter == ThreadFilter::ArchivedOnly
+    }
+
     pub fn is_filter_editor_focused(&self, window: &Window, cx: &App) -> bool {
         self.filter_editor
             .read(cx)
