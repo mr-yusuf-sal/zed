@@ -56,6 +56,53 @@ pub fn to_table_content(result: &ResultSet, rows: &[usize]) -> TableLikeContent 
     }
 }
 
+/// Adds `page`, the rows that follow `result`'s in the same table, to the end of `result`.
+///
+/// Columns are matched by name rather than by position, because MongoDB builds each page's
+/// columns from the documents in it: a later page can list the fields in another order or bring
+/// fields no earlier document had. Those go after the existing columns, so the indexes in
+/// `result.edit_target` keep naming the same columns, and the rows already there read NULL in
+/// them. A name that appears twice is matched occurrence by occurrence.
+pub fn append_page(result: &mut ResultSet, page: ResultSet) {
+    let mut matched = vec![false; result.columns.len()];
+    let mut positions = Vec::with_capacity(page.columns.len());
+    for column in page.columns {
+        let existing = result
+            .columns
+            .iter()
+            .zip(&matched)
+            .position(|(name, matched)| !matched && *name == column);
+        let position = existing.unwrap_or_else(|| {
+            result.columns.push(column);
+            matched.push(false);
+            result.columns.len() - 1
+        });
+        if let Some(matched) = matched.get_mut(position) {
+            *matched = true;
+        }
+        positions.push(position);
+    }
+
+    let width = result.columns.len();
+    for row in &mut result.rows {
+        if row.len() < width {
+            row.resize(width, None);
+        }
+    }
+    result.rows.extend(page.rows.into_iter().map(|cells| {
+        let mut row = vec![None; width];
+        for (cell, &position) in cells.into_iter().zip(&positions) {
+            if let Some(slot) = row.get_mut(position) {
+                *slot = cell;
+            }
+        }
+        row
+    }));
+    result.truncated = page.truncated;
+    // Notices describe the object as it is now, such as a Redis key's time to live.
+    result.notices = page.notices;
+}
+
 /// The rows with a cell containing `query`, ignoring case. NULL is matched by the word it is
 /// shown as, so searching for "null" finds the rows that have one.
 pub fn matching_rows(result: &ResultSet, query: &str) -> Vec<usize> {
@@ -156,6 +203,7 @@ pub fn to_json(result: &ResultSet) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::EditTarget;
 
     fn cell(value: &str) -> Option<SharedString> {
         Some(SharedString::from(value.to_string()))
@@ -213,7 +261,99 @@ mod tests {
         assert_eq!(matching_rows(&result, ""), vec![0, 1, 2]);
         let content = to_table_content(&result, &[2]);
         assert_eq!(content.rows.len(), 1);
-        assert!(matches!(content.line_numbers.as_slice(), [LineNumber::Line(3)]));
+        assert!(matches!(
+            content.line_numbers.as_slice(),
+            [LineNumber::Line(3)]
+        ));
+    }
+
+    #[test]
+    fn appends_a_page_by_column_name() {
+        let target = EditTarget {
+            path: vec![SharedString::from("app"), SharedString::from("users")],
+            key_columns: vec![0],
+            read_only_columns: vec![0],
+        };
+        let mut result = ResultSet {
+            columns: vec![SharedString::from("_id"), SharedString::from("name")],
+            rows: vec![vec![cell("1"), cell("Ayşe")], vec![cell("2"), None]],
+            truncated: true,
+            notices: vec![SharedString::from("ttl 10s")],
+            edit_target: Some(target.clone()),
+            ..Default::default()
+        };
+        // The next page's documents list their fields in another order and bring a new one.
+        let page = ResultSet {
+            columns: vec![
+                SharedString::from("name"),
+                SharedString::from("_id"),
+                SharedString::from("nickname"),
+            ],
+            rows: vec![vec![cell("Can"), cell("3"), cell("Cano")]],
+            truncated: false,
+            notices: vec![SharedString::from("ttl 9s")],
+            edit_target: Some(EditTarget {
+                key_columns: vec![1],
+                read_only_columns: vec![1],
+                ..target.clone()
+            }),
+            ..Default::default()
+        };
+        append_page(&mut result, page);
+
+        assert_eq!(
+            result.columns,
+            vec![
+                SharedString::from("_id"),
+                SharedString::from("name"),
+                SharedString::from("nickname"),
+            ]
+        );
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![cell("1"), cell("Ayşe"), None],
+                vec![cell("2"), None, None],
+                vec![cell("3"), cell("Can"), cell("Cano")],
+            ]
+        );
+        assert_eq!(result.edit_target, Some(target));
+        assert!(!result.truncated);
+        assert_eq!(result.notices, vec![SharedString::from("ttl 9s")]);
+    }
+
+    #[test]
+    fn appends_repeated_column_names_in_order() {
+        let mut result = ResultSet {
+            columns: vec![SharedString::from("id"), SharedString::from("id")],
+            rows: vec![vec![cell("1"), cell("a")]],
+            ..Default::default()
+        };
+        let page = ResultSet {
+            columns: vec![SharedString::from("id"), SharedString::from("id")],
+            rows: vec![vec![cell("2"), cell("b")]],
+            ..Default::default()
+        };
+        append_page(&mut result, page);
+        assert_eq!(result.columns.len(), 2);
+        assert_eq!(
+            result.rows,
+            vec![vec![cell("1"), cell("a")], vec![cell("2"), cell("b")]]
+        );
+    }
+
+    #[test]
+    fn appending_an_empty_last_page_only_ends_the_result() {
+        let mut result = ResultSet {
+            columns: vec![SharedString::from("member")],
+            rows: vec![vec![cell("a")]],
+            truncated: true,
+            ..Default::default()
+        };
+        append_page(&mut result, ResultSet::default());
+        assert_eq!(result.columns, vec![SharedString::from("member")]);
+        assert_eq!(result.rows, vec![vec![cell("a")]]);
+        assert!(!result.truncated);
     }
 
     #[test]
