@@ -39,7 +39,11 @@ impl TableView {
         cx: &Context<TableView>,
     ) -> AnyElement {
         create_table_cell(display_cell_id, cell_content, vertical_alignment, cx)
-            // Mouse events handlers will be here
+            .on_click(
+                cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                    this.click_cell(display_cell_id, event.click_count(), window, cx);
+                }),
+            )
             .into_any_element()
     }
 }

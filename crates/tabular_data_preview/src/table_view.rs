@@ -115,7 +115,19 @@ pub struct TableView {
     pub(crate) is_loading: bool,
     /// The keyboard navigation cursor. `None` until the user first navigates.
     pub(crate) selection: Option<CellSelection>,
+    /// Lets an embedder turn on cell selection outside debug builds. Off by default so the CSV
+    /// preview keeps its current behaviour.
+    pub(crate) selection_enabled: bool,
 }
+
+/// Emitted for embedders that turn selection on with [`TableView::set_selection_enabled`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableViewEvent {
+    SelectionChanged(DataCellId),
+    CellDoubleClicked(DataCellId),
+}
+
+impl gpui::EventEmitter<TableViewEvent> for TableView {}
 
 impl TableView {
     pub fn new(window: &Window, cx: &mut Context<Self>) -> Self {
@@ -146,7 +158,39 @@ impl TableView {
             row_height,
             is_loading: false,
             selection: None,
+            selection_enabled: false,
         }
+    }
+
+    pub fn set_selection_enabled(&mut self, enabled: bool) {
+        self.selection_enabled = enabled;
+    }
+
+    pub fn selection(&self) -> Option<CellSelection> {
+        self.selection
+    }
+
+    pub(crate) fn click_cell(
+        &mut self,
+        display_cell_id: crate::types::DisplayCellId,
+        click_count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_selection_enabled() {
+            return;
+        }
+        let Some(data_row) = self.engine.d2d_mapping().get_data_row(display_cell_id.row) else {
+            return;
+        };
+        let cell = DataCellId::new(data_row, display_cell_id.col);
+        self.selection = Some(CellSelection::single_cell(cell));
+        self.focus_handle.focus(window, cx);
+        cx.emit(TableViewEvent::SelectionChanged(cell));
+        if click_count >= 2 {
+            cx.emit(TableViewEvent::CellDoubleClicked(cell));
+        }
+        cx.notify();
     }
 
     /// Replace the data shown by the grid. Recomputes filter menus and column widths, kicks off the
@@ -240,7 +284,7 @@ impl TableView {
 
     #[inline]
     pub(crate) fn is_selection_enabled(&self) -> bool {
-        cfg!(any(test, debug_assertions))
+        self.selection_enabled || cfg!(any(test, debug_assertions))
     }
 
     pub(crate) fn move_focused_cell(
