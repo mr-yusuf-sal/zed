@@ -8,11 +8,14 @@ use anyhow::Result;
 use collections::HashMap;
 use editor::Editor;
 use gpui::{
-    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    Pixels, PromptLevel, Render, Task, WeakEntity, Window, actions, px,
+    Anchor, AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle,
+    Focusable, Pixels, PromptLevel, Render, Task, WeakEntity, Window, actions, px,
 };
 use std::sync::Arc;
-use ui::{Color, Icon, IconName, Label, SharedString, Tooltip, prelude::*};
+use ui::{
+    Color, ContextMenu, Icon, IconName, Label, PopoverMenu, SharedString, Tooltip, prelude::*,
+};
+use util::ResultExt as _;
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
@@ -924,6 +927,77 @@ impl QuarryPanel {
         elements
     }
 
+    fn render_connection_menu(
+        &self,
+        index: usize,
+        connected: bool,
+        busy: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let panel = cx.entity().downgrade();
+        PopoverMenu::new(SharedString::from(format!(
+            "quarry-connection-menu-{index}"
+        )))
+        .trigger_with_tooltip(
+            IconButton::new(
+                ("quarry-connection-menu-trigger", index),
+                IconName::Ellipsis,
+            )
+            .icon_size(IconSize::XSmall),
+            Tooltip::text("Connection Actions"),
+        )
+        .anchor(Anchor::TopRight)
+        .menu(move |window, cx| {
+            let panel = panel.clone();
+            Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                let update = |action: fn(
+                    &mut QuarryPanel,
+                    usize,
+                    &mut Window,
+                    &mut Context<QuarryPanel>,
+                )| {
+                    let panel = panel.clone();
+                    move |window: &mut Window, cx: &mut App| {
+                        panel
+                            .update(cx, |this, cx| action(this, index, window, cx))
+                            .log_err();
+                    }
+                };
+                menu.when(!busy, |menu| {
+                    menu.entry(
+                        "Refresh",
+                        None,
+                        update(|this, index, _, cx| this.refresh(index, cx)),
+                    )
+                })
+                .when(connected, |menu| {
+                    menu.entry(
+                        "Disconnect",
+                        None,
+                        update(|this, index, _, cx| this.disconnect(index, cx)),
+                    )
+                })
+                .separator()
+                .entry(
+                    "Edit Connection",
+                    None,
+                    update(|this, index, window, cx| this.start_editing(index, window, cx)),
+                )
+                .entry(
+                    "Set Password",
+                    None,
+                    update(|this, index, window, cx| this.start_password_prompt(index, window, cx)),
+                )
+                .separator()
+                .entry(
+                    "Delete Connection",
+                    None,
+                    update(|this, index, window, cx| this.confirm_delete(index, window, cx)),
+                )
+            }))
+        })
+    }
+
     fn render_connection(
         &self,
         index: usize,
@@ -979,49 +1053,7 @@ impl QuarryPanel {
                                 this.new_query(index, None, window, cx);
                             })),
                     )
-                    .when(connected, |this| {
-                        this.child(
-                            IconButton::new(("quarry-disconnect", index), IconName::Disconnected)
-                                .icon_size(IconSize::XSmall)
-                                .tooltip(|_, cx| Tooltip::simple("Disconnect", cx))
-                                .on_click(cx.listener(move |this, _, _window, cx| {
-                                    this.disconnect(index, cx);
-                                })),
-                        )
-                    })
-                    .child(
-                        IconButton::new(("quarry-refresh", index), IconName::RotateCw)
-                            .icon_size(IconSize::XSmall)
-                            .disabled(busy)
-                            .tooltip(|_, cx| Tooltip::simple("Refresh", cx))
-                            .on_click(cx.listener(move |this, _, _window, cx| {
-                                this.refresh(index, cx);
-                            })),
-                    )
-                    .child(
-                        IconButton::new(("quarry-edit", index), IconName::Pencil)
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(|_, cx| Tooltip::simple("Edit Connection", cx))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.start_editing(index, window, cx);
-                            })),
-                    )
-                    .child(
-                        IconButton::new(("quarry-password", index), IconName::Lock)
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(|_, cx| Tooltip::simple("Set Password", cx))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.start_password_prompt(index, window, cx);
-                            })),
-                    )
-                    .child(
-                        IconButton::new(("quarry-delete", index), IconName::Trash)
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(|_, cx| Tooltip::simple("Delete Connection", cx))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.confirm_delete(index, window, cx);
-                            })),
-                    )
+                    .child(self.render_connection_menu(index, connected, busy, cx))
                     .on_click(cx.listener(move |this, _, _window, cx| {
                         this.connect(index, cx);
                     })),
