@@ -626,17 +626,31 @@ impl Driver for SqlServerDriver {
         Ok(batch.sets)
     }
 
-    async fn preview(&self, path: &[SharedString], row_limit: usize) -> Result<ResultSet> {
+    async fn preview_page(
+        &self,
+        path: &[SharedString],
+        row_limit: usize,
+        offset: usize,
+    ) -> Result<ResultSet> {
         let [database, schema, table] = path else {
             bail!("expected database, schema and table, got {path:?}");
         };
         // TOP rather than LIMIT: SQL Server has no LIMIT clause. One extra row is what tells
         // the view the result was cut short.
-        let sql = format!(
-            "SELECT TOP ({}) * FROM {}",
-            row_limit.saturating_add(1),
-            three_part_name(database, schema, table)
-        );
+        let table_name = three_part_name(database, schema, table);
+        let sql = if offset == 0 {
+            format!(
+                "SELECT TOP ({}) * FROM {table_name}",
+                row_limit.saturating_add(1)
+            )
+        } else {
+            // OFFSET needs an ORDER BY; ordering by a constant keeps the scan order TOP used.
+            format!(
+                "SELECT * FROM {table_name} ORDER BY (SELECT NULL) \
+                 OFFSET {offset} ROWS FETCH NEXT {} ROWS ONLY",
+                row_limit.saturating_add(1)
+            )
+        };
         let mut guard = self.session(&self.browse, None).await?;
         let outcome = run_batch(&mut guard.connection()?.client, &sql, row_limit).await;
         guard.settle(&outcome);

@@ -610,7 +610,12 @@ impl Driver for RedisDriver {
         }])
     }
 
-    async fn preview(&self, path: &[SharedString], row_limit: usize) -> Result<ResultSet> {
+    async fn preview_page(
+        &self,
+        path: &[SharedString],
+        row_limit: usize,
+        offset: usize,
+    ) -> Result<ResultSet> {
         let (database, key) = Self::locate(path)?;
         if path.len() < 2 {
             bail!("expected a key, got a database");
@@ -625,7 +630,8 @@ impl Driver for RedisDriver {
             .query_async(&mut connection)
             .await
             .context("reading the key's type")?;
-        let fetch = row_limit as isize;
+        // The last index of a ranged read, one past the page to learn whether it was cut short.
+        let last = (offset + row_limit) as isize;
 
         let edit_target = |key_columns: Vec<usize>| {
             Some(EditTarget {
@@ -638,6 +644,11 @@ impl Driver for RedisDriver {
         // Each type needs its own read command; there is no generic "get whatever this is".
         // Ranged reads ask for one more item than shown to learn whether the page was cut short.
         let mut result = match kind.as_str() {
+            // A string is one value, so it has no page after the first.
+            "string" if offset > 0 => ResultSet {
+                columns: columns(&["value"]),
+                ..ResultSet::default()
+            },
             "string" => {
                 let value: Vec<u8> = redis::cmd("GET")
                     .arg(&key)
@@ -670,8 +681,8 @@ impl Driver for RedisDriver {
             "list" => {
                 let items: Vec<Vec<u8>> = redis::cmd("LRANGE")
                     .arg(&key)
-                    .arg(0)
-                    .arg(fetch)
+                    .arg(offset)
+                    .arg(last)
                     .query_async(&mut connection)
                     .await
                     .with_context(|| format!("reading {key}"))?;
@@ -679,19 +690,23 @@ impl Driver for RedisDriver {
                     columns: columns(&["index", "value"]),
                     truncated: items.len() > row_limit,
                     rows: string_rows(items.iter().take(row_limit).enumerate().map(
-                        |(index, item)| vec![SharedString::from(index.to_string()), text(item)],
+                        |(index, item)| {
+                            vec![SharedString::from((offset + index).to_string()), text(item)]
+                        },
                     )),
                     edit_target: edit_target(vec![0]),
                     ..ResultSet::default()
                 }
             }
             "set" => {
+                // SCAN has no offset; the members before the page are read and skipped.
                 let (members, more) =
-                    scan_collection(&mut connection, "SSCAN", &key, row_limit + 1).await?;
+                    scan_collection(&mut connection, "SSCAN", &key, offset + row_limit + 1).await?;
                 let mut seen = HashSet::default();
                 let members: Vec<Vec<u8>> = members
                     .into_iter()
                     .filter(|member| seen.insert(member.clone()))
+                    .skip(offset)
                     .collect();
                 // Members are their own identity: changing one is a remove plus an add, not an
                 // edit, so the set is shown read-only.
@@ -710,8 +725,8 @@ impl Driver for RedisDriver {
             "zset" => {
                 let items: Vec<(Vec<u8>, String)> = redis::cmd("ZRANGE")
                     .arg(&key)
-                    .arg(0)
-                    .arg(fetch)
+                    .arg(offset)
+                    .arg(last)
                     .arg("WITHSCORES")
                     .query_async(&mut connection)
                     .await
@@ -728,7 +743,8 @@ impl Driver for RedisDriver {
             }
             "hash" => {
                 let (flat, more) =
-                    scan_collection(&mut connection, "HSCAN", &key, (row_limit + 1) * 2).await?;
+                    scan_collection(&mut connection, "HSCAN", &key, (offset + row_limit + 1) * 2)
+                        .await?;
                 let mut seen = HashSet::default();
                 let pairs: Vec<(&[u8], &[u8])> = flat
                     .chunks_exact(2)
@@ -737,6 +753,7 @@ impl Driver for RedisDriver {
                         _ => None,
                     })
                     .filter(|(field, _)| seen.insert(field.to_vec()))
+                    .skip(offset)
                     .collect();
                 ResultSet {
                     columns: columns(&["field", "value"]),
@@ -757,10 +774,11 @@ impl Driver for RedisDriver {
                     .arg("-")
                     .arg("+")
                     .arg("COUNT")
-                    .arg(row_limit + 1)
+                    .arg(offset + row_limit + 1)
                     .query_async(&mut connection)
                     .await
                     .with_context(|| format!("reading {key}"))?;
+                let entries: Vec<_> = entries.into_iter().skip(offset).collect();
                 let rows = entries.iter().take(row_limit).map(|(id, fields)| {
                     let object: serde_json::Map<String, serde_json::Value> = fields
                         .chunks_exact(2)

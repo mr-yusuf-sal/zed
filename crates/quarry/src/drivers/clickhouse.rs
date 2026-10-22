@@ -395,7 +395,12 @@ impl Driver for ClickHouseDriver {
         Ok(vec![result?])
     }
 
-    async fn preview(&self, path: &[SharedString], row_limit: usize) -> Result<ResultSet> {
+    async fn preview_page(
+        &self,
+        path: &[SharedString],
+        row_limit: usize,
+        offset: usize,
+    ) -> Result<ResultSet> {
         let [database, table, ..] = path else {
             bail!("expected a database-qualified table, got {path:?}");
         };
@@ -404,7 +409,7 @@ impl Driver for ClickHouseDriver {
         // in-place edit of one cell.
         self.execute(
             &format!(
-                "SELECT * FROM {}.{} LIMIT {}",
+                "SELECT * FROM {}.{} LIMIT {} OFFSET {offset}",
                 quote_ident(database),
                 quote_ident(table),
                 row_limit + 1
