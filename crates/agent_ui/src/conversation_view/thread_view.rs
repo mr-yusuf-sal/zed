@@ -830,6 +830,7 @@ impl ThreadView {
                 window,
                 cx,
             );
+            editor.enable_auto_context(window, cx);
             let content_blocks = if let Some(content) = initial_content {
                 match content {
                     AgentInitialContent::ThreadSummary { session_id, title } => {

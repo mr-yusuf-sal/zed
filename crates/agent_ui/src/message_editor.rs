@@ -5,7 +5,7 @@ use crate::{
     completion_provider::{
         AgentContextSelection, AvailableCommand, AvailableSkill, PromptCompletionProvider,
         PromptCompletionProviderDelegate, PromptContextAction, PromptContextType,
-        PromptLocalCommand, SlashCommandCompletion,
+        PromptLocalCommand, SlashCommandCompletion, editor_selection_ranges,
     },
     mention_set::{Mention, MentionImage, MentionSet, insert_crease_for_mention},
 };
@@ -24,19 +24,20 @@ use editor::{
 };
 use futures::{FutureExt as _, future::join_all};
 use gpui::{
-    AppContext, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, Image, ImageFormat, KeyContext, SharedString, Subscription, Task, TaskExt,
-    TextStyle, WeakEntity,
+    AppContext, ClipboardEntry, ClipboardItem, Context, Entity, EntityId, EventEmitter,
+    FocusHandle, Focusable, Image, ImageFormat, KeyContext, SharedString, Subscription, Task,
+    TaskExt, TextStyle, WeakEntity,
 };
 use language::{Buffer, language_settings::InlayHintKind};
 use parking_lot::RwLock;
 use project::AgentId;
 use project::{
-    CompletionIntent, InlayHint, InlayHintLabel, InlayId, Project, ProjectPath, Worktree,
+    CompletionIntent, InlayHint, InlayHintLabel, InlayId, Project, ProjectItem as _, ProjectPath,
+    Worktree,
 };
 use rope::Point;
 use settings::Settings;
-use std::{cmp::min, fmt::Write, ops::Range, rc::Rc, sync::Arc};
+use std::{cmp::min, fmt::Write, ops::Range, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 use text::LineEnding;
 use theme_settings::ThemeSettings;
 use ui::{ContextMenu, prelude::*};
@@ -214,9 +215,40 @@ pub struct MessageEditor {
     local_commands: SharedLocalCommands,
     agent_id: AgentId,
     thread_store: Option<Entity<ThreadStore>>,
+    auto_context: Option<AutoContext>,
     _subscriptions: Vec<Subscription>,
     _parse_slash_command_task: Task<()>,
 }
+
+/// Mentions of the workspace's active file and its selection that the message
+/// editor keeps up to date on its own. Each mention is only re-inserted when
+/// what it points at changes, so one the user deleted stays deleted.
+struct AutoContext {
+    active_editor: Option<WeakEntity<Editor>>,
+    file: AutoMention<PathBuf>,
+    selection: AutoMention<Vec<(EntityId, Range<usize>)>>,
+    _workspace_subscription: Subscription,
+    _active_editor_subscription: Option<Subscription>,
+    _refresh_task: Task<()>,
+}
+
+struct AutoMention<Key> {
+    key: Option<Key>,
+    crease_ids: Vec<CreaseId>,
+}
+
+impl<Key> Default for AutoMention<Key> {
+    fn default() -> Self {
+        Self {
+            key: None,
+            crease_ids: Vec::new(),
+        }
+    }
+}
+
+// Selections change on every mouse drag step; wait for them to settle so the
+// mention isn't rebuilt dozens of times per selection.
+const AUTO_CONTEXT_DEBOUNCE: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug)]
 pub enum InputAttempt {
@@ -617,9 +649,329 @@ impl MessageEditor {
             local_commands,
             agent_id,
             thread_store,
+            auto_context: None,
             _subscriptions: subscriptions,
             _parse_slash_command_task: Task::ready(()),
         }
+    }
+
+    /// Keeps a mention of the active editor's file, and of its selection when
+    /// there is one, at the start of the message.
+    pub fn enable_auto_context(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let workspace_subscription =
+            cx.subscribe_in(&workspace, window, |this, _, event, window, cx| {
+                if let workspace::Event::ActiveItemChanged = event {
+                    this.watch_active_editor(window, cx);
+                }
+            });
+        self.auto_context = Some(AutoContext {
+            active_editor: None,
+            file: AutoMention::default(),
+            selection: AutoMention::default(),
+            _workspace_subscription: workspace_subscription,
+            _active_editor_subscription: None,
+            _refresh_task: Task::ready(()),
+        });
+        self.watch_active_editor(window, cx);
+    }
+
+    fn watch_active_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let active_editor = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).active_item(cx))
+            .and_then(|item| item.act_as::<Editor>(cx));
+        let Some(auto_context) = self.auto_context.as_mut() else {
+            return;
+        };
+        let active_editor_id = active_editor.as_ref().map(|editor| editor.entity_id());
+        let watched_editor_id = auto_context
+            .active_editor
+            .as_ref()
+            .map(|editor| editor.entity_id());
+        if active_editor_id == watched_editor_id {
+            return;
+        }
+
+        auto_context._active_editor_subscription = active_editor.as_ref().map(|editor| {
+            cx.subscribe_in(editor, window, |this, _, event, window, cx| {
+                if let EditorEvent::SelectionsChanged { .. } = event {
+                    this.schedule_auto_context_refresh(window, cx);
+                }
+            })
+        });
+        auto_context.active_editor = active_editor.map(|editor| editor.downgrade());
+        self.schedule_auto_context_refresh(window, cx);
+    }
+
+    fn schedule_auto_context_refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(auto_context) = self.auto_context.as_mut() else {
+            return;
+        };
+        auto_context._refresh_task = cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(AUTO_CONTEXT_DEBOUNCE).await;
+            this.update_in(cx, |this, window, cx| this.refresh_auto_context(window, cx))
+                .log_err();
+        });
+    }
+
+    fn refresh_auto_context(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editor.read(cx).read_only(cx) {
+            return;
+        }
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let Some(auto_context) = self.auto_context.as_ref() else {
+            return;
+        };
+        let active_editor = auto_context
+            .active_editor
+            .as_ref()
+            .and_then(|editor| editor.upgrade());
+
+        let file = active_editor.as_ref().and_then(|editor| {
+            let buffer = editor.read(cx).buffer().read(cx).as_singleton()?;
+            let project_path = buffer.read(cx).project_path(cx)?;
+            workspace
+                .read(cx)
+                .project()
+                .read(cx)
+                .absolute_path(&project_path, cx)
+        });
+        let selections = active_editor
+            .as_ref()
+            .map(|editor| editor_selection_ranges(editor, false, cx))
+            .unwrap_or_default();
+        let selection_key = (!selections.is_empty()).then(|| {
+            selections
+                .iter()
+                .map(|(buffer, range)| {
+                    let snapshot = buffer.read(cx).snapshot();
+                    (
+                        buffer.entity_id(),
+                        text::ToOffset::to_offset(&range.start, &snapshot)
+                            ..text::ToOffset::to_offset(&range.end, &snapshot),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+
+        let Some(auto_context) = self.auto_context.as_mut() else {
+            return;
+        };
+        let file_changed = auto_context.file.key != file;
+        let selection_changed = auto_context.selection.key != selection_key;
+        let stale_file_creases = if file_changed {
+            auto_context.file.key = file.clone();
+            std::mem::take(&mut auto_context.file.crease_ids)
+        } else {
+            Vec::new()
+        };
+        let stale_selection_creases = if selection_changed {
+            auto_context.selection.key = selection_key;
+            std::mem::take(&mut auto_context.selection.crease_ids)
+        } else {
+            Vec::new()
+        };
+
+        self.remove_auto_mentions(stale_file_creases, cx);
+        self.remove_auto_mentions(stale_selection_creases, cx);
+
+        if file_changed && let Some(abs_path) = file {
+            let crease_ids = self.insert_auto_file_mention(abs_path, &workspace, window, cx);
+            if let Some(auto_context) = self.auto_context.as_mut() {
+                auto_context.file.crease_ids = crease_ids;
+            }
+        }
+
+        if selection_changed && !selections.is_empty() {
+            // Keep the selection right after the file it was made in.
+            let offset = self
+                .auto_context
+                .as_ref()
+                .and_then(|auto_context| self.auto_mention_end(&auto_context.file.crease_ids, cx))
+                .unwrap_or(0);
+            let crease_ids =
+                self.insert_auto_selection_mention(selections, offset, &workspace, window, cx);
+            if let Some(auto_context) = self.auto_context.as_mut() {
+                auto_context.selection.crease_ids = crease_ids;
+            }
+        }
+    }
+
+    fn insert_auto_file_mention(
+        &mut self,
+        abs_path: PathBuf,
+        workspace: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<CreaseId> {
+        let mention_uri = MentionUri::File { abs_path };
+        // A restored draft can already mention the file.
+        if self.mention_set.read(cx).mentions().contains(&mention_uri) {
+            return Vec::new();
+        }
+        let link_text = mention_uri.as_link().to_string();
+        let content_len = link_text.len();
+        let Some(start) = self.insert_auto_text(0, format!("{link_text} "), window, cx) else {
+            return Vec::new();
+        };
+
+        let supports_images = self.session_capabilities.read().supports_images();
+        let editor = self.editor.clone();
+        let creases_before = self.mention_set.read(cx).creases();
+        self.mention_set
+            .update(cx, |mention_set, cx| {
+                mention_set.confirm_mention_completion(
+                    mention_uri.name().into(),
+                    start,
+                    content_len,
+                    mention_uri,
+                    supports_images,
+                    editor,
+                    workspace,
+                    window,
+                    cx,
+                )
+            })
+            .detach();
+        self.mention_set
+            .read(cx)
+            .creases()
+            .difference(&creases_before)
+            .copied()
+            .collect()
+    }
+
+    fn insert_auto_selection_mention(
+        &mut self,
+        selections: Vec<(Entity<Buffer>, Range<text::Anchor>)>,
+        offset: usize,
+        workspace: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<CreaseId> {
+        const PLACEHOLDER: &str = "selection ";
+
+        let placeholder_text = PLACEHOLDER.repeat(selections.len());
+        let selections = selections
+            .into_iter()
+            .enumerate()
+            .map(|(ix, (buffer, range))| {
+                (
+                    buffer,
+                    range,
+                    (PLACEHOLDER.len() * ix)..(PLACEHOLDER.len() * (ix + 1) - 1),
+                )
+            })
+            .collect::<Vec<_>>();
+        let Some(start) = self.insert_auto_text(offset, placeholder_text, window, cx) else {
+            return Vec::new();
+        };
+
+        let editor = self.editor.clone();
+        let creases_before = self.mention_set.read(cx).creases();
+        self.mention_set.update(cx, |mention_set, cx| {
+            mention_set.confirm_mention_for_selection(
+                start..start,
+                selections,
+                editor,
+                workspace.downgrade(),
+                window,
+                cx,
+            )
+        });
+        self.mention_set
+            .read(cx)
+            .creases()
+            .difference(&creases_before)
+            .copied()
+            .collect()
+    }
+
+    /// Inserts `text` at `offset` without moving the cursor, unless the message
+    /// was empty, in which case the cursor goes after it so typing continues
+    /// past the mention.
+    fn insert_auto_text(
+        &mut self,
+        offset: usize,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<text::Anchor> {
+        let buffer = self.editor.read(cx).buffer().read(cx).as_singleton()?;
+        let offset = offset.min(buffer.read(cx).len());
+        let anchor = buffer.read(cx).anchor_before(offset);
+        let was_empty = self.is_empty(cx);
+        self.editor.update(cx, |editor, cx| {
+            let offset = MultiBufferOffset(offset);
+            editor.edit([(offset..offset, text)], cx);
+            if was_empty {
+                editor.move_to_end(&editor::actions::MoveToEnd, window, cx);
+            }
+        });
+        Some(anchor)
+    }
+
+    /// The offset just past the given mentions and the space that follows
+    /// them, if any of them are still in the message.
+    fn auto_mention_end(&self, crease_ids: &[CreaseId], cx: &App) -> Option<usize> {
+        let editor = self.editor.read(cx);
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let crease_snapshot = editor.display_map.read(cx).crease_snapshot();
+        let end = crease_snapshot
+            .creases()
+            .filter(|(crease_id, _)| crease_ids.contains(crease_id))
+            .map(|(_, crease)| crease.range().end.to_offset(&snapshot))
+            .max()?;
+        let end = if snapshot.chars_at(end).next() == Some(' ') {
+            end + 1usize
+        } else {
+            end
+        };
+        Some(end.0)
+    }
+
+    fn remove_auto_mentions(&mut self, crease_ids: Vec<CreaseId>, cx: &mut Context<Self>) {
+        let present = self.mention_set.read(cx).creases();
+        let crease_ids = crease_ids
+            .into_iter()
+            .filter(|crease_id| present.contains(crease_id))
+            .collect::<Vec<_>>();
+        if crease_ids.is_empty() {
+            return;
+        }
+
+        self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let ranges = editor
+                .remove_creases(crease_ids.iter().copied(), cx)
+                .into_iter()
+                .filter_map(|(_, range)| {
+                    let range = range.to_offset(&snapshot);
+                    // The user already deleted this mention's text.
+                    if range.is_empty() {
+                        return None;
+                    }
+                    let end = if snapshot.chars_at(range.end).next() == Some(' ') {
+                        range.end + 1usize
+                    } else {
+                        range.end
+                    };
+                    Some((range.start..end, ""))
+                })
+                .collect::<Vec<_>>();
+            editor.edit(ranges, cx);
+        });
+        self.mention_set.update(cx, |mention_set, cx| {
+            for crease_id in &crease_ids {
+                mention_set.remove_mention(crease_id, cx);
+            }
+        });
     }
 
     pub fn set_local_commands(&self, commands: Vec<PromptLocalCommand>) {
@@ -939,6 +1291,12 @@ impl MessageEditor {
             editor.clear(window, cx);
         });
         self.clear_mentions(cx);
+        // Start the next message with the current file and selection again.
+        if let Some(auto_context) = self.auto_context.as_mut() {
+            auto_context.file = AutoMention::default();
+            auto_context.selection = AutoMention::default();
+            self.schedule_auto_context_refresh(window, cx);
+        }
     }
 
     fn clear_mentions(&mut self, cx: &mut Context<Self>) {
