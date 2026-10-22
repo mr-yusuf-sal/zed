@@ -9,7 +9,10 @@ use ui::{SharedString, table_row::TableRow};
 /// Every cell is `TableCell::Generated`, the variant with no backing text buffer — the CSV
 /// preview uses buffer anchors to map a cell back to the file it came from, and a result set
 /// has no file.
-pub fn to_table_content(result: &ResultSet) -> TableLikeContent {
+///
+/// Only the rows at `rows` are included, in that order: the query view passes the ones its
+/// search matched. The gutter keeps numbering them by their place in the whole result.
+pub fn to_table_content(result: &ResultSet, rows: &[usize]) -> TableLikeContent {
     let number_of_cols = result.columns.len();
 
     let headers = TableRow::from_vec(
@@ -21,9 +24,13 @@ pub fn to_table_content(result: &ResultSet) -> TableLikeContent {
         number_of_cols,
     );
 
-    let rows = result
-        .rows
+    let line_numbers = rows
         .iter()
+        .map(|index| LineNumber::Line(index + 1))
+        .collect();
+    let rows = rows
+        .iter()
+        .filter_map(|index| result.rows.get(*index))
         .map(|row| {
             TableRow::from_vec(
                 (0..number_of_cols)
@@ -41,17 +48,44 @@ pub fn to_table_content(result: &ResultSet) -> TableLikeContent {
         })
         .collect::<Vec<_>>();
 
-    // The grid shows these in its gutter. Results have no file, so they number the rows.
-    let line_numbers = (0..rows.len())
-        .map(|index| LineNumber::Line(index + 1))
-        .collect();
-
     TableLikeContent {
         number_of_cols,
         headers,
         rows,
         line_numbers,
     }
+}
+
+/// The rows with a cell containing `query`, ignoring case. NULL is matched by the word it is
+/// shown as, so searching for "null" finds the rows that have one.
+pub fn matching_rows(result: &ResultSet, query: &str) -> Vec<usize> {
+    let query = fold_case(query.trim());
+    if query.is_empty() {
+        return (0..result.rows.len()).collect();
+    }
+    result
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            row.iter().any(|cell| match cell {
+                Some(value) => fold_case(value).contains(&query),
+                None => "null".contains(&query),
+            })
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Lowercases for a search that ignores case the way a Turkish reader expects: `İ` lowercases
+/// to `i` plus a combining dot, which is dropped, and dotless `ı` is matched as `i`, so
+/// "izmir" finds "İZMİR" and "Izmir" alike.
+fn fold_case(text: &str) -> String {
+    text.to_lowercase()
+        .chars()
+        .filter(|character| *character != '\u{307}')
+        .map(|character| if character == 'ı' { 'i' } else { character })
+        .collect()
 }
 
 // A single shared value rather than one allocation per NULL cell; a wide result set is mostly
@@ -134,7 +168,7 @@ mod tests {
             rows: vec![vec![None, cell("")]],
             ..Default::default()
         };
-        let content = to_table_content(&result);
+        let content = to_table_content(&result, &[0]);
         let row = &content.rows[0];
         assert_eq!(
             row.expect_get(0usize).display_value().unwrap().as_ref(),
@@ -163,13 +197,33 @@ mod tests {
     }
 
     #[test]
+    fn searches_every_cell_and_keeps_row_numbers() {
+        let result = ResultSet {
+            columns: vec![SharedString::from("name"), SharedString::from("city")],
+            rows: vec![
+                vec![cell("Ayşe"), cell("İzmir")],
+                vec![cell("Can"), None],
+                vec![cell("Deniz"), cell("izmit")],
+            ],
+            ..Default::default()
+        };
+        assert_eq!(matching_rows(&result, "  IZM "), vec![0, 2]);
+        assert_eq!(matching_rows(&result, "ayşe"), vec![0]);
+        assert_eq!(matching_rows(&result, "null"), vec![1]);
+        assert_eq!(matching_rows(&result, ""), vec![0, 1, 2]);
+        let content = to_table_content(&result, &[2]);
+        assert_eq!(content.rows.len(), 1);
+        assert!(matches!(content.line_numbers.as_slice(), [LineNumber::Line(3)]));
+    }
+
+    #[test]
     fn pads_a_short_row_instead_of_dropping_it() {
         let result = ResultSet {
             columns: vec![SharedString::from("a"), SharedString::from("b")],
             rows: vec![vec![cell("only one")]],
             ..Default::default()
         };
-        let content = to_table_content(&result);
+        let content = to_table_content(&result, &[0]);
         assert_eq!(content.rows.len(), 1);
         assert_eq!(content.rows[0].cols(), 2);
     }
