@@ -605,14 +605,19 @@ impl Driver for PostgresDriver {
             .await
     }
 
-    async fn preview(&self, path: &[SharedString], row_limit: usize) -> Result<ResultSet> {
+    async fn preview_page(
+        &self,
+        path: &[SharedString],
+        row_limit: usize,
+        offset: usize,
+    ) -> Result<ResultSet> {
         let [database, schema, table] = path else {
             bail!("expected database, schema and table, got {path:?}");
         };
         // Identifiers are quoted rather than interpolated so mixed-case and reserved names work;
         // they come from the catalog rather than from the user, but quoting keeps it honest.
         let sql = format!(
-            "SELECT * FROM {} LIMIT {}",
+            "SELECT * FROM {} LIMIT {} OFFSET {offset}",
             qualified_name(schema, table),
             // One extra row is what tells the view the result was cut short.
             row_limit.saturating_add(1)
