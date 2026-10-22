@@ -1627,19 +1627,24 @@ pub async fn open_remote_worktree(
         .await
         .context("fetching workspace position from db")?;
 
-    let mut options =
-        cx.update(|_, cx| (app_state.build_window_options)(workspace_position.display, cx))?;
-    options.window_bounds = workspace_position.window_bounds;
+    let new_window = match cx.update(|_, cx| workspace::single_window_target(cx))? {
+        Some(window) => window,
+        None => {
+            let mut options = cx
+                .update(|_, cx| (app_state.build_window_options)(workspace_position.display, cx))?;
+            options.window_bounds = workspace_position.window_bounds;
 
-    let new_window = cx.open_window(options, |window, cx| {
-        let workspace = cx.new(|cx| {
-            let mut workspace =
-                Workspace::new(None, new_project.clone(), app_state.clone(), window, cx);
-            workspace.centered_layout = workspace_position.centered_layout;
-            workspace
-        });
-        cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
-    })?;
+            cx.open_window(options, |window, cx| {
+                let workspace = cx.new(|cx| {
+                    let mut workspace =
+                        Workspace::new(None, new_project.clone(), app_state.clone(), window, cx);
+                    workspace.centered_layout = workspace_position.centered_layout;
+                    workspace
+                });
+                cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
+            })?
+        }
+    };
 
     workspace::open_remote_project_with_existing_connection(
         connection_options,
