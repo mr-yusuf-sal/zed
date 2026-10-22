@@ -842,13 +842,26 @@ impl QuarryPanel {
                 )
             })
             .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
-            .child(Label::new(node.name.clone()).size(LabelSize::Small))
-            .children(node.detail.clone().map(|detail| {
-                Label::new(detail)
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted)
-            }))
-            .child(div().flex_1())
+            // The names shrink and truncate so a long one cannot push the row's buttons out of
+            // the panel.
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1()
+                    .overflow_hidden()
+                    .child(
+                        Label::new(node.name.clone())
+                            .size(LabelSize::Small)
+                            .truncate(),
+                    )
+                    .children(node.detail.clone().map(|detail| {
+                        Label::new(detail)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .truncate()
+                    })),
+            )
             .when(queryable_scope, |this| {
                 let database = node.path.first().cloned();
                 this.child(
@@ -1030,21 +1043,30 @@ impl QuarryPanel {
                             }),
                     )
                     .child(
-                        Label::new(SharedString::from(config.name.clone())).size(LabelSize::Small),
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .overflow_hidden()
+                            .child(
+                                Label::new(SharedString::from(config.name.clone()))
+                                    .size(LabelSize::Small)
+                                    .truncate(),
+                            )
+                            .child(
+                                Label::new(SharedString::from(config.engine.label()))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            )
+                            .when(busy, |this| {
+                                this.child(
+                                    Label::new("connecting…")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Info),
+                                )
+                            }),
                     )
-                    .child(
-                        Label::new(SharedString::from(config.engine.label()))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .when(busy, |this| {
-                        this.child(
-                            Label::new("connecting…")
-                                .size(LabelSize::XSmall)
-                                .color(Color::Info),
-                        )
-                    })
-                    .child(div().flex_1())
                     .child(
                         IconButton::new(("quarry-new-query", index), IconName::Plus)
                             .icon_size(IconSize::XSmall)

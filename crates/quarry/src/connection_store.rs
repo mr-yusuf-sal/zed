@@ -37,7 +37,10 @@ impl ConnectionStore {
             .log_err()
             .flatten()
             .and_then(|json| serde_json::from_str::<Vec<ConnectionConfig>>(&json).log_err())
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .map(repair_url_options)
+            .collect();
         Self { connections }
     }
 
@@ -83,6 +86,24 @@ impl ConnectionStore {
         })
         .detach();
     }
+}
+
+/// Earlier versions of the URL parser kept a `?option=...` suffix as part of the database name,
+/// so a pasted `mongodb://app@host/app?authSource=admin` was saved with the database
+/// `app?authSource=admin` and a name to match. Such a database does not exist, and the long
+/// name pushed the row's buttons out of the panel. A name the user typed is left alone.
+fn repair_url_options(mut config: ConnectionConfig) -> ConnectionConfig {
+    let Some(broken) = config.database.clone() else {
+        return config;
+    };
+    let Some((database, _options)) = broken.split_once('?') else {
+        return config;
+    };
+    if config.name == format!("{}/{broken}", config.host) {
+        config.name = format!("{}/{database}", config.host);
+    }
+    config.database = (!database.is_empty()).then(|| database.to_string());
+    config
 }
 
 const HISTORY_KEY_PREFIX: &str = "quarry_history:";
@@ -147,6 +168,9 @@ pub fn parse_connection_url(input: &str) -> Result<ConnectionConfig> {
         ),
     };
 
+    // Options such as MongoDB's `?authSource=admin` are not part of the database name. None of
+    // them are read yet; the drivers' defaults already match the common ones.
+    let rest = rest.split_once('?').map_or(rest, |(rest, _options)| rest);
     let (authority, database) = match rest.split_once('/') {
         Some((authority, database)) if !database.is_empty() => (authority, Some(database)),
         Some((authority, _)) => (authority, None),
@@ -257,6 +281,37 @@ mod tests {
             let config = parse_connection_url(url).unwrap();
             assert_eq!(connection_url(&config), url);
         }
+    }
+
+    #[test]
+    fn url_options_are_not_part_of_the_database() {
+        let config =
+            parse_connection_url("mongodb://app@localhost:27018/app?authSource=admin").unwrap();
+        assert_eq!(config.database.as_deref(), Some("app"));
+        assert_eq!(config.name, "localhost/app");
+        let config = parse_connection_url("mongodb://localhost:27018/?tls=true").unwrap();
+        assert_eq!(config.database, None);
+    }
+
+    #[test]
+    fn repairs_a_database_saved_with_url_options() {
+        let saved = ConnectionConfig {
+            name: "localhost/app?authSource=admin".to_string(),
+            engine: Engine::MongoDb,
+            host: "localhost".to_string(),
+            port: 27018,
+            database: Some("app?authSource=admin".to_string()),
+            username: Some("app".to_string()),
+        };
+        let repaired = repair_url_options(saved.clone());
+        assert_eq!(repaired.database.as_deref(), Some("app"));
+        assert_eq!(repaired.name, "localhost/app");
+
+        let renamed = ConnectionConfig {
+            name: "orders".to_string(),
+            ..saved
+        };
+        assert_eq!(repair_url_options(renamed).name, "orders");
     }
 
     #[test]
