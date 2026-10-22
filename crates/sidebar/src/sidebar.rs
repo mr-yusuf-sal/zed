@@ -2365,6 +2365,7 @@ impl Sidebar {
         let key_for_toggle = key.clone();
         let key_for_focus = key.clone();
         let key_for_drop = key.clone();
+        let key_for_disclosure = key.clone();
         let dragged_group = DraggedProjectGroup {
             key: key.clone(),
             label: label.clone(),
@@ -2518,10 +2519,27 @@ impl Sidebar {
                             div()
                                 .when(!is_focused, |this| this.visible_on_hover(&group_name))
                                 .child(
-                                    Icon::new(disclosure_icon)
-                                        .size(IconSize::Small)
-                                        .color(Color::Muted),
-                                ),
+                                    div()
+                                        .id(format!("{id_prefix}disclosure-{ix}"))
+                                        .child(
+                                            Icon::new(disclosure_icon)
+                                                .size(IconSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.toggle_collapse(
+                                                &key_for_disclosure,
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                                // Stopping the mouse down keeps the header from
+                                // also treating this as a click that activates
+                                // the project, or as the start of a drag.
+                                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                }),
                         )
                     }),
             )
