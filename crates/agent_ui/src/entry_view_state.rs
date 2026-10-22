@@ -67,6 +67,7 @@ pub struct EntryViewState {
     expanded_tool_calls: HashSet<acp_v2::ToolCallId>,
     /// Subagent cards shown for an ACP parent's outgoing session messages.
     expanded_session_message_cards: HashSet<acp_v2::MessageId>,
+    full_terminal_output_tool_calls: HashSet<acp_v2::ToolCallId>,
 }
 
 impl EntryViewState {
@@ -90,6 +91,7 @@ impl EntryViewState {
             expanded_compactions: HashSet::default(),
             expanded_tool_calls: HashSet::default(),
             expanded_session_message_cards: HashSet::default(),
+            full_terminal_output_tool_calls: HashSet::default(),
         }
     }
 
@@ -123,6 +125,17 @@ impl EntryViewState {
         if !self.expanded_session_message_cards.remove(message_id) {
             self.expanded_session_message_cards
                 .insert(message_id.clone());
+        }
+    }
+
+    pub(crate) fn is_terminal_output_full(&self, tool_call_id: &acp_v2::ToolCallId) -> bool {
+        self.full_terminal_output_tool_calls.contains(tool_call_id)
+    }
+
+    pub(crate) fn toggle_terminal_output_full(&mut self, tool_call_id: &acp_v2::ToolCallId) {
+        if !self.full_terminal_output_tool_calls.remove(tool_call_id) {
+            self.full_terminal_output_tool_calls
+                .insert(tool_call_id.clone());
         }
     }
 
