@@ -1092,6 +1092,24 @@ impl Render for QueryView {
             .on_action(cx.listener(Self::run_query))
             .on_action(cx.listener(Self::run_all))
             .on_action(cx.listener(Self::cancel_query))
+            // Base keymaps (VS Code, JetBrains, TextMate) bind the run key to
+            // `editor::NewlineBelow` at the editor's own depth, and they load after Zed's
+            // defaults, so the Quarry binding can never outrank them. Capturing the action they
+            // dispatch keeps the run key working under every base keymap; the cost is that
+            // "insert line below" is not available in the query editor.
+            .capture_action(
+                cx.listener(|this, _: &editor::actions::NewlineBelow, window, cx| {
+                    if !this.editor.focus_handle(cx).is_focused(window) {
+                        return;
+                    }
+                    cx.stop_propagation();
+                    if window.modifiers().shift {
+                        this.run_all(&RunAll, window, cx);
+                    } else {
+                        this.run_query(&RunQuery, window, cx);
+                    }
+                }),
+            )
             .child(self.render_toolbar(cx))
             .child(
                 // The editor is given a share of the tab rather than the whole of it: a query
