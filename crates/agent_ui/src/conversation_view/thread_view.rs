@@ -4477,17 +4477,17 @@ impl ThreadView {
             return None;
         }
 
-        let mut counts = Vec::new();
-        if !subagents.is_empty() {
-            counts.push(format!(
-                "{} {}",
-                subagents.len(),
-                pluralize("subagent", subagents.len())
-            ));
-        }
-        if !processes.is_empty() {
-            counts.push(format!("{} background", processes.len()));
-        }
+        // Both full counts side by side are too wide for the toolbar and wrap
+        // it, so they are abbreviated when both are shown.
+        let counts = match (subagents.len(), processes.len()) {
+            (0, process_count) => format!("{process_count} background"),
+            (subagent_count, 0) => {
+                format!("{subagent_count} {}", pluralize("subagent", subagent_count))
+            }
+            (subagent_count, process_count) => {
+                format!("{subagent_count} sub · {process_count} bg")
+            }
+        };
         let trigger_icon = if subagents.is_empty() {
             IconName::ToolTerminal
         } else {
@@ -4498,7 +4498,7 @@ impl ThreadView {
         Some(
             PopoverMenu::new("running-work-menu")
                 .trigger_with_tooltip(
-                    Button::new("running-work", counts.join(" · "))
+                    Button::new("running-work", counts)
                         .label_size(LabelSize::Small)
                         .color(Color::Muted)
                         .start_icon(
