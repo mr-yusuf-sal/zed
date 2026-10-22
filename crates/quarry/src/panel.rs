@@ -1,5 +1,5 @@
 use crate::{
-    connection_store::{ConnectionStore, parse_connection_url},
+    connection_store::{ConnectionStore, connection_url, parse_connection_url},
     driver::{ConnectionConfig, Driver, ObjectKind, ObjectNode},
     query_view::QueryView,
     runtime::QuarryRuntime,
@@ -9,7 +9,7 @@ use collections::HashMap;
 use editor::Editor;
 use gpui::{
     AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    Pixels, Render, Task, WeakEntity, Window, actions, px,
+    Pixels, PromptLevel, Render, Task, WeakEntity, Window, actions, px,
 };
 use std::sync::Arc;
 use ui::{Color, Icon, IconName, Label, SharedString, Tooltip, prelude::*};
@@ -43,16 +43,22 @@ pub fn init(cx: &mut App) {
 /// has been expanded so far. The tree is filled in lazily: asking a server for every schema,
 /// table and column up front is slow on a real database and most of it is never looked at.
 struct ConnectionState {
+    /// What async work uses to find its way back to this state. A connection's position in the
+    /// list shifts when one above it is deleted, and a refresh replaces the state outright, so a
+    /// task that finishes late looks its state up by id and finds nothing rather than writing
+    /// into a different connection.
+    id: usize,
     driver: Option<Arc<dyn Driver>>,
-    expanded: Vec<SharedString>,
+    expanded: Vec<Vec<SharedString>>,
     children: HashMap<Vec<SharedString>, Vec<ObjectNode>>,
     error: Option<SharedString>,
     busy: bool,
 }
 
-impl Default for ConnectionState {
-    fn default() -> Self {
+impl ConnectionState {
+    fn new(id: usize) -> Self {
         Self {
+            id,
             driver: None,
             expanded: Vec::new(),
             children: HashMap::default(),
@@ -62,12 +68,14 @@ impl Default for ConnectionState {
     }
 }
 
-/// The add-connection form: a URL and an optional password, kept together so the password is
-/// written to the credential store at the same moment the connection is saved.
+/// The add/edit-connection form: a URL and an optional password, kept together so the password
+/// is written to the credential store at the same moment the connection is saved.
 struct Draft {
     url: Entity<Editor>,
     password: Entity<Editor>,
     error: Option<SharedString>,
+    /// The id of the connection state being edited, or `None` when adding a new connection.
+    editing: Option<usize>,
 }
 
 fn new_password_editor(window: &mut Window, cx: &mut App) -> Entity<Editor> {
@@ -86,7 +94,8 @@ pub struct QuarryPanel {
     workspace: WeakEntity<Workspace>,
     store: Entity<ConnectionStore>,
     states: Vec<ConnectionState>,
-    /// Present while the user is filling in the add-connection form.
+    next_state_id: usize,
+    /// Present while the user is filling in the add- or edit-connection form.
     draft: Option<Draft>,
     /// Set while changing the password of a connection that already exists.
     password_prompt: Option<(usize, Entity<Editor>)>,
@@ -104,8 +113,13 @@ impl QuarryPanel {
         let count = store.read(cx).connections().len();
         cx.observe(&store, |this, store, cx| {
             // Keep one state per saved connection; a newly added one starts disconnected.
+            // Deletion removes its state itself, so only additions show up here.
             let count = store.read(cx).connections().len();
-            this.states.resize_with(count, ConnectionState::default);
+            while this.states.len() < count {
+                let state = this.new_state();
+                this.states.push(state);
+            }
+            this.states.truncate(count);
             cx.notify();
         })
         .detach();
@@ -114,13 +128,24 @@ impl QuarryPanel {
             focus_handle: cx.focus_handle(),
             workspace,
             store,
-            states: (0..count).map(|_| ConnectionState::default()).collect(),
+            states: (0..count).map(ConnectionState::new).collect(),
+            next_state_id: count,
             draft: None,
             password_prompt: None,
             width: None,
             position: DockPosition::Left,
             _tasks: Vec::new(),
         }
+    }
+
+    fn new_state(&mut self) -> ConnectionState {
+        let id = self.next_state_id;
+        self.next_state_id += 1;
+        ConnectionState::new(id)
+    }
+
+    fn index_of(&self, state_id: usize) -> Option<usize> {
+        self.states.iter().position(|state| state.id == state_id)
     }
 
     fn start_adding(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -130,15 +155,44 @@ impl QuarryPanel {
             editor
         });
         url.focus_handle(cx).focus(window, cx);
+        self.password_prompt = None;
         self.draft = Some(Draft {
             url,
             password: new_password_editor(window, cx),
             error: None,
+            editing: None,
         });
         cx.notify();
     }
 
-    fn confirm_adding(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn start_editing(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.store.read(cx).get(index).cloned() else {
+            return;
+        };
+        let Some(state_id) = self.states.get(index).map(|state| state.id) else {
+            return;
+        };
+        let url = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_text(connection_url(&config), window, cx);
+            editor
+        });
+        url.focus_handle(cx).focus(window, cx);
+        let password = new_password_editor(window, cx);
+        password.update(cx, |editor, cx| {
+            editor.set_placeholder_text("password (blank keeps the saved one)", window, cx);
+        });
+        self.password_prompt = None;
+        self.draft = Some(Draft {
+            url,
+            password,
+            error: None,
+            editing: Some(state_id),
+        });
+        cx.notify();
+    }
+
+    fn confirm_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(draft) = self.draft.as_ref() else {
             return;
         };
@@ -157,12 +211,158 @@ impl QuarryPanel {
         };
 
         let password = draft.password.read(cx).text(cx);
+        let editing = draft.editing;
         self.draft = None;
-        if !password.is_empty() {
-            self.save_password(&config, password, cx);
-        }
-        self.store.update(cx, |store, cx| store.add(config, cx));
         self.focus_handle.focus(window, cx);
+        cx.notify();
+
+        let Some(state_id) = editing else {
+            if !password.is_empty() {
+                self.save_password(&config, password, cx);
+            }
+            self.store.update(cx, |store, cx| store.add(config, cx));
+            return;
+        };
+        // The connection may have been deleted while its form was open.
+        let Some(index) = self.index_of(state_id) else {
+            return;
+        };
+        let Some(previous) = self.store.read(cx).get(index).cloned() else {
+            return;
+        };
+        self.store
+            .update(cx, |store, cx| store.replace(index, config.clone(), cx));
+        // Whatever the edit changed, the open session was made with the old settings.
+        let fresh = self.new_state();
+        if let Some(state) = self.states.get_mut(index) {
+            *state = fresh;
+        }
+        if password.is_empty() {
+            self.move_password(&previous, &config, cx);
+        } else {
+            self.save_password(&config, password, cx);
+            self.forget_password_if_unused(&previous, cx);
+        }
+    }
+
+    fn credential_in_use(&self, credential_url: &str, cx: &App) -> bool {
+        self.store
+            .read(cx)
+            .connections()
+            .iter()
+            .any(|config| config.credential_url() == credential_url)
+    }
+
+    /// Carries the saved password over when an edit changes where it is filed (engine, host or
+    /// port) or the username it was saved with. Without this, an edit that left the password
+    /// field blank would silently lose the password — or, since a stored username wins over the
+    /// config's, keep connecting as the old user.
+    fn move_password(
+        &mut self,
+        previous: &ConnectionConfig,
+        config: &ConnectionConfig,
+        cx: &mut Context<Self>,
+    ) {
+        let old_url = previous.credential_url();
+        let new_url = config.credential_url();
+        if old_url == new_url && previous.username == config.username {
+            return;
+        }
+        let delete_old = old_url != new_url && !self.credential_in_use(&old_url, cx);
+        let username = config.username.clone().unwrap_or_default();
+        let task = cx.spawn(async move |_, cx| {
+            let moved = async {
+                let Some((_, password)) = cx.update(|cx| cx.read_credentials(&old_url)).await?
+                else {
+                    return anyhow::Ok(());
+                };
+                cx.update(|cx| cx.write_credentials(&new_url, &username, &password))
+                    .await?;
+                if delete_old {
+                    cx.update(|cx| cx.delete_credentials(&old_url)).await?;
+                }
+                anyhow::Ok(())
+            }
+            .await;
+            if let Err(error) = moved {
+                log::error!("Quarry could not move the saved password: {error:#}");
+            }
+        });
+        self._tasks.push(task);
+    }
+
+    /// Removes a connection's password from the OS credential store unless another saved
+    /// connection still files its password under the same entry.
+    fn forget_password_if_unused(&mut self, config: &ConnectionConfig, cx: &mut Context<Self>) {
+        let url = config.credential_url();
+        if self.credential_in_use(&url, cx) {
+            return;
+        }
+        let task = cx.spawn(async move |_, cx| {
+            if let Err(error) = cx.update(|cx| cx.delete_credentials(&url)).await {
+                log::error!("Quarry could not delete the saved password: {error:#}");
+            }
+        });
+        self._tasks.push(task);
+    }
+
+    /// Drops the open session and reconnects, keeping the expanded folders open so new or
+    /// dropped tables show up where the user was looking. Also the way to retry a connection
+    /// that failed, since a failed one otherwise keeps showing its error.
+    fn refresh(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(expanded) = self.states.get(index).map(|state| state.expanded.clone()) else {
+            return;
+        };
+        let mut fresh = self.new_state();
+        fresh.expanded = expanded;
+        if let Some(state) = self.states.get_mut(index) {
+            *state = fresh;
+        }
+        self.connect(index, cx);
+    }
+
+    fn confirm_delete(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.store.read(cx).get(index).cloned() else {
+            return;
+        };
+        let Some(state_id) = self.states.get(index).map(|state| state.id) else {
+            return;
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Delete the connection {}?", config.name),
+            Some("Its saved password is removed as well."),
+            &["Delete", "Cancel"],
+            cx,
+        );
+        let task = cx.spawn(async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            this.update(cx, |this, cx| this.delete(state_id, cx)).ok();
+        });
+        self._tasks.push(task);
+    }
+
+    fn delete(&mut self, state_id: usize, cx: &mut Context<Self>) {
+        let Some(index) = self.index_of(state_id) else {
+            return;
+        };
+        let Some(config) = self.store.read(cx).get(index).cloned() else {
+            return;
+        };
+        self.states.remove(index);
+        // The prompt refers to a connection by position, which has just shifted.
+        self.password_prompt = None;
+        if self
+            .draft
+            .as_ref()
+            .is_some_and(|draft| draft.editing == Some(state_id))
+        {
+            self.draft = None;
+        }
+        self.store.update(cx, |store, cx| store.remove(index, cx));
+        self.forget_password_if_unused(&config, cx);
         cx.notify();
     }
 
@@ -223,11 +423,15 @@ impl QuarryPanel {
         }
         state.busy = true;
         state.error = None;
+        let state_id = state.id;
         cx.notify();
 
         let task = cx.spawn(async move |this, cx| {
             let opened = crate::connect(config, cx).await;
             this.update(cx, |this, cx| {
+                let Some(index) = this.index_of(state_id) else {
+                    return;
+                };
                 let Some(state) = this.states.get_mut(index) else {
                     return;
                 };
@@ -235,7 +439,12 @@ impl QuarryPanel {
                 match opened {
                     Ok(driver) => {
                         state.driver = Some(driver);
+                        // Non-empty only after a refresh, which keeps what was open.
+                        let expanded = state.expanded.clone();
                         this.load_children(index, Vec::new(), cx);
+                        for path in expanded {
+                            this.load_children(index, path, cx);
+                        }
                     }
                     Err(error) => state.error = Some(format!("{error:#}").into()),
                 }
@@ -247,11 +456,12 @@ impl QuarryPanel {
     }
 
     fn load_children(&mut self, index: usize, path: Vec<SharedString>, cx: &mut Context<Self>) {
-        let Some(driver) = self
-            .states
-            .get(index)
-            .and_then(|state| state.driver.clone())
-        else {
+        let Some((state_id, driver)) = self.states.get(index).and_then(|state| {
+            state
+                .driver
+                .clone()
+                .map(|driver| (state.id, driver))
+        }) else {
             return;
         };
         let Some(runtime) = QuarryRuntime::global(cx) else {
@@ -265,7 +475,8 @@ impl QuarryPanel {
         let task = cx.spawn(async move |this, cx| {
             let children = request.await;
             this.update(cx, |this, cx| {
-                let Some(state) = this.states.get_mut(index) else {
+                let Some(state) = this.states.iter_mut().find(|state| state.id == state_id)
+                else {
                     return;
                 };
                 match children {
@@ -286,10 +497,10 @@ impl QuarryPanel {
             return;
         };
         let key = node.path.clone();
-        if state.expanded.contains(&key.join("/").into()) {
-            state.expanded.retain(|p| p.as_ref() != key.join("/"));
+        if let Some(position) = state.expanded.iter().position(|path| *path == key) {
+            state.expanded.remove(position);
         } else {
-            state.expanded.push(key.join("/").into());
+            state.expanded.push(key.clone());
             if !state.children.contains_key(&key) {
                 self.load_children(index, key, cx);
                 return;
@@ -303,7 +514,7 @@ impl QuarryPanel {
             state
                 .expanded
                 .iter()
-                .any(|expanded| expanded.as_ref() == path.join("/"))
+                .any(|expanded| expanded.as_slice() == path)
         })
     }
 
@@ -491,11 +702,36 @@ impl QuarryPanel {
                     })
                     .child(div().flex_1())
                     .child(
+                        IconButton::new(("quarry-refresh", index), IconName::RotateCw)
+                            .icon_size(IconSize::XSmall)
+                            .disabled(busy)
+                            .tooltip(|_, cx| Tooltip::simple("Refresh", cx))
+                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                this.refresh(index, cx);
+                            })),
+                    )
+                    .child(
+                        IconButton::new(("quarry-edit", index), IconName::Pencil)
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(|_, cx| Tooltip::simple("Edit Connection", cx))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.start_editing(index, window, cx);
+                            })),
+                    )
+                    .child(
                         IconButton::new(("quarry-password", index), IconName::Lock)
                             .icon_size(IconSize::XSmall)
                             .tooltip(|_, cx| Tooltip::simple("Set Password", cx))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.start_password_prompt(index, window, cx);
+                            })),
+                    )
+                    .child(
+                        IconButton::new(("quarry-delete", index), IconName::Trash)
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(|_, cx| Tooltip::simple("Delete Connection", cx))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.confirm_delete(index, window, cx);
                             })),
                     )
                     .on_click(cx.listener(move |this, _, _window, cx| {
@@ -600,11 +836,21 @@ impl Render for QuarryPanel {
                     ),
             )
             .children(self.draft.as_ref().map(|draft| {
+                let editing_name = draft
+                    .editing
+                    .and_then(|state_id| self.index_of(state_id))
+                    .and_then(|index| self.store.read(cx).get(index))
+                    .map(|config| config.name.clone());
                 v_flex()
                     .w_full()
                     .px_2()
                     .py_1()
                     .gap_0p5()
+                    .children(editing_name.map(|name| {
+                        Label::new(SharedString::from(format!("Editing {name}")))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                    }))
                     .child(draft.url.clone())
                     .child(draft.password.clone())
                     .children(draft.error.clone().map(|error| {
@@ -618,7 +864,7 @@ impl Render for QuarryPanel {
                             .color(Color::Muted),
                     )
                     .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
-                        this.confirm_adding(window, cx);
+                        this.confirm_draft(window, cx);
                     }))
                     .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
                         this.draft = None;
