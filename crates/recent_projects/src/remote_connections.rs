@@ -129,9 +129,12 @@ pub async fn open_remote_project(
     connection_options: RemoteConnectionOptions,
     paths: Vec<PathBuf>,
     app_state: Arc<AppState>,
-    open_options: workspace::OpenOptions,
+    mut open_options: workspace::OpenOptions,
     cx: &mut AsyncApp,
 ) -> Result<WindowHandle<MultiWorkspace>> {
+    if open_options.requesting_window.is_none() {
+        open_options.requesting_window = cx.update(|cx| workspace::single_window_target(cx));
+    }
     let created_new_window = open_options.requesting_window.is_none();
 
     let (existing, open_visible) = find_existing_workspace(

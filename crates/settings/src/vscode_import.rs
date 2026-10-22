@@ -1073,6 +1073,7 @@ impl VsCodeSettings {
             close_panel_on_toggle: None,
             command_aliases: Default::default(),
             global_hotkeys: Default::default(),
+            single_window: None,
             confirm_quit: self.read_enum("window.confirmBeforeClose", |s| match s {
                 "always" | "keyboardOnly" => Some(true),
                 "never" => Some(false),

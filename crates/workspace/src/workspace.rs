@@ -2262,6 +2262,19 @@ impl Workspace {
                 OpenMode::NewWindow => None,
                 _ => requesting_window,
             };
+            let (window_to_replace, open_mode, joined_single_window) = match window_to_replace {
+                Some(window) => (Some(window), open_mode, false),
+                None => match cx.update(|cx| single_window_target(cx)) {
+                    Some(window) => {
+                        let open_mode = match open_mode {
+                            OpenMode::Add => OpenMode::Add,
+                            OpenMode::NewWindow | OpenMode::Activate => OpenMode::Activate,
+                        };
+                        (Some(window), open_mode, true)
+                    }
+                    None => (None, open_mode, false),
+                },
+            };
 
             let (window, workspace): (WindowHandle<MultiWorkspace>, Entity<Workspace>) =
                 if let Some(window) = window_to_replace {
@@ -2292,6 +2305,10 @@ impl Workspace {
                         match open_mode {
                             OpenMode::Activate => {
                                 multi_workspace.activate(workspace.clone(), None, window, cx);
+                                // The window may be behind other apps, or hidden to the tray.
+                                if joined_single_window {
+                                    window.activate_window();
+                                }
                             }
                             OpenMode::Add => {
                                 multi_workspace.add(workspace.clone(), &*window, cx);
@@ -11062,6 +11079,9 @@ pub fn open_workspace_by_id(
 
         let centered_layout = serialized_workspace.centered_layout;
 
+        let requesting_window =
+            requesting_window.or_else(|| cx.update(|cx| single_window_target(cx)));
+
         let (window, workspace) = if let Some(window) = requesting_window {
             let workspace = window.update(cx, |multi_workspace, window, cx| {
                 let workspace = cx.new(|cx| {
@@ -11352,6 +11372,21 @@ pub fn open_paths(
         };
         result
     })
+}
+
+/// With `single_window` on, the window that a workspace which would otherwise
+/// get a new window of its own is added to instead.
+pub fn single_window_target(cx: &App) -> Option<WindowHandle<MultiWorkspace>> {
+    if !WorkspaceSettings::get_global(cx).single_window {
+        return None;
+    }
+    cx.active_window()
+        .and_then(|window| window.downcast::<MultiWorkspace>())
+        .or_else(|| {
+            cx.windows()
+                .into_iter()
+                .find_map(|window| window.downcast::<MultiWorkspace>())
+        })
 }
 
 pub fn open_new(

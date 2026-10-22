@@ -124,6 +124,11 @@ pub struct WorkspaceSettingsContent {
     /// Default: {}
     #[serde(default)]
     pub global_hotkeys: HashMap<String, Option<String>>,
+    /// Keep every project in one window. Anything that would open a new
+    /// window adds its workspace to the existing window's sidebar instead.
+    ///
+    /// Default: false
+    pub single_window: Option<bool>,
     /// Whether to resize all the panels in a dock when resizing the dock.
     ///
     /// Default: ["left"]

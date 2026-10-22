@@ -2861,11 +2861,13 @@ impl Sidebar {
         let multi_workspace = self.multi_workspace.clone();
         let project_group_key = project_group_key.clone();
 
-        let show_multi_project_entries = multi_workspace
-            .read_with(cx, |mw, _| {
-                project_group_key.host().is_none() && mw.project_group_keys().len() >= 2
-            })
-            .unwrap_or(false);
+        let single_window = workspace::WorkspaceSettings::get_global(cx).single_window;
+        let show_multi_project_entries = !single_window
+            && multi_workspace
+                .read_with(cx, |mw, _| {
+                    project_group_key.host().is_none() && mw.project_group_keys().len() >= 2
+                })
+                .unwrap_or(false);
 
         let this = cx.weak_entity();
 

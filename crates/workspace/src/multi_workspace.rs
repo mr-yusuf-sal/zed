@@ -2138,16 +2138,20 @@ impl Render for MultiWorkspace {
                             }
                         }),
                     )
-                    .when(self.project_group_keys().len() >= 2, |el| {
-                        el.on_action(cx.listener(
-                            |this: &mut Self, _: &MoveProjectToNewWindow, window, cx| {
-                                let key =
-                                    this.project_group_key_for_workspace(this.workspace(), cx);
-                                this.open_project_group_in_new_window(&key, window, cx)
-                                    .detach_and_log_err(cx);
-                            },
-                        ))
-                    })
+                    .when(
+                        self.project_group_keys().len() >= 2
+                            && !crate::WorkspaceSettings::get_global(cx).single_window,
+                        |el| {
+                            el.on_action(cx.listener(
+                                |this: &mut Self, _: &MoveProjectToNewWindow, window, cx| {
+                                    let key =
+                                        this.project_group_key_for_workspace(this.workspace(), cx);
+                                    this.open_project_group_in_new_window(&key, window, cx)
+                                        .detach_and_log_err(cx);
+                                },
+                            ))
+                        },
+                    )
                 })
                 .when(
                     self.sidebar_open() && self.multi_workspace_enabled(cx),

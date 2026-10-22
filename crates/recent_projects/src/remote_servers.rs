@@ -486,7 +486,10 @@ impl ProjectPicker {
                     })
                     .log_err();
 
-                    let window = if create_new_window {
+                    let single_window = cx
+                        .update(|_, cx| workspace::single_window_target(cx).is_some())
+                        .unwrap_or(false);
+                    let window = if create_new_window && !single_window {
                         let options = cx
                             .update(|_, cx| (app_state.build_window_options)(None, cx))
                             .log_err()?;
