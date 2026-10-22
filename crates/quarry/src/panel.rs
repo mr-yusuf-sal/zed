@@ -1,11 +1,11 @@
 use crate::{
     connection_store::{ConnectionStore, connection_url, parse_connection_url},
-    driver::{ConnectionConfig, Driver, ObjectKind, ObjectNode},
-    query_view::QueryView,
+    driver::{ConnectionConfig, Driver, Environment, ObjectKind, ObjectNode},
+    query_view::{QueryView, environment_badge},
     runtime::QuarryRuntime,
 };
 use anyhow::Result;
-use collections::HashMap;
+use collections::{BTreeMap, HashMap, HashSet};
 use editor::Editor;
 use gpui::{
     Anchor, AnyElement, App, AppContext as _, ClipboardItem, Context, DismissEvent, Entity,
@@ -84,6 +84,11 @@ fn connection_menu(
         update(|this, index, window, cx| this.start_editing(index, window, cx)),
     )
     .entry(
+        "Duplicate Connection",
+        None,
+        update(|this, index, _, cx| this.duplicate(index, cx)),
+    )
+    .entry(
         "Set Password",
         None,
         update(|this, index, window, cx| this.start_password_prompt(index, window, cx)),
@@ -140,6 +145,8 @@ struct Draft {
     name: Entity<Editor>,
     url: Entity<Editor>,
     password: Entity<Editor>,
+    folder: Entity<Editor>,
+    environment: Option<Environment>,
     error: Option<SharedString>,
     /// The id of the connection state being edited, or `None` when adding a new connection.
     editing: Option<usize>,
@@ -159,6 +166,17 @@ fn new_name_editor(name: Option<&str>, window: &mut Window, cx: &mut App) -> Ent
         editor.set_placeholder_text("name (optional — defaults to host/database)", window, cx);
         if let Some(name) = name {
             editor.set_text(name.to_string(), window, cx);
+        }
+        editor
+    })
+}
+
+fn new_folder_editor(folder: Option<&str>, window: &mut Window, cx: &mut App) -> Entity<Editor> {
+    cx.new(|cx| {
+        let mut editor = Editor::single_line(window, cx);
+        editor.set_placeholder_text("folder (optional)", window, cx);
+        if let Some(folder) = folder {
+            editor.set_text(folder.to_string(), window, cx);
         }
         editor
     })
@@ -192,6 +210,8 @@ pub struct QuarryPanel {
     width: Option<Pixels>,
     position: DockPosition,
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
+    /// Folders whose connections are hidden. Not persisted: a restart opens every folder.
+    collapsed_folders: HashSet<String>,
     _tasks: Vec<Task<()>>,
 }
 
@@ -239,6 +259,7 @@ impl QuarryPanel {
             width: None,
             position: DockPosition::Left,
             context_menu: None,
+            collapsed_folders: HashSet::default(),
             _tasks: Vec::new(),
         }
     }
@@ -265,6 +286,8 @@ impl QuarryPanel {
             name: new_name_editor(None, window, cx),
             url,
             password: new_password_editor(window, cx),
+            folder: new_folder_editor(None, window, cx),
+            environment: None,
             error: None,
             editing: None,
             test: TestState::Untested,
@@ -294,6 +317,8 @@ impl QuarryPanel {
             name: new_name_editor(Some(&config.name), window, cx),
             url,
             password,
+            folder: new_folder_editor(config.folder.as_deref(), window, cx),
+            environment: config.environment,
             error: None,
             editing: Some(state_id),
             test: TestState::Untested,
@@ -312,6 +337,9 @@ impl QuarryPanel {
                 if !name.trim().is_empty() {
                     config.name = name.trim().to_string();
                 }
+                let folder = draft.folder.read(cx).text(cx);
+                config.folder = Some(folder.trim().to_string()).filter(|folder| !folder.is_empty());
+                config.environment = draft.environment;
                 Ok(config)
             }
             Err(error) => Err(format!("{error:#}").into()),
@@ -408,6 +436,16 @@ impl QuarryPanel {
             self.save_password(&config, password, cx);
             self.forget_password_if_unused(&previous, cx);
         }
+    }
+
+    /// Adds a copy of the connection, for pointing the same server at another database or
+    /// user. The copy shares the saved password, which is filed by engine, host and port.
+    fn duplicate(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(mut config) = self.store.read(cx).get(index).cloned() else {
+            return;
+        };
+        config.name = format!("{} (copy)", config.name);
+        self.store.update(cx, |store, cx| store.add(config, cx));
     }
 
     fn credential_in_use(&self, credential_url: &str, cx: &App) -> bool {
@@ -1259,6 +1297,89 @@ impl QuarryPanel {
         }
     }
 
+    /// Connections in folders first, each folder under a heading that folds it away, then the
+    /// ones without a folder. Positions in the store are kept, so every row still addresses
+    /// its connection by index.
+    fn render_connection_list(
+        &self,
+        connections: &[ConnectionConfig],
+        filter: &str,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let mut folders: BTreeMap<String, Vec<usize>> = BTreeMap::default();
+        let mut loose = Vec::new();
+        for (index, config) in connections.iter().enumerate() {
+            match &config.folder {
+                Some(folder) => folders.entry(folder.clone()).or_default().push(index),
+                None => loose.push(index),
+            }
+        }
+
+        let mut elements = Vec::new();
+        for (folder, indexes) in folders {
+            let collapsed = self.collapsed_folders.contains(&folder);
+            elements.push(
+                h_flex()
+                    .id(SharedString::from(format!("quarry-folder-{folder}")))
+                    .w_full()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                    .child(
+                        Icon::new(if collapsed {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Icon::new(IconName::Folder)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(SharedString::from(folder.clone()))
+                            .size(LabelSize::Small)
+                            .truncate(),
+                    )
+                    .child(
+                        Label::new(SharedString::from(indexes.len().to_string()))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.collapsed_folders.remove(&folder) {
+                            this.collapsed_folders.insert(folder.clone());
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+            if !collapsed {
+                for index in indexes {
+                    if let Some(config) = connections.get(index) {
+                        elements.push(
+                            div()
+                                .w_full()
+                                .pl_3()
+                                .child(self.render_connection(index, config, filter, cx))
+                                .into_any_element(),
+                        );
+                    }
+                }
+            }
+        }
+        for index in loose {
+            if let Some(config) = connections.get(index) {
+                elements.push(self.render_connection(index, config, filter, cx));
+            }
+        }
+        elements
+    }
+
     fn render_connection(
         &self,
         index: usize,
@@ -1301,6 +1422,9 @@ impl QuarryPanel {
                                     .size(LabelSize::Small)
                                     .truncate(),
                             )
+                            .when_some(config.environment, |row, environment| {
+                                row.child(environment_badge(environment))
+                            })
                             .child(
                                 Label::new(SharedString::from(config.engine.label()))
                                     .size(LabelSize::XSmall)
@@ -1452,6 +1576,42 @@ impl Render for QuarryPanel {
                     .child(draft.name.clone())
                     .child(draft.url.clone())
                     .child(draft.password.clone())
+                    .child(draft.folder.clone())
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Label::new("Environment")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .children(
+                                std::iter::once(None)
+                                    .chain(Environment::ALL.into_iter().map(Some))
+                                    .map(|environment| {
+                                        Button::new(
+                                            SharedString::from(format!(
+                                                "quarry-environment-{}",
+                                                environment.map_or("none", Environment::label)
+                                            )),
+                                            environment.map_or("none", Environment::label),
+                                        )
+                                        .label_size(LabelSize::XSmall)
+                                        .when_some(environment, |button, environment| {
+                                            button.color(environment.color())
+                                        })
+                                        .toggle_state(draft.environment == environment)
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                if let Some(draft) = this.draft.as_mut() {
+                                                    draft.environment = environment;
+                                                }
+                                                cx.notify();
+                                            }),
+                                        )
+                                    }),
+                            ),
+                    )
                     .children(draft.error.clone().map(|error| {
                         Label::new(error)
                             .size(LabelSize::XSmall)
@@ -1539,15 +1699,7 @@ impl Render for QuarryPanel {
                     .min_h_0()
                     .w_full()
                     .overflow_y_scroll()
-                    .children(
-                        connections
-                            .iter()
-                            .enumerate()
-                            .map(|(index, config)| {
-                                self.render_connection(index, config, &filter, cx)
-                            })
-                            .collect::<Vec<_>>(),
-                    )
+                    .children(self.render_connection_list(&connections, &filter, cx))
                     .when(connections.is_empty() && self.draft.is_none(), |this| {
                         this.child(
                             Label::new("No connections yet — use + to add one")

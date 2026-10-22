@@ -296,9 +296,264 @@ fn strip_sql_comments(text: &str) -> String {
     }
 }
 
+/// Whether running `statement` may change data or schema. Used to ask before running on a
+/// production connection, so it errs towards yes: a false alarm costs a click, a miss costs data.
+///
+/// SQL is judged by its words rather than its first keyword, because one T-SQL batch can hold
+/// any number of statements and a Postgres `WITH` can wrap a `DELETE`. Words inside strings,
+/// quoted identifiers and comments are skipped, so `WHERE note = 'delete me'` stays a read.
+pub fn may_write(statement: &str, engine: Engine) -> bool {
+    match engine {
+        Engine::Postgres | Engine::SqlServer | Engine::ClickHouse => sql_words(statement, engine)
+            .iter()
+            .any(|word| SQL_WRITE_WORDS.contains(&word.as_str())),
+        Engine::MongoDb => mongo_may_write(statement),
+        Engine::Redis => {
+            let command = statement
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_ascii_uppercase();
+            !REDIS_READ_COMMANDS.contains(&command.as_str())
+        }
+    }
+}
+
+/// Words that start or are part of a statement that changes something. `INTO` catches
+/// `SELECT ... INTO`, which creates a table; `EXEC` and `CALL` run code that could do anything.
+const SQL_WRITE_WORDS: &[&str] = &[
+    "INSERT", "UPDATE", "DELETE", "MERGE", "UPSERT", "REPLACE", "DROP", "ALTER", "CREATE",
+    "TRUNCATE", "RENAME", "GRANT", "REVOKE", "DENY", "EXEC", "EXECUTE", "CALL", "DO", "COPY",
+    "INTO", "REINDEX", "CLUSTER", "VACUUM", "OPTIMIZE", "KILL", "SYSTEM", "ATTACH", "DETACH",
+    "EXCHANGE", "BACKUP", "RESTORE", "DBCC", "BULK", "LOCK", "REFRESH", "COMMENT", "SECURITY",
+    "IMPORT", "LOAD", "SHUTDOWN",
+];
+
+/// The uppercased words of `statement` outside strings, quoted identifiers and comments.
+fn sql_words(statement: &str, engine: Engine) -> Vec<String> {
+    let dialect = match engine {
+        Engine::SqlServer => Dialect::TransactSql,
+        Engine::ClickHouse => Dialect::ClickHouse,
+        _ => Dialect::Postgres,
+    };
+    let bytes = statement.as_bytes();
+    let mut words = Vec::new();
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b'\'' => index = skip_quoted(bytes, index, b'\'', dialect == Dialect::ClickHouse),
+            b'"' => index = skip_quoted(bytes, index, b'"', dialect == Dialect::ClickHouse),
+            b'`' if dialect == Dialect::ClickHouse => index = skip_quoted(bytes, index, b'`', true),
+            b'[' if dialect == Dialect::TransactSql => {
+                index = skip_quoted(bytes, index, b']', false)
+            }
+            b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                index = bytes
+                    .get(index..)
+                    .and_then(|rest| rest.iter().position(|&byte| byte == b'\n'))
+                    .map_or(bytes.len(), |newline| index + newline);
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index = statement
+                    .get(index + 2..)
+                    .and_then(|rest| rest.find("*/"))
+                    .map_or(bytes.len(), |close| index + 2 + close + 2);
+            }
+            b'$' if dialect == Dialect::Postgres => {
+                index = skip_dollar_quoted(statement, index).unwrap_or(index + 1);
+            }
+            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+                let length = bytes.get(index..).map_or(0, |rest| {
+                    rest.iter()
+                        .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
+                        .count()
+                });
+                // A word right after a dot is a name (`t.update`), and one right before a `(`
+                // is a function call (`replace(name, ...)`), not a keyword. T-SQL's dynamic
+                // `EXEC('...')` is the exception that runs anything.
+                let after_dot = index > 0 && bytes.get(index - 1) == Some(&b'.');
+                let before_parenthesis = bytes.get(index + length) == Some(&b'(');
+                if !after_dot && let Some(word) = statement.get(index..index + length) {
+                    let word = word.to_ascii_uppercase();
+                    if !before_parenthesis || word == "EXEC" || word == "EXECUTE" {
+                        words.push(word);
+                    }
+                }
+                index += length;
+            }
+            _ => index += 1,
+        }
+    }
+    words
+}
+
+/// MongoDB commands that only read. Anything else, including a command this list has never
+/// heard of, counts as a write; so does an aggregation that ends in `$out` or `$merge`.
+const MONGO_READ_COMMANDS: &[&str] = &[
+    "find",
+    "aggregate",
+    "count",
+    "distinct",
+    "listCollections",
+    "listIndexes",
+    "listDatabases",
+    "dbStats",
+    "collStats",
+    "serverStatus",
+    "ping",
+    "explain",
+    "hello",
+    "isMaster",
+    "buildInfo",
+    "connectionStatus",
+    "getMore",
+    "hostInfo",
+    "currentOp",
+    "validate",
+    "dataSize",
+];
+
+fn mongo_may_write(statement: &str) -> bool {
+    let Ok(serde_json::Value::Object(command)) =
+        serde_json::from_str::<serde_json::Value>(statement)
+    else {
+        return true;
+    };
+    let Some(name) = command.keys().next() else {
+        return true;
+    };
+    if !MONGO_READ_COMMANDS.contains(&name.as_str()) {
+        return true;
+    }
+    name == "aggregate" && (statement.contains("\"$out\"") || statement.contains("\"$merge\""))
+}
+
+/// Redis commands that only read. Anything else is treated as a write.
+const REDIS_READ_COMMANDS: &[&str] = &[
+    "GET",
+    "MGET",
+    "GETRANGE",
+    "STRLEN",
+    "EXISTS",
+    "TYPE",
+    "TTL",
+    "PTTL",
+    "EXPIRETIME",
+    "PEXPIRETIME",
+    "HGET",
+    "HMGET",
+    "HGETALL",
+    "HKEYS",
+    "HVALS",
+    "HLEN",
+    "HEXISTS",
+    "HSTRLEN",
+    "HSCAN",
+    "HRANDFIELD",
+    "LRANGE",
+    "LLEN",
+    "LINDEX",
+    "LPOS",
+    "SMEMBERS",
+    "SISMEMBER",
+    "SMISMEMBER",
+    "SCARD",
+    "SSCAN",
+    "SRANDMEMBER",
+    "SINTER",
+    "SUNION",
+    "SDIFF",
+    "SINTERCARD",
+    "ZRANGE",
+    "ZRANGEBYSCORE",
+    "ZRANGEBYLEX",
+    "ZREVRANGE",
+    "ZREVRANGEBYSCORE",
+    "ZSCORE",
+    "ZMSCORE",
+    "ZCARD",
+    "ZCOUNT",
+    "ZLEXCOUNT",
+    "ZRANK",
+    "ZREVRANK",
+    "ZSCAN",
+    "ZRANDMEMBER",
+    "XRANGE",
+    "XREVRANGE",
+    "XLEN",
+    "XINFO",
+    "XPENDING",
+    "SCAN",
+    "KEYS",
+    "DBSIZE",
+    "INFO",
+    "PING",
+    "ECHO",
+    "TIME",
+    "OBJECT",
+    "MEMORY",
+    "DUMP",
+    "PFCOUNT",
+    "GETBIT",
+    "BITCOUNT",
+    "BITPOS",
+    "GEOPOS",
+    "GEODIST",
+    "GEOHASH",
+    "GEOSEARCH",
+    "RANDOMKEY",
+    "LASTSAVE",
+    "ROLE",
+    "COMMAND",
+    "SLOWLOG",
+    "LATENCY",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tells_writes_from_reads() {
+        for read in [
+            "select * from orders where note = 'delete me'",
+            "SELECT o.update, o.\"drop\" FROM t o -- delete later",
+            "with recent as (select 1) select * from recent",
+            "EXPLAIN SELECT 1",
+            "select replace(name, 'a', 'b') from t",
+        ] {
+            assert!(!may_write(read, Engine::Postgres), "{read}");
+        }
+        for write in [
+            "update orders set total = 0",
+            "WITH gone AS (DELETE FROM t RETURNING *) SELECT * FROM gone",
+            "select * into backup from orders",
+            "create table t (id int)",
+        ] {
+            assert!(may_write(write, Engine::Postgres), "{write}");
+        }
+        assert!(may_write(
+            "DECLARE @x int = 1;\nUPDATE [t] SET a = @x",
+            Engine::SqlServer
+        ));
+        assert!(!may_write("SELECT [delete] FROM [t]", Engine::SqlServer));
+        assert!(may_write("EXEC('DROP TABLE t')", Engine::SqlServer));
+        assert!(may_write(
+            "OPTIMIZE TABLE app.orders FINAL",
+            Engine::ClickHouse
+        ));
+        assert!(!may_write("{\"find\": \"users\"}", Engine::MongoDb));
+        assert!(may_write(
+            "{\"delete\": \"users\", \"deletes\": []}",
+            Engine::MongoDb
+        ));
+        assert!(may_write(
+            "{\"aggregate\": \"a\", \"pipeline\": [{\"$out\": \"b\"}]}",
+            Engine::MongoDb
+        ));
+        assert!(!may_write("hgetall user:1", Engine::Redis));
+        assert!(may_write("FLUSHDB", Engine::Redis));
+    }
 
     fn pieces(text: &str, engine: Engine) -> Vec<&str> {
         split(text, engine)
