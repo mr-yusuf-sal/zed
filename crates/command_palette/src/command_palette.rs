@@ -174,6 +174,21 @@ impl CommandPalette {
                 .detach();
         });
     }
+
+    /// Backspace past the start of the query goes back to the file finder, the way deleting
+    /// the `>` in VS Code's quick open does.
+    fn backspace_on_empty_query(
+        &mut self,
+        _: &editor::actions::Backspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.picker.read(cx).query(cx).is_empty() {
+            return;
+        }
+        cx.stop_propagation();
+        window.dispatch_action(Box::new(workspace::ToggleFileFinder::default()), cx);
+    }
 }
 
 impl EventEmitter<DismissEvent> for CommandPalette {}
@@ -189,6 +204,7 @@ impl Render for CommandPalette {
         v_flex()
             .key_context("CommandPalette")
             .on_action(cx.listener(Self::remove_selected))
+            .capture_action(cx.listener(Self::backspace_on_empty_query))
             .child(self.picker.clone())
     }
 }
