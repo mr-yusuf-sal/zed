@@ -7520,6 +7520,15 @@ impl Sidebar {
 
     fn render_sidebar_bottom_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_archive = matches!(self.view, SidebarView::Archive(..));
+        let is_archived_only = matches!(
+            &self.view,
+            SidebarView::Archive(archive) if archive.read(cx).is_showing_only_archived()
+        );
+        let has_archived_threads = ThreadMetadataStore::global(cx)
+            .read(cx)
+            .archived_entries()
+            .next()
+            .is_some();
         let on_right = self.side(cx) == SidebarSide::Right;
 
         h_flex()
@@ -7543,6 +7552,22 @@ impl Sidebar {
                     })
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_archive(&ToggleThreadHistory, window, cx);
+                    })),
+            )
+            .child(
+                IconButton::new("archived-history", IconName::Archive)
+                    .icon_size(IconSize::Small)
+                    .disabled(!has_archived_threads)
+                    .toggle_state(is_archived_only)
+                    .tooltip(Tooltip::text(if !has_archived_threads {
+                        "No Archived Threads"
+                    } else if is_archived_only {
+                        "Hide Archived Threads"
+                    } else {
+                        "Show Archived Threads"
+                    }))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_archived_threads(window, cx);
                     })),
             )
             .child(div().flex_1())
@@ -7708,6 +7733,24 @@ impl Sidebar {
         }
     }
 
+    fn toggle_archived_threads(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let showing_archived_only = matches!(
+            &self.view,
+            SidebarView::Archive(archive) if archive.read(cx).is_showing_only_archived()
+        );
+        if showing_archived_only {
+            self.show_thread_list(window, cx);
+            return;
+        }
+        if !matches!(self.view, SidebarView::Archive(_)) {
+            self.show_archive(window, cx);
+        }
+        if let SidebarView::Archive(archive) = &self.view {
+            archive.update(cx, |archive, cx| archive.show_only_archived(cx));
+        }
+        cx.notify();
+    }
+
     fn show_archive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let side = match self.side(cx) {
             SidebarSide::Left => "left",
@@ -7771,6 +7814,8 @@ impl Sidebar {
         );
 
         self._subscriptions.push(subscription);
+        // The archive button in the bottom bar mirrors the view's own archived-only toggle.
+        self._subscriptions.push(cx.observe(&archive_view, |_, _, cx| cx.notify()));
         self.view = SidebarView::Archive(archive_view.clone());
         archive_view.update(cx, |view, cx| view.focus_filter_editor(window, cx));
         self.serialize(cx);
