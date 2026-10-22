@@ -44,6 +44,8 @@ const EXIT_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 // The host prefixes every line it sends to Zed with one of these tags.
 const ATTACHED_TAG: char = 'a';
+// Only sent by hosts from builds that served one connection at a time, which
+// can still be running when a newer Zed connects.
 const BUSY_TAG: char = 'b';
 const STDOUT_TAG: char = 'o';
 const STDERR_TAG: char = 'e';
@@ -308,11 +310,16 @@ async fn serve(executor: Rc<LocalExecutor<'static>>, socket_path: PathBuf) -> Re
     };
     futures::future::select(Box::pin(accept_loop), exit_receiver).await;
 
-    let client = host.borrow_mut().client.take();
-    if let Some(client) = client {
+    let clients = std::mem::take(&mut host.borrow_mut().clients);
+    let writers = clients.into_values().map(|client| {
         drop(client.sender);
-        futures::future::select(client.writer, Timer::after(EXIT_FLUSH_TIMEOUT)).await;
-    }
+        client.writer
+    });
+    futures::future::select(
+        futures::future::join_all(writers),
+        Timer::after(EXIT_FLUSH_TIMEOUT),
+    )
+    .await;
     std::fs::remove_file(&socket_path).ok();
     Ok(())
 }
@@ -346,7 +353,12 @@ async fn bind(socket_path: &Path) -> Result<Option<UnixListener>> {
 #[derive(Default)]
 struct Host {
     agent: Option<Agent>,
-    client: Option<Client>,
+    /// Every connected Zed, by the generation it attached with. One Zed can
+    /// connect more than once, from each of its projects on the same folder.
+    clients: HashMap<u64, Client>,
+    /// The connection that set up each session, which its updates and
+    /// requests go to.
+    session_owners: HashMap<String, u64>,
     next_generation: u64,
     next_request_id: u64,
     client_requests: HashMap<u64, ClientRequest>,
@@ -360,7 +372,6 @@ struct Agent {
 }
 
 struct Client {
-    generation: u64,
     sender: mpsc::UnboundedSender<String>,
     writer: Task<()>,
 }
@@ -397,10 +408,6 @@ async fn handle_connection(
         .context("connection closed before its hello")??;
     let hello: Hello = serde_json::from_str(&hello_line).context("parsing hello")?;
 
-    if host.borrow().client.is_some() {
-        writer.write_all(format!("{BUSY_TAG}\n").as_bytes()).await?;
-        return Ok(());
-    }
     if host.borrow().agent.is_none() {
         if let Err(error) = spawn_agent(&executor, &host, &hello.command) {
             let message = format!("{error:#}").replace(['\r', '\n'], " ");
@@ -481,7 +488,7 @@ fn spawn_agent(
         async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Some(Ok(line)) = lines.next().await {
-                host.borrow().send_to_client(STDERR_TAG, &line);
+                host.borrow().broadcast(STDERR_TAG, &line);
             }
         }
     });
@@ -505,7 +512,7 @@ fn spawn_agent(
                 futures::future::select(Box::pin(drained), Timer::after(EXIT_FLUSH_TIMEOUT)).await;
                 let mut host = host.borrow_mut();
                 let code = status.and_then(|status| status.code());
-                host.send_to_client(
+                host.broadcast(
                     EXIT_TAG,
                     &code.map(|code| code.to_string()).unwrap_or_default(),
                 );
@@ -549,23 +556,22 @@ impl Host {
         self.next_generation += 1;
         let generation = self.next_generation;
         sender.unbounded_send(ATTACHED_TAG.to_string()).ok();
-        self.client = Some(Client {
-            generation,
-            sender,
-            writer,
-        });
-        self.deliver_held_requests(None);
+        self.clients.insert(generation, Client { sender, writer });
+        self.deliver_held_requests(generation, None);
         generation
     }
 
     fn detach(&mut self, generation: u64) {
-        if self.current_generation() != Some(generation) {
+        if self.clients.remove(&generation).is_none() {
             return;
         }
-        self.client = None;
+        self.session_owners.retain(|_, owner| *owner != generation);
 
         let mut answered_locally = Vec::new();
         self.agent_requests.retain_mut(|request| {
+            if request.delivered_to != Some(generation) {
+                return true;
+            }
             if request.method.starts_with("fs/") {
                 answered_locally.push(request.message.clone());
                 return false;
@@ -576,14 +582,27 @@ impl Host {
         for request in answered_locally {
             self.answer_locally(&request);
         }
+        // Requests of no session can go to any Zed that is still connected.
+        if let Some(generation) = self.target(None) {
+            self.deliver_held_requests(generation, None);
+        }
     }
 
-    fn current_generation(&self) -> Option<u64> {
-        self.client.as_ref().map(|client| client.generation)
+    /// The connection that a message of `session_id` goes to: the one that set
+    /// the session up, or for a message of no session the latest one.
+    fn target(&self, session_id: Option<&str>) -> Option<u64> {
+        match session_id {
+            Some(session_id) => self
+                .session_owners
+                .get(session_id)
+                .copied()
+                .filter(|generation| self.clients.contains_key(generation)),
+            None => self.clients.keys().max().copied(),
+        }
     }
 
     fn is_idle(&self) -> bool {
-        self.client.is_none()
+        self.clients.is_empty()
             && !self
                 .client_requests
                 .values()
@@ -596,8 +615,14 @@ impl Host {
         }
     }
 
-    fn send_to_client(&self, tag: char, line: &str) {
-        if let Some(client) = &self.client {
+    fn send_to(&self, generation: u64, tag: char, line: &str) {
+        if let Some(client) = self.clients.get(&generation) {
+            client.sender.unbounded_send(format!("{tag}{line}")).ok();
+        }
+    }
+
+    fn broadcast(&self, tag: char, line: &str) {
+        for client in self.clients.values() {
             client.sender.unbounded_send(format!("{tag}{line}")).ok();
         }
     }
@@ -624,6 +649,13 @@ impl Host {
                 let host_id = self.next_request_id;
                 self.next_request_id += 1;
                 let session_id = params_session_id(&message);
+                // Loading a session replays it before the response, so its
+                // updates must already go to the connection that asked.
+                if SESSION_SETUP_METHODS.contains(&method.as_str())
+                    && let Some(session_id) = &session_id
+                {
+                    self.session_owners.insert(session_id.clone(), generation);
+                }
                 self.client_requests.insert(
                     host_id,
                     ClientRequest {
@@ -653,13 +685,11 @@ impl Host {
             }
             (None, Some(id)) => {
                 let key = id.to_string();
-                let Some(index) = self
-                    .agent_requests
-                    .iter()
-                    .position(|request| request.key == key)
-                else {
+                let Some(index) = self.agent_requests.iter().position(|request| {
+                    request.key == key && request.delivered_to == Some(generation)
+                }) else {
                     // The host answered this request itself after the Zed that
-                    // was asked disconnected.
+                    // was asked disconnected, or another Zed answered it.
                     return;
                 };
                 self.agent_requests.remove(index);
@@ -671,7 +701,7 @@ impl Host {
 
     fn handle_agent_line(&mut self, line: String) {
         let Ok(mut message) = serde_json::from_str::<Value>(&line) else {
-            self.send_to_client(STDOUT_TAG, &line);
+            self.broadcast(STDOUT_TAG, &line);
             return;
         };
         let method = message
@@ -682,17 +712,20 @@ impl Host {
 
         match (method, id) {
             (Some(method), Some(id)) => {
-                if self.client.is_none() && method.starts_with("fs/") {
-                    self.answer_locally(&message);
-                    return;
-                }
-                let delivered_to = self.current_generation();
-                if delivered_to.is_some() {
-                    self.send_to_client(STDOUT_TAG, &line);
+                let session_id = params_session_id(&message);
+                let delivered_to = self.target(session_id.as_deref());
+                match delivered_to {
+                    Some(generation) => self.send_to(generation, STDOUT_TAG, &line),
+                    // No Zed that knows the session is connected to answer it.
+                    None if method.starts_with("fs/") => {
+                        self.answer_locally(&message);
+                        return;
+                    }
+                    None => {}
                 }
                 self.agent_requests.push(AgentRequest {
                     key: id.to_string(),
-                    session_id: params_session_id(&message),
+                    session_id,
                     method,
                     message,
                     delivered_to,
@@ -703,15 +736,21 @@ impl Host {
                     .get("params")
                     .and_then(|params| params.get("requestId"))
                     .map(Value::to_string);
+                let Some(index) = self
+                    .agent_requests
+                    .iter()
+                    .position(|request| Some(&request.key) == key.as_ref())
+                else {
+                    return;
+                };
                 // A request Zed was never shown is dropped here; one it was
                 // shown needs the cancellation to dismiss its prompt.
-                if let Some(index) = self.agent_requests.iter().position(|request| {
-                    Some(&request.key) == key.as_ref() && request.delivered_to.is_none()
-                }) {
-                    self.agent_requests.remove(index);
-                    return;
+                match self.agent_requests[index].delivered_to {
+                    Some(generation) => self.send_to(generation, STDOUT_TAG, &line),
+                    None => {
+                        self.agent_requests.remove(index);
+                    }
                 }
-                self.send_to_client(STDOUT_TAG, &line);
             }
             (None, Some(id)) => {
                 let Some(request) = id
@@ -720,7 +759,7 @@ impl Host {
                 else {
                     return;
                 };
-                if self.current_generation() != Some(request.generation) {
+                if !self.clients.contains_key(&request.generation) {
                     return;
                 }
                 let loaded_session = if SESSION_SETUP_METHODS.contains(&request.method.as_str())
@@ -736,23 +775,32 @@ impl Host {
                     None
                 };
                 message["id"] = request.id;
-                self.send_to_client(STDOUT_TAG, &message.to_string());
+                self.send_to(request.generation, STDOUT_TAG, &message.to_string());
                 // After the response, so that Zed knows the session by the time
                 // the requests that waited for it arrive.
                 if let Some(session_id) = loaded_session {
-                    self.deliver_held_requests(Some(&session_id));
+                    self.session_owners
+                        .insert(session_id.clone(), request.generation);
+                    self.deliver_held_requests(request.generation, Some(&session_id));
                 }
             }
-            _ => self.send_to_client(STDOUT_TAG, &line),
+            _ => match params_session_id(&message)
+                .as_deref()
+                .and_then(|session_id| self.target(Some(session_id)))
+            {
+                Some(generation) => self.send_to(generation, STDOUT_TAG, &line),
+                // A Zed ignores updates of a session it has not loaded.
+                None => self.broadcast(STDOUT_TAG, &line),
+            },
         }
     }
 
-    /// Delivers the held requests of `session_id`, or those that belong to no
-    /// session when it is `None`.
-    fn deliver_held_requests(&mut self, session_id: Option<&str>) {
-        let Some(generation) = self.current_generation() else {
+    /// Delivers to `generation` the held requests of `session_id`, or those
+    /// that belong to no session when it is `None`.
+    fn deliver_held_requests(&mut self, generation: u64, session_id: Option<&str>) {
+        if !self.clients.contains_key(&generation) {
             return;
-        };
+        }
         let mut lines = Vec::new();
         for request in &mut self.agent_requests {
             if request.delivered_to.is_none() && request.session_id.as_deref() == session_id {
@@ -761,7 +809,7 @@ impl Host {
             }
         }
         for line in lines {
-            self.send_to_client(STDOUT_TAG, &line);
+            self.send_to(generation, STDOUT_TAG, &line);
         }
     }
 
@@ -940,5 +988,71 @@ mod tests {
         );
         host.detach(second);
         assert!(host.is_idle());
+    }
+
+    #[test]
+    fn connections_share_the_agent() {
+        let (mut host, mut agent) = test_host();
+        let (first, mut first_client) = attach(&mut host);
+        let (second, mut second_client) = attach(&mut host);
+
+        host.handle_client_line(
+            first,
+            json!({"jsonrpc": "2.0", "id": 0, "method": "session/load", "params": {"sessionId": "a"}})
+                .to_string(),
+        );
+        host.handle_client_line(
+            second,
+            json!({"jsonrpc": "2.0", "id": 0, "method": "session/load", "params": {"sessionId": "b"}})
+                .to_string(),
+        );
+        assert_eq!(next_message(&mut agent)["id"], json!(0));
+        assert_eq!(
+            next_message(&mut agent)["id"],
+            json!(1),
+            "both connections numbering from zero must not collide"
+        );
+
+        host.handle_agent_line(
+            json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "b"}})
+                .to_string(),
+        );
+        assert_eq!(next_line(&mut first_client), "");
+        assert_eq!(
+            next_message(&mut second_client)["params"]["sessionId"],
+            json!("b")
+        );
+
+        host.handle_agent_line(json!({"jsonrpc": "2.0", "id": 1, "result": {}}).to_string());
+        assert_eq!(next_line(&mut first_client), "");
+        assert_eq!(next_message(&mut second_client)["id"], json!(0));
+        host.handle_agent_line(json!({"jsonrpc": "2.0", "id": 0, "result": {}}).to_string());
+        assert_eq!(next_message(&mut first_client)["id"], json!(0));
+
+        host.handle_agent_line(
+            json!({"jsonrpc": "2.0", "id": 9, "method": "session/request_permission", "params": {"sessionId": "a"}})
+                .to_string(),
+        );
+        assert_eq!(next_message(&mut first_client)["id"], json!(9));
+        assert_eq!(next_line(&mut second_client), "");
+
+        host.detach(first);
+        assert!(!host.is_idle(), "the second connection is still attached");
+        let (third, mut third_client) = attach(&mut host);
+        assert_eq!(
+            next_line(&mut third_client),
+            "",
+            "the permission request waits until its session is loaded again"
+        );
+        host.handle_client_line(
+            third,
+            json!({"jsonrpc": "2.0", "id": 0, "method": "session/load", "params": {"sessionId": "a"}})
+                .to_string(),
+        );
+        assert_eq!(next_message(&mut agent)["id"], json!(2));
+        host.handle_agent_line(json!({"jsonrpc": "2.0", "id": 2, "result": {}}).to_string());
+        assert_eq!(next_message(&mut third_client)["id"], json!(0));
+        assert_eq!(next_message(&mut third_client)["id"], json!(9));
+        assert_eq!(next_line(&mut second_client), "");
     }
 }
