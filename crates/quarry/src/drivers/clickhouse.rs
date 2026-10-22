@@ -516,6 +516,33 @@ impl Driver for ClickHouseDriver {
             .map(|definition| definition.to_string())
             .with_context(|| format!("{database}.{table} was not found"))
     }
+
+    /// ClickHouse keeps the statement every table was created with, so the definition is the
+    /// CREATE script for tables and views alike.
+    async fn create_script(&self, path: &[SharedString]) -> Result<String> {
+        let definition = self.definition(path).await?;
+        Ok(format!("{definition};\n"))
+    }
+
+    fn qualified_name(&self, path: &[SharedString]) -> Option<String> {
+        match path {
+            [database, table, ..] => {
+                Some(format!("{}.{}", quote_ident(database), quote_ident(table)))
+            }
+            [database] => Some(quote_ident(database)),
+            [] => None,
+        }
+    }
+
+    fn select_statement(&self, path: &[SharedString], limit: usize) -> Option<String> {
+        let table = self.qualified_name(path).filter(|_| path.len() == 2)?;
+        Some(format!("SELECT * FROM {table} LIMIT {limit}"))
+    }
+
+    fn count_statement(&self, path: &[SharedString]) -> Option<String> {
+        let table = self.qualified_name(path).filter(|_| path.len() == 2)?;
+        Some(format!("SELECT count() FROM {table}"))
+    }
 }
 
 fn quote_ident(name: &str) -> String {

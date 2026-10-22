@@ -839,3 +839,73 @@ fn mongodb_query_and_edit() {
             .is_err());
     });
 }
+
+#[test]
+#[ignore = "needs the quarry mongodb on :27018"]
+fn mongodb_create_script_round_trips() {
+    runtime().block_on(async {
+        let driver = mongo_driver().await;
+        let original = driver
+            .create_script(&path(&["app", "orders"]))
+            .await
+            .expect("create script");
+        println!("{original}");
+        assert!(original.contains("\"createIndexes\": \"orders\""));
+        assert!(!original.contains("\"_id_\""));
+
+        // Run in a scratch database, the commands recreate the same collection and indexes.
+        let scratch = Some("quarry_live_ddl");
+        driver
+            .query("{\"dropDatabase\": 1}", scratch, 10)
+            .await
+            .expect("clearing the scratch database");
+        for range in quarry::statements::split(&original, quarry::driver::Engine::MongoDb) {
+            driver
+                .query(&original[range], scratch, 10)
+                .await
+                .expect("running the script");
+        }
+        let copy = driver
+            .create_script(&path(&["quarry_live_ddl", "orders"]))
+            .await
+            .expect("create script of the copy");
+        driver
+            .query("{\"dropDatabase\": 1}", scratch, 10)
+            .await
+            .expect("dropping the scratch database");
+        assert_eq!(copy, original);
+
+        let count = single(
+            driver
+                .query(
+                    &driver
+                        .count_statement(&path(&["app", "orders"]))
+                        .expect("count statement"),
+                    Some("app"),
+                    10,
+                )
+                .await
+                .expect("counting"),
+        );
+        assert!(cell(&count, 0, "n").is_some());
+    });
+}
+
+#[test]
+#[ignore = "needs the quarry clickhouse on :18123"]
+fn clickhouse_create_script() {
+    runtime().block_on(async {
+        let driver = clickhouse_driver().await;
+        let script = driver
+            .create_script(&path(&["app", "orders"]))
+            .await
+            .expect("create script");
+        println!("{script}");
+        assert!(script.starts_with("CREATE TABLE app.orders"));
+        let select = driver
+            .select_statement(&path(&["app", "orders"]), 5)
+            .expect("select statement");
+        let rows = single(driver.query(&select, None, 10).await.expect("selecting"));
+        assert_eq!(rows.rows.len(), 5);
+    });
+}
