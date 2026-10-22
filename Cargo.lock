@@ -23249,6 +23249,7 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "gpui_tokio",
+ "gpui_windows",
  "hang_telemetry",
  "http_client",
  "image",

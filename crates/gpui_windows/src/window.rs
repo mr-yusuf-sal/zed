@@ -6,7 +6,10 @@ use std::{
     path::PathBuf,
     rc::{Rc, Weak},
     str::FromStr,
-    sync::{Arc, Once, atomic::AtomicBool},
+    sync::{
+        Arc, Once,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -591,6 +594,15 @@ impl WindowsWindow {
     }
 }
 
+static ACTIVATION_SUPPRESSED: AtomicBool = AtomicBool::new(false);
+
+/// While set, activating a window neither shows nor focuses it. Windows are
+/// created hidden and only appear when first activated, so an app can set this
+/// around its startup to come up with its windows hidden (e.g. in the system tray).
+pub fn set_activation_suppressed(suppressed: bool) {
+    ACTIVATION_SUPPRESSED.store(suppressed, Ordering::SeqCst);
+}
+
 impl rwh::HasWindowHandle for WindowsWindow {
     fn window_handle(&self) -> std::result::Result<rwh::WindowHandle<'_>, rwh::HandleError> {
         let raw = rwh::Win32WindowHandle::new(unsafe {
@@ -812,6 +824,9 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn activate(&self) {
+        if ACTIVATION_SUPPRESSED.load(Ordering::SeqCst) {
+            return;
+        }
         let hwnd = self.0.hwnd;
         let this = self.0.clone();
         self.0
