@@ -2,7 +2,7 @@ use crate::{
     connection_store::{ConnectionStore, connection_url, parse_connection_url},
     docker::DiscoveredServer,
     driver::{ConnectionConfig, Driver, Environment, ObjectKind, ObjectNode},
-    query_view::{QueryView, environment_badge},
+    query_view::{PREVIEW_ROW_LIMIT, QueryView, environment_badge},
     runtime::QuarryRuntime,
 };
 use anyhow::Result;
@@ -33,7 +33,6 @@ actions!(
     ]
 );
 
-const PREVIEW_ROW_LIMIT: usize = 500;
 const SELECT_ROW_LIMIT: usize = 100;
 
 #[derive(Clone, Copy)]
@@ -939,13 +938,16 @@ impl QuarryPanel {
         };
         view.update(cx, |view, cx| view.set_loading(cx));
 
+        let preview = runtime.spawn({
+            let path = node.path.clone();
+            async move { driver.preview(&path, PREVIEW_ROW_LIMIT).await }
+        });
         let path = node.path.clone();
-        let preview = runtime.spawn(async move { driver.preview(&path, PREVIEW_ROW_LIMIT).await });
         let view = view.downgrade();
         let task = cx.spawn(async move |_, cx| {
             let result = preview.await;
             view.update(cx, |view, cx| match result {
-                Ok(result) => view.show_result(result, cx),
+                Ok(result) => view.show_preview(path, result, cx),
                 Err(error) => view.show_error(format!("{error:#}").into(), cx),
             })
             .ok();
@@ -1358,9 +1360,8 @@ impl QuarryPanel {
                     })),
                 )
             })
-            .entry("Copy Name", None, {
-                let name = name.clone();
-                move |_, cx| cx.write_to_clipboard(ClipboardItem::new_string(name.to_string()))
+            .entry("Copy Name", None, move |_, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(name.to_string()))
             })
             .when_some(qualified_name, |menu, qualified_name| {
                 menu.entry("Copy Qualified Name", None, move |_, cx| {

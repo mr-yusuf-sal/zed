@@ -49,6 +49,10 @@ actions!(
 /// nobody scrolls to. The view says so when it truncates, so the cap is never silent.
 const ROW_LIMIT: usize = 2_000;
 
+/// A preview opened from the tree shows this many rows at first, and "Load More" adds this many
+/// more each time.
+pub const PREVIEW_ROW_LIMIT: usize = 500;
+
 enum Status {
     Connecting,
     Idle,
@@ -74,6 +78,15 @@ struct PendingEdit {
     saving: bool,
 }
 
+/// The table, collection or key a preview tab was opened on, kept while its rows are on screen
+/// so that "Load More" can read the rows after them. They come from `QueryView::driver`, which
+/// is the driver the panel read the first page with.
+struct PreviewSource {
+    path: Vec<SharedString>,
+    /// The next page while it is being read. Dropping it abandons the read.
+    loading: Option<Task<()>>,
+}
+
 pub struct QueryView {
     focus_handle: FocusHandle,
     config: ConnectionConfig,
@@ -95,6 +108,9 @@ pub struct QueryView {
     visible_rows: Vec<usize>,
     status: Status,
     pending_edit: Option<PendingEdit>,
+    /// Set while the grid shows a preview from the tree; it is the only result then. Any other
+    /// result replacing it clears this.
+    preview: Option<PreviewSource>,
     running: Option<Task<()>>,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -178,6 +194,7 @@ impl QueryView {
             visible_rows: Vec::new(),
             status: Status::Idle,
             pending_edit: None,
+            preview: None,
             running: None,
             _tasks: Vec::new(),
             _subscriptions: subscriptions,
@@ -286,13 +303,79 @@ impl QueryView {
         cx.notify();
     }
 
-    /// Replaces the grid with `result`, for the table preview that opens from the tree.
-    pub fn show_result(&mut self, result: ResultSet, cx: &mut Context<Self>) {
+    /// Replaces the grid with `result`, the first page of the preview that opens from the tree,
+    /// and keeps `path` so that the pages after it can be loaded.
+    pub fn show_preview(
+        &mut self,
+        path: Vec<SharedString>,
+        result: ResultSet,
+        cx: &mut Context<Self>,
+    ) {
         self.status = Status::Succeeded {
             statements: 1,
             elapsed: Duration::ZERO,
         };
         self.set_results(vec![result], cx);
+        self.preview = Some(PreviewSource {
+            path,
+            loading: None,
+        });
+    }
+
+    /// Reads the page after the rows the preview shows and adds it to them.
+    fn load_more(&mut self, cx: &mut Context<Self>) {
+        let Some(preview) = self.preview.as_mut() else {
+            return;
+        };
+        if preview.loading.is_some() {
+            return;
+        }
+        let Some(offset) = self.results.first().map(|result| result.rows.len()) else {
+            return;
+        };
+        let Some(driver) = self.driver.clone() else {
+            return;
+        };
+        let Some(runtime) = QuarryRuntime::global(cx) else {
+            self.status = Status::Failed("the Quarry runtime is not available".into());
+            cx.notify();
+            return;
+        };
+        let path = preview.path.clone();
+        let page = runtime
+            .spawn(async move { driver.preview_page(&path, PREVIEW_ROW_LIMIT, offset).await });
+        preview.loading = Some(cx.spawn(async move |this, cx| {
+            let page = page.await;
+            this.update(cx, |this, cx| {
+                if let Some(preview) = this.preview.as_mut() {
+                    preview.loading = None;
+                }
+                match page {
+                    Ok(page) => this.append_page(page, cx),
+                    Err(error) => {
+                        this.status = Status::Failed(format!("{error:#}").into());
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Adds `page`, read from where the preview's rows end, to the bottom of the grid. Rows and
+    /// columns already shown keep their indexes, so the edit target and a cell being edited
+    /// still point at the same cells.
+    fn append_page(&mut self, page: ResultSet, cx: &mut Context<Self>) {
+        let Some(result) = self.results.first_mut() else {
+            return;
+        };
+        result_table::append_page(result, page);
+        self.status = Status::Succeeded {
+            statements: 1,
+            elapsed: Duration::ZERO,
+        };
+        self.refresh_table(cx);
     }
 
     /// Shows why a preview could not be loaded where the user is looking, instead of an empty
@@ -510,6 +593,7 @@ impl QueryView {
     fn set_results(&mut self, results: Vec<ResultSet>, cx: &mut Context<Self>) {
         self.results = results;
         self.pending_edit = None;
+        self.preview = None;
         self.select_result(0, cx);
     }
 
@@ -985,7 +1069,7 @@ impl QueryView {
         )
     }
 
-    fn render_status(&self, cx: &App) -> AnyElement {
+    fn render_status(&self, cx: &mut Context<Self>) -> AnyElement {
         let (icon, color, text) = match &self.status {
             Status::Connecting => (
                 IconName::ArrowCircle,
@@ -1064,7 +1148,37 @@ impl QueryView {
             .border_color(cx.theme().colors().border)
             .child(Icon::new(icon).size(IconSize::XSmall).color(color))
             .child(Label::new(text).size(LabelSize::Small).color(color))
+            .when_some(self.render_load_more(cx), |status, button| {
+                status.child(div().flex_1()).child(button)
+            })
             .into_any_element()
+    }
+
+    /// Offered under a preview whose last page was cut short. It stays after an edit or a failed
+    /// query, which leave the preview's rows in place, so the status text is not what decides.
+    fn render_load_more(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let preview = self.preview.as_ref()?;
+        if !self.results.first()?.truncated {
+            return None;
+        }
+        let loading = preview.loading.is_some();
+        Some(
+            div()
+                .flex_none()
+                .child(
+                    Button::new(
+                        "quarry-load-more",
+                        if loading { "Loading…" } else { "Load More" },
+                    )
+                    .label_size(LabelSize::Small)
+                    .disabled(loading || self.running.is_some())
+                    .tooltip(Tooltip::text(format!(
+                        "Add the next {PREVIEW_ROW_LIMIT} rows"
+                    )))
+                    .on_click(cx.listener(|this, _, _, cx| this.load_more(cx))),
+                )
+                .into_any_element(),
+        )
     }
 }
 
@@ -1094,8 +1208,10 @@ fn result_summary(result: &ResultSet) -> String {
         return message.to_string();
     }
     let rows = result.rows.len();
+    // The row count already says where the result was cut: at ROW_LIMIT for a query, but at a
+    // multiple of PREVIEW_ROW_LIMIT for a preview and the pages loaded under it.
     let mut summary = if result.truncated {
-        format!("{rows} rows (truncated at {ROW_LIMIT})")
+        format!("{rows} rows (truncated)")
     } else {
         format!("{rows} rows")
     };
@@ -1363,5 +1479,233 @@ impl SerializableItem for QueryView {
 
     fn should_serialize(&self, event: &Self::Event) -> bool {
         matches!(event, ItemEvent::Edit)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::{EditTarget, ObjectNode};
+    use gpui::TestAppContext;
+    use parking_lot::Mutex;
+    use settings::SettingsStore;
+
+    /// Numbered rows handed out a page at a time, recording the offset of every page asked for.
+    /// As with MongoDB, a page has the columns its own rows have: the last ten rows carry one
+    /// more, and it comes first in their pages.
+    struct PagedTable {
+        rows: usize,
+        offsets: Mutex<Vec<usize>>,
+    }
+
+    impl PagedTable {
+        fn page(&self, path: &[SharedString], row_limit: usize, offset: usize) -> ResultSet {
+            let end = self.rows.min(offset.saturating_add(row_limit));
+            let numbers = offset.min(end)..end;
+            let is_late = |number: usize| number + 10 >= self.rows;
+            let has_late = numbers.clone().any(is_late);
+            let mut columns = vec![SharedString::from("_id"), SharedString::from("name")];
+            if has_late {
+                columns.insert(0, SharedString::from("late"));
+            }
+            let rows = numbers
+                .map(|number| {
+                    let mut row = vec![
+                        Some(SharedString::from(number.to_string())),
+                        Some(SharedString::from(format!("user {number}"))),
+                    ];
+                    if has_late {
+                        row.insert(0, is_late(number).then(|| SharedString::from("yes")));
+                    }
+                    row
+                })
+                .collect();
+            let id_column = usize::from(has_late);
+            ResultSet {
+                columns,
+                rows,
+                truncated: end < self.rows,
+                edit_target: Some(EditTarget {
+                    path: path.to_vec(),
+                    key_columns: vec![id_column],
+                    read_only_columns: vec![id_column],
+                }),
+                ..ResultSet::default()
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Driver for PagedTable {
+        async fn children(&self, _path: &[SharedString]) -> Result<Vec<ObjectNode>> {
+            Ok(Vec::new())
+        }
+
+        async fn query(
+            &self,
+            _statement: &str,
+            _database: Option<&str>,
+            _row_limit: usize,
+        ) -> Result<Vec<ResultSet>> {
+            Ok(Vec::new())
+        }
+
+        async fn preview_page(
+            &self,
+            path: &[SharedString],
+            row_limit: usize,
+            offset: usize,
+        ) -> Result<ResultSet> {
+            self.offsets.lock().push(offset);
+            Ok(self.page(path, row_limit, offset))
+        }
+
+        async fn databases(&self) -> Result<Vec<SharedString>> {
+            Ok(Vec::new())
+        }
+
+        fn default_database(&self) -> Option<SharedString> {
+            None
+        }
+
+        async fn catalog(&self, _database: Option<&str>) -> Result<Vec<CatalogEntry>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            QuarryRuntime::init(cx);
+        });
+        // Pages are read on the Quarry tokio runtime, whose threads the test scheduler does not
+        // run, so the test has to wait for them in real time.
+        cx.executor().allow_parking();
+    }
+
+    fn names(names: &[&'static str]) -> Vec<SharedString> {
+        names.iter().map(|name| SharedString::from(*name)).collect()
+    }
+
+    #[gpui::test]
+    async fn test_load_more_appends_the_next_pages(cx: &mut TestAppContext) {
+        init_test(cx);
+        let table = Arc::new(PagedTable {
+            rows: PREVIEW_ROW_LIMIT * 2 + 10,
+            offsets: Mutex::new(Vec::new()),
+        });
+        let path = names(&["app", "users"]);
+        let config = ConnectionConfig {
+            name: "test".to_string(),
+            engine: Engine::MongoDb,
+            host: "localhost".to_string(),
+            port: 27017,
+            database: None,
+            username: None,
+            environment: None,
+            folder: None,
+        };
+        let (view, cx) = cx.add_window_view({
+            let driver: Arc<dyn Driver> = table.clone();
+            move |window, cx| {
+                QueryView::new(
+                    config,
+                    Some(driver),
+                    None,
+                    "users".into(),
+                    None,
+                    None,
+                    window,
+                    cx,
+                )
+            }
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.show_preview(path.clone(), table.page(&path, PREVIEW_ROW_LIMIT, 0), cx);
+            view.start_edit(3, 1, window, cx);
+            view.search.update(cx, |search, cx| {
+                search.set_text("user 50", window, cx);
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.visible_rows, vec![50]);
+            assert!(
+                view.preview
+                    .as_ref()
+                    .is_some_and(|preview| preview.loading.is_none())
+            );
+        });
+
+        let page_loaded = |view: &mut QueryView, _: &mut Context<QueryView>| {
+            view.preview
+                .as_ref()
+                .is_some_and(|preview| preview.loading.is_none())
+        };
+        view.update(cx, |view, cx| view.load_more(cx));
+        cx.condition(&view, page_loaded).await;
+        view.read_with(cx, |view, _| {
+            let result = &view.results[0];
+            assert_eq!(result.rows.len(), PREVIEW_ROW_LIMIT * 2);
+            assert!(result.truncated);
+            assert_eq!(result.columns, names(&["_id", "name"]));
+            assert_eq!(
+                result.rows[PREVIEW_ROW_LIMIT][0].as_deref(),
+                Some(PREVIEW_ROW_LIMIT.to_string().as_str())
+            );
+            let mut expected_matches = vec![50];
+            expected_matches.extend(500..510);
+            assert_eq!(view.visible_rows, expected_matches);
+            let pending = view
+                .pending_edit
+                .as_ref()
+                .expect("the cell being edited is still being edited");
+            assert_eq!((pending.row, pending.column), (3, 1));
+        });
+
+        view.update(cx, |view, cx| view.load_more(cx));
+        cx.condition(&view, page_loaded).await;
+        view.read_with(cx, |view, _| {
+            let result = &view.results[0];
+            assert_eq!(result.rows.len(), PREVIEW_ROW_LIMIT * 2 + 10);
+            assert!(!result.truncated);
+            assert_eq!(result.columns, names(&["_id", "name", "late"]));
+            assert_eq!(result.rows[0][2], None);
+            assert_eq!(
+                result.rows[PREVIEW_ROW_LIMIT * 2][2].as_deref(),
+                Some("yes")
+            );
+            assert_eq!(
+                result
+                    .edit_target
+                    .as_ref()
+                    .map(|target| target.key_columns.clone()),
+                Some(vec![0])
+            );
+            let edit = view
+                .cell_edit(0, PREVIEW_ROW_LIMIT * 2 + 5, 1, Some("x".to_string()))
+                .expect("a row from the last page is editable");
+            assert_eq!(
+                edit.key,
+                vec![(
+                    SharedString::from("_id"),
+                    Some(SharedString::from((PREVIEW_ROW_LIMIT * 2 + 5).to_string()))
+                )]
+            );
+            assert_eq!(edit.column, SharedString::from("name"));
+        });
+        assert_eq!(
+            *table.offsets.lock(),
+            vec![PREVIEW_ROW_LIMIT, PREVIEW_ROW_LIMIT * 2]
+        );
+
+        view.update(cx, |view, cx| {
+            view.set_results(vec![ResultSet::default()], cx)
+        });
+        view.read_with(cx, |view, _| assert!(view.preview.is_none()));
     }
 }

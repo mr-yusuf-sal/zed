@@ -48,4 +48,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync"] }
 tokio-util.workspace = true
 
 [dev-dependencies]
+db = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
+settings = { workspace = true, features = ["test-support"] }
+theme.workspace = true
+theme_settings.workspace = true
