@@ -4430,7 +4430,8 @@ impl ThreadView {
 
     /// Subagent launches still running, with how many tool calls each has made.
     fn running_subagents(&self, cx: &App) -> Vec<(usize, SharedString, usize)> {
-        let entries = self.thread.read(cx).entries();
+        let thread = self.thread.read(cx);
+        let entries = thread.entries();
         entries
             .iter()
             .enumerate()
@@ -4438,15 +4439,19 @@ impl ThreadView {
                 let AgentThreadEntry::ToolCall(tool_call) = entry else {
                     return None;
                 };
-                if !(tool_call.is_subagent() || launches_claude_code_subagent(tool_call)) {
-                    return None;
-                }
-                if !matches!(
-                    tool_call.status(),
-                    ToolCallStatus::Pending
-                        | ToolCallStatus::InProgress
-                        | ToolCallStatus::WaitingForConfirmation
-                ) {
+                // A subagent the agent reports as working counts whatever its
+                // tool call's status: one launched in the background completes
+                // its tool call at launch, and one resumed by a message works
+                // for the tool call that sent the message.
+                let launch_running = (tool_call.is_subagent()
+                    || launches_claude_code_subagent(tool_call))
+                    && matches!(
+                        tool_call.status(),
+                        ToolCallStatus::Pending
+                            | ToolCallStatus::InProgress
+                            | ToolCallStatus::WaitingForConfirmation
+                    );
+                if !launch_running && !thread.is_subagent_running(&tool_call.id) {
                     return None;
                 }
                 let label = tool_call
