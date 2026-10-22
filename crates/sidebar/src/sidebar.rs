@@ -2362,7 +2362,6 @@ impl Sidebar {
             IconName::ChevronDown
         };
 
-        let key_for_toggle = key.clone();
         let key_for_focus = key.clone();
         let key_for_drop = key.clone();
         let key_for_disclosure = key.clone();
@@ -2583,15 +2582,9 @@ impl Sidebar {
                     menu_handle.toggle(window, cx);
                 }
             })
-            .on_click(
-                cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                    if !event.modifiers().secondary() {
-                        this.activate_or_open_workspace_for_group(&key_for_focus, window, cx);
-                    } else if !this.has_filter_query(cx) {
-                        this.toggle_collapse(&key_for_toggle, window, cx);
-                    }
-                }),
-            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.activate_or_open_workspace_for_group(&key_for_focus, window, cx);
+            }))
             .block_mouse_except_scroll();
 
         if !is_collapsed && !has_threads {
