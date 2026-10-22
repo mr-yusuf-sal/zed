@@ -276,6 +276,16 @@ fn subagent_parent_tool_call_id(tool_call: &ToolCall) -> Option<acp_v1::ToolCall
     Some(acp_v1::ToolCallId::new(parent_id))
 }
 
+/// Whether `tool_call` is Claude Code's Agent (formerly Task) tool, which
+/// runs a subagent.
+fn launches_claude_code_subagent(tool_call: &ToolCall) -> bool {
+    let tool_name = tool_call
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get("claudeCode")?.get("toolName")?.as_str());
+    matches!(tool_name, Some("Agent" | "Task"))
+}
+
 /// A user message as one line of plain text: mention links (`[@name](uri)`)
 /// shrink to their `@name` label and whitespace collapses.
 fn sticky_message_text(markdown: &str) -> String {
@@ -653,7 +663,6 @@ pub struct ThreadView {
     pub edits_expanded: bool,
     pub plan_expanded: bool,
     pub queue_expanded: bool,
-    background_processes_expanded: bool,
     pub editor_expanded: bool,
     pub should_be_following: bool,
     pub editing_message: Option<usize>,
@@ -1098,7 +1107,6 @@ impl ThreadView {
             edits_expanded: false,
             plan_expanded: false,
             queue_expanded: true,
-            background_processes_expanded: false,
             editor_expanded: false,
             should_be_following: false,
             editing_message: None,
@@ -3635,14 +3643,8 @@ impl ThreadView {
             (generic, legacy) => generic.or(legacy),
         };
         let has_awaiting_permission = awaiting_permission.is_some();
-        let background_processes = self.render_background_processes(cx);
 
-        if changed_buffers.is_empty()
-            && !has_plan
-            && queue_is_empty
-            && !has_awaiting_permission
-            && background_processes.is_none()
-        {
+        if changed_buffers.is_empty() && !has_plan && queue_is_empty && !has_awaiting_permission {
             return None;
         }
 
@@ -3728,16 +3730,6 @@ impl ThreadView {
                         .when(queue_expanded, |parent| {
                             parent.child(self.render_message_queue_entries(window, cx))
                         })
-                    })
-                    .when_some(background_processes, |this, element| {
-                        this.when(
-                            has_awaiting_permission
-                                || has_plan
-                                || !changed_buffers.is_empty()
-                                || !queue_is_empty,
-                            |this| this.child(Divider::horizontal().color(DividerColor::Border)),
-                        )
-                        .child(element)
                     }),
             )
             .into_any()
@@ -4436,80 +4428,140 @@ impl ThreadView {
             .collect()
     }
 
-    fn render_background_processes(&self, cx: &Context<Self>) -> Option<AnyElement> {
+    /// Subagent launches still running, with how many tool calls each has made.
+    fn running_subagents(&self, cx: &App) -> Vec<(usize, SharedString, usize)> {
+        let entries = self.thread.read(cx).entries();
+        entries
+            .iter()
+            .enumerate()
+            .filter_map(|(entry_ix, entry)| {
+                let AgentThreadEntry::ToolCall(tool_call) = entry else {
+                    return None;
+                };
+                if !(tool_call.is_subagent() || launches_claude_code_subagent(tool_call)) {
+                    return None;
+                }
+                if !matches!(
+                    tool_call.status(),
+                    ToolCallStatus::Pending
+                        | ToolCallStatus::InProgress
+                        | ToolCallStatus::WaitingForConfirmation
+                ) {
+                    return None;
+                }
+                let label = tool_call
+                    .label
+                    .read(cx)
+                    .source()
+                    .replace('`', "")
+                    .split_whitespace()
+                    .join(" ");
+                let tool_call_count = entries
+                    .iter()
+                    .filter(|entry| {
+                        matches!(entry, AgentThreadEntry::ToolCall(child)
+                            if self.subagent_parent_id(child).as_ref() == Some(&tool_call.id))
+                    })
+                    .count();
+                Some((entry_ix, label.into(), tool_call_count))
+            })
+            .collect()
+    }
+
+    /// A count of running subagents and background processes next to the
+    /// context usage ring, opening a list of them that scrolls to each.
+    fn render_running_work(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let subagents = self.running_subagents(cx);
         let processes = self.background_processes(cx);
-        if processes.is_empty() {
+        if subagents.is_empty() && processes.is_empty() {
             return None;
         }
-        let expanded = self.background_processes_expanded;
-        let title: SharedString = if processes.len() == 1 {
-            "1 Background Process".into()
+
+        let mut counts = Vec::new();
+        if !subagents.is_empty() {
+            counts.push(format!(
+                "{} {}",
+                subagents.len(),
+                pluralize("subagent", subagents.len())
+            ));
+        }
+        if !processes.is_empty() {
+            counts.push(format!("{} background", processes.len()));
+        }
+        let trigger_icon = if subagents.is_empty() {
+            IconName::ToolTerminal
         } else {
-            format!("{} Background Processes", processes.len()).into()
+            IconName::Thread
         };
+        let this = cx.weak_entity();
 
         Some(
-            v_flex()
-                .child(
-                    h_flex()
-                        .id("background_processes_summary")
-                        .p_1()
-                        .w_full()
-                        .gap_1()
-                        .when(expanded, |this| {
-                            this.border_b_1().border_color(cx.theme().colors().border)
-                        })
-                        .child(Disclosure::new("background_processes_disclosure", expanded))
-                        .child(Label::new(title).size(LabelSize::Small).color(Color::Muted))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.background_processes_expanded =
-                                !this.background_processes_expanded;
-                            cx.notify();
-                        })),
+            PopoverMenu::new("running-work-menu")
+                .trigger_with_tooltip(
+                    Button::new("running-work", counts.join(" · "))
+                        .label_size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .start_icon(
+                            Icon::new(trigger_icon)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                    Tooltip::text("Running Subagents and Background Processes"),
                 )
-                .when(expanded, |this| {
-                    this.children(
-                        processes
-                            .into_iter()
-                            .map(|(entry_ix, command, started_at)| {
-                                h_flex()
-                                    .id(("background-process", entry_ix))
-                                    .px_2()
-                                    .py_1()
-                                    .gap_2()
-                                    .w_full()
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(cx.theme().colors().element_hover))
-                                    .child(
-                                        Icon::new(IconName::ToolTerminal)
-                                            .size(IconSize::XSmall)
-                                            .color(Color::Muted),
-                                    )
-                                    .child(
-                                        div().flex_1().min_w_0().child(
-                                            Label::new(command)
-                                                .size(LabelSize::Small)
-                                                .buffer_font(cx)
-                                                .truncate(),
-                                        ),
-                                    )
-                                    .child(
-                                        Label::new(util::time::duration_alt_display(
-                                            started_at.elapsed(),
-                                        ))
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                    )
-                                    .tooltip(Tooltip::text("Scroll to Command"))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.list_state.scroll_to(ListOffset {
-                                            item_ix: entry_ix,
-                                            offset_in_item: px(0.),
-                                        });
-                                        cx.notify();
-                                    }))
-                            }),
-                    )
+                .anchor(gpui::Anchor::BottomRight)
+                .menu(move |window, cx| {
+                    let subagents = subagents.clone();
+                    let processes = processes.clone();
+                    let this = this.clone();
+                    Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                        let scroll_to = |entry_ix: usize| {
+                            let this = this.clone();
+                            move |_: &mut Window, cx: &mut App| {
+                                this.update(cx, |this, cx| {
+                                    this.list_state.scroll_to(ListOffset {
+                                        item_ix: entry_ix,
+                                        offset_in_item: px(0.),
+                                    });
+                                    cx.notify();
+                                })
+                                .log_err();
+                            }
+                        };
+                        if !subagents.is_empty() {
+                            menu = menu.header("Subagents");
+                            for (entry_ix, label, tool_call_count) in &subagents {
+                                let label = format!(
+                                    "{label} · {tool_call_count} {}",
+                                    pluralize("tool call", *tool_call_count)
+                                );
+                                menu = menu.item(
+                                    ContextMenuEntry::new(label)
+                                        .icon(IconName::Thread)
+                                        .icon_color(Color::Muted)
+                                        .handler(scroll_to(*entry_ix)),
+                                );
+                            }
+                        }
+                        if !processes.is_empty() {
+                            if !subagents.is_empty() {
+                                menu = menu.separator();
+                            }
+                            menu = menu.header("Background Processes");
+                            for (entry_ix, command, started_at) in &processes {
+                                let label = format!(
+                                    "{command} · {}",
+                                    util::time::duration_alt_display(started_at.elapsed())
+                                );
+                                menu = menu.item(
+                                    ContextMenuEntry::new(label)
+                                        .icon(IconName::ToolTerminal)
+                                        .icon_color(Color::Muted)
+                                        .handler(scroll_to(*entry_ix)),
+                                );
+                            }
+                        }
+                        menu
+                    }))
                 })
                 .into_any_element(),
         )
@@ -5247,6 +5299,7 @@ impl ThreadView {
                                     .flex_wrap()
                                     .gap_1()
                                     .children(discard_draft_button)
+                                    .children(self.render_running_work(cx))
                                     .children(self.render_token_usage(cx))
                                     .children(self.profile_selector.clone())
                                     .map(|this| match self.config_options_view.clone() {
