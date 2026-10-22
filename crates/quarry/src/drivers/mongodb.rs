@@ -395,7 +395,12 @@ impl Driver for MongoDriver {
         Ok(vec![to_result_set(vec![response], false)])
     }
 
-    async fn preview(&self, path: &[SharedString], row_limit: usize) -> Result<ResultSet> {
+    async fn preview_page(
+        &self,
+        path: &[SharedString],
+        row_limit: usize,
+        offset: usize,
+    ) -> Result<ResultSet> {
         let [database, collection, ..] = path else {
             bail!("expected a database and a collection, got {path:?}");
         };
@@ -404,6 +409,7 @@ impl Driver for MongoDriver {
             .database(database)
             .collection::<Document>(collection)
             .find(doc! {})
+            .skip(offset as u64)
             // One more than asked for is how the view learns the page was cut short.
             .limit(row_limit as i64 + 1)
             .await

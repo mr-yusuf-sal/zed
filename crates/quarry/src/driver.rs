@@ -259,7 +259,19 @@ pub trait Driver: Send + Sync {
 
     /// The first page of a table, collection or key, for double-clicking it in the tree. Sets
     /// `edit_target` when the rows can be updated in place.
-    async fn preview(&self, path: &[SharedString], row_limit: usize) -> Result<ResultSet>;
+    async fn preview(&self, path: &[SharedString], row_limit: usize) -> Result<ResultSet> {
+        self.preview_page(path, row_limit, 0).await
+    }
+
+    /// Like `preview`, but skipping the first `offset` rows, for loading the page after the
+    /// one already shown. The order is the server's natural one, which an unchanged table
+    /// keeps from one page to the next.
+    async fn preview_page(
+        &self,
+        path: &[SharedString],
+        row_limit: usize,
+        offset: usize,
+    ) -> Result<ResultSet>;
 
     /// Asks the server to stop whatever this driver is currently running. Best effort: the
     /// caller also drops the future that is running it.
