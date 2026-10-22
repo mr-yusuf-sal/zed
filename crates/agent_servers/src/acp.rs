@@ -51,7 +51,7 @@ use acp_thread::{AcpThread, AuthRequired, LoadError, TerminalProviderEvent};
 use terminal::TerminalBuilder;
 use terminal::terminal_settings::{AlternateScroll, CursorShape};
 
-use crate::{CURSOR_ID, GEMINI_ID};
+use crate::{CLAUDE_AGENT_ID, CURSOR_ID, GEMINI_ID};
 
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
 const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
@@ -755,13 +755,17 @@ impl AcpConnection {
         cx: &mut AsyncApp,
     ) -> Result<Self> {
         let original_command = command.clone();
+        // Claude Code's turns can run for a long time, so its sessions are kept
+        // going in an agent host when Zed quits.
+        let hosted = agent_id.as_ref() == CLAUDE_AGENT_ID;
         let transport::StdioProcess {
-            mut child,
+            child,
+            status,
             incoming,
             outgoing,
             stderr,
             debug_log,
-        } = transport::spawn_stdio(&project, command, cx)?;
+        } = transport::spawn_stdio(&project, command, hosted, cx).await?;
         let sessions = Rc::new(RefCell::new(HashMap::default()));
 
         let (release_channel, version): (Option<&str>, String) = cx.update(|cx| {
@@ -802,8 +806,7 @@ impl AcpConnection {
                 .context("Failed to receive ACP connection handle")
         }
         .boxed_local();
-        let status_fut = child
-            .status()
+        let status_fut = status
             .map(|status| {
                 status.map_err(|error| anyhow!("failed to wait for agent server exit: {error}"))
             })
@@ -995,7 +998,7 @@ impl AcpConnection {
             _dispatch_task: dispatch_task,
             _wait_task: wait_task,
             _stderr_task: stderr_task,
-            child: Some(child),
+            child,
         })
     }
 
