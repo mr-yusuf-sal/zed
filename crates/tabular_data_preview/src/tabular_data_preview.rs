@@ -8,7 +8,7 @@ use workspace::{Item, Pane, Workspace};
 
 use crate::parser::EditorState;
 
-pub use crate::table_view::{CellSelection, PerformanceMetrics, TableView};
+pub use crate::table_view::{CellSelection, PerformanceMetrics, TableView, TableViewEvent};
 
 mod parser;
 mod renderer;
