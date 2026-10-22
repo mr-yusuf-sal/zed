@@ -1,5 +1,4 @@
-use anyhow::{Context as _, Result};
-use futures::channel::oneshot;
+use anyhow::{Context as _, Result, anyhow};
 use gpui::{App, Global};
 use std::{future::Future, sync::Arc};
 
@@ -10,7 +9,7 @@ use std::{future::Future, sync::Arc};
 ///
 /// Rather than teach each driver a different executor, Quarry owns one multi-threaded tokio
 /// runtime and treats it as a service: work is handed over with `spawn`, and the result comes
-/// back through a oneshot that a gpui task can await like any other future. The runtime lives
+/// back through its join handle, which a gpui task can await like any other future. The runtime lives
 /// in a `Global` so a single pool is shared by every connection and every query view.
 pub struct QuarryRuntime {
     runtime: Arc<tokio::runtime::Runtime>,
@@ -60,23 +59,31 @@ impl QuarryRuntime {
     /// Runs `future` on the tokio runtime and resolves on the caller's executor.
     ///
     /// The returned future is plain `async`, so a gpui task can await it without ever entering
-    /// tokio. If the spawned work panics the oneshot is dropped, which surfaces as an error
-    /// here instead of unwinding into gpui.
+    /// tokio. Dropping it aborts the tokio task too: that is what cancelling a query relies on,
+    /// since otherwise a closed tab or a pressed Cancel would leave the work running unseen.
+    /// If the spawned work panics, that surfaces as an error here instead of unwinding into gpui.
     pub fn spawn<F, T>(&self, future: F) -> impl Future<Output = Result<T>> + Send + 'static
     where
         F: Future<Output = Result<T>> + Send + 'static,
         T: Send + 'static,
     {
-        let (tx, rx) = oneshot::channel();
-        self.runtime.spawn(async move {
-            // A send failure just means the caller stopped caring (view closed, query
-            // cancelled); the work is already done and there is nothing to report.
-            let _ = tx.send(future.await);
-        });
+        let mut handle = AbortOnDrop(self.runtime.spawn(future));
         async move {
-            rx.await
-                .context("the Quarry runtime dropped the task before it reported a result")?
+            match (&mut handle.0).await {
+                Ok(result) => result,
+                Err(error) if error.is_cancelled() => Err(anyhow!("cancelled")),
+                Err(error) => Err(anyhow!("the Quarry task panicked: {error}")),
+            }
         }
+    }
+}
+
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        // A no-op once the task has finished.
+        self.0.abort();
     }
 }
 

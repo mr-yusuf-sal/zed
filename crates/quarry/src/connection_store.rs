@@ -85,6 +85,43 @@ impl ConnectionStore {
     }
 }
 
+const HISTORY_KEY_PREFIX: &str = "quarry_history:";
+const HISTORY_LIMIT: usize = 200;
+
+/// Statements run against `config`, most recent first. Keyed by the credential URL rather than
+/// the connection's position or name, so renaming or reordering connections keeps the history.
+pub fn query_history(config: &ConnectionConfig, cx: &App) -> Vec<String> {
+    KeyValueStore::global(cx)
+        .read_kvp(&history_key(config))
+        .log_err()
+        .flatten()
+        .and_then(|json| serde_json::from_str::<Vec<String>>(&json).log_err())
+        .unwrap_or_default()
+}
+
+/// Moves `statement` to the front of the history, dropping an older copy of it.
+pub fn record_query(config: &ConnectionConfig, statement: String, cx: &mut App) {
+    let statement = statement.trim().to_string();
+    if statement.is_empty() {
+        return;
+    }
+    let mut history = query_history(config, cx);
+    history.retain(|existing| *existing != statement);
+    history.insert(0, statement);
+    history.truncate(HISTORY_LIMIT);
+    let Some(json) = serde_json::to_string(&history).log_err() else {
+        return;
+    };
+    let key = history_key(config);
+    let kvp = KeyValueStore::global(cx);
+    cx.background_spawn(async move { kvp.write_kvp(key, json).await.log_err() })
+        .detach();
+}
+
+fn history_key(config: &ConnectionConfig) -> String {
+    format!("{HISTORY_KEY_PREFIX}{}", config.credential_url())
+}
+
 /// Parses the single line a user types when adding a connection, e.g.
 /// `postgres://scott@localhost:5432/store`.
 ///
@@ -175,10 +212,7 @@ pub fn connection_url(config: &ConnectionConfig) -> String {
         .as_deref()
         .map(|database| format!("/{database}"))
         .unwrap_or_default();
-    format!(
-        "{scheme}://{user}{}:{}{database}",
-        config.host, config.port
-    )
+    format!("{scheme}://{user}{}:{}{database}", config.host, config.port)
 }
 
 #[cfg(test)]

@@ -1701,4 +1701,24 @@
       "right": ["tabular_data::MoveFocusedCell", { "direction": "right" }],
     },
   },
+  {
+    // Listed separately because a binding that only matches "Quarry" loses to the editor's own
+    // ctrl-enter, which matches deeper in the context stack.
+    "context": "Quarry > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-enter": "quarry::RunQuery",
+      "ctrl-shift-enter": "quarry::RunAll",
+      "ctrl-alt-c": "quarry::CancelQuery",
+    },
+  },
+  {
+    "context": "Quarry",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-enter": "quarry::RunQuery",
+      "ctrl-shift-enter": "quarry::RunAll",
+      "ctrl-alt-c": "quarry::CancelQuery",
+    },
+  },
 ]

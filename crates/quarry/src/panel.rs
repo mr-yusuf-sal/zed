@@ -71,11 +71,31 @@ impl ConnectionState {
 /// The add/edit-connection form: a URL and an optional password, kept together so the password
 /// is written to the credential store at the same moment the connection is saved.
 struct Draft {
+    name: Entity<Editor>,
     url: Entity<Editor>,
     password: Entity<Editor>,
     error: Option<SharedString>,
     /// The id of the connection state being edited, or `None` when adding a new connection.
     editing: Option<usize>,
+    test: TestState,
+}
+
+enum TestState {
+    Untested,
+    Testing,
+    Succeeded,
+    Failed(SharedString),
+}
+
+fn new_name_editor(name: Option<&str>, window: &mut Window, cx: &mut App) -> Entity<Editor> {
+    cx.new(|cx| {
+        let mut editor = Editor::single_line(window, cx);
+        editor.set_placeholder_text("name (optional — defaults to host/database)", window, cx);
+        if let Some(name) = name {
+            editor.set_text(name.to_string(), window, cx);
+        }
+        editor
+    })
 }
 
 fn new_password_editor(window: &mut Window, cx: &mut App) -> Entity<Editor> {
@@ -99,6 +119,10 @@ pub struct QuarryPanel {
     draft: Option<Draft>,
     /// Set while changing the password of a connection that already exists.
     password_prompt: Option<(usize, Entity<Editor>)>,
+    /// Narrows the tree to names containing this text. It filters what has been loaded; a
+    /// folder that was never expanded is not searched, because that would mean asking the
+    /// server for everything.
+    filter: Entity<Editor>,
     width: Option<Pixels>,
     position: DockPosition,
     _tasks: Vec<Task<()>>,
@@ -108,8 +132,20 @@ impl QuarryPanel {
     pub fn new(
         workspace: WeakEntity<Workspace>,
         store: Entity<ConnectionStore>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let filter = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Filter loaded objects…", window, cx);
+            editor
+        });
+        cx.subscribe(&filter, |_, _, event: &editor::EditorEvent, cx| {
+            if matches!(event, editor::EditorEvent::BufferEdited) {
+                cx.notify();
+            }
+        })
+        .detach();
         let count = store.read(cx).connections().len();
         cx.observe(&store, |this, store, cx| {
             // Keep one state per saved connection; a newly added one starts disconnected.
@@ -132,6 +168,7 @@ impl QuarryPanel {
             next_state_id: count,
             draft: None,
             password_prompt: None,
+            filter,
             width: None,
             position: DockPosition::Left,
             _tasks: Vec::new(),
@@ -157,10 +194,12 @@ impl QuarryPanel {
         url.focus_handle(cx).focus(window, cx);
         self.password_prompt = None;
         self.draft = Some(Draft {
+            name: new_name_editor(None, window, cx),
             url,
             password: new_password_editor(window, cx),
             error: None,
             editing: None,
+            test: TestState::Untested,
         });
         cx.notify();
     }
@@ -184,30 +223,88 @@ impl QuarryPanel {
         });
         self.password_prompt = None;
         self.draft = Some(Draft {
+            name: new_name_editor(Some(&config.name), window, cx),
             url,
             password,
             error: None,
             editing: Some(state_id),
+            test: TestState::Untested,
         });
         cx.notify();
     }
 
-    fn confirm_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(draft) = self.draft.as_ref() else {
+    /// The config the form describes, or the reason it describes none. A typed name replaces
+    /// the one derived from the URL.
+    fn draft_config(&self, cx: &App) -> Option<Result<ConnectionConfig, SharedString>> {
+        let draft = self.draft.as_ref()?;
+        let text = draft.url.read(cx).text(cx);
+        Some(match parse_connection_url(&text) {
+            Ok(mut config) => {
+                let name = draft.name.read(cx).text(cx);
+                if !name.trim().is_empty() {
+                    config.name = name.trim().to_string();
+                }
+                Ok(config)
+            }
+            Err(error) => Err(format!("{error:#}").into()),
+        })
+    }
+
+    fn test_draft(&mut self, cx: &mut Context<Self>) {
+        let Some(config) = self.draft_config(cx) else {
             return;
         };
-        let text = draft.url.read(cx).text(cx);
-        let config = match parse_connection_url(&text) {
+        let Some(draft) = self.draft.as_mut() else {
+            return;
+        };
+        let config = match config {
+            Ok(config) => config,
+            Err(error) => {
+                draft.error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        let password = draft.password.read(cx).text(cx);
+        let password = (!password.is_empty()).then_some(password);
+        draft.error = None;
+        draft.test = TestState::Testing;
+        cx.notify();
+
+        let task = cx.spawn(async move |this, cx| {
+            let outcome = crate::test_connection(config, password, cx).await;
+            this.update(cx, |this, cx| {
+                if let Some(draft) = this.draft.as_mut() {
+                    draft.test = match outcome {
+                        Ok(()) => TestState::Succeeded,
+                        Err(error) => TestState::Failed(format!("{error:#}").into()),
+                    };
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self._tasks.push(task);
+    }
+
+    fn confirm_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.draft_config(cx) else {
+            return;
+        };
+        let config = match config {
             Ok(config) => config,
             Err(error) => {
                 // Keep the form open with the text still in it so a typo can be corrected
                 // rather than retyped, and say what was wrong where the user is looking.
                 if let Some(draft) = self.draft.as_mut() {
-                    draft.error = Some(format!("{error:#}").into());
+                    draft.error = Some(error);
                 }
                 cx.notify();
                 return;
             }
+        };
+        let Some(draft) = self.draft.as_ref() else {
+            return;
         };
 
         let password = draft.password.read(cx).text(cx);
@@ -456,12 +553,11 @@ impl QuarryPanel {
     }
 
     fn load_children(&mut self, index: usize, path: Vec<SharedString>, cx: &mut Context<Self>) {
-        let Some((state_id, driver)) = self.states.get(index).and_then(|state| {
-            state
-                .driver
-                .clone()
-                .map(|driver| (state.id, driver))
-        }) else {
+        let Some((state_id, driver)) = self
+            .states
+            .get(index)
+            .and_then(|state| state.driver.clone().map(|driver| (state.id, driver)))
+        else {
             return;
         };
         let Some(runtime) = QuarryRuntime::global(cx) else {
@@ -475,8 +571,7 @@ impl QuarryPanel {
         let task = cx.spawn(async move |this, cx| {
             let children = request.await;
             this.update(cx, |this, cx| {
-                let Some(state) = this.states.iter_mut().find(|state| state.id == state_id)
-                else {
+                let Some(state) = this.states.iter_mut().find(|state| state.id == state_id) else {
                     return;
                 };
                 match children {
@@ -518,19 +613,86 @@ impl QuarryPanel {
         })
     }
 
-    /// Opens a tab showing the first page of a table, which is what double-clicking an object
-    /// in the tree is for. The query editor above it starts empty so it can be used straight
-    /// away against the same connection.
+    /// Drops the open session without reconnecting, which is what a user who is done with a
+    /// server wants: the tree folds away and nothing stays connected in the background.
+    fn disconnect(&mut self, index: usize, cx: &mut Context<Self>) {
+        let fresh = self.new_state();
+        if let Some(state) = self.states.get_mut(index) {
+            *state = fresh;
+        }
+        cx.notify();
+    }
+
+    /// Opens a query tab on connection `index`. Without a live driver the tab connects on its
+    /// own, so "New Query" works on a connection that was never expanded.
+    fn open_tab(
+        &mut self,
+        index: usize,
+        database: Option<SharedString>,
+        title: SharedString,
+        initial_text: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<QueryView>> {
+        let config = self.store.read(cx).get(index).cloned()?;
+        let driver = self
+            .states
+            .get(index)
+            .and_then(|state| state.driver.clone());
+        let workspace = self.workspace.upgrade()?;
+        let languages = workspace.read(cx).project().read(cx).languages().clone();
+        let view = cx.new(|cx| {
+            QueryView::new(
+                config,
+                driver,
+                database,
+                title,
+                initial_text,
+                Some(languages),
+                window,
+                cx,
+            )
+        });
+        workspace.update(cx, |workspace, cx| {
+            workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+        });
+        Some(view)
+    }
+
+    fn new_query(
+        &mut self,
+        index: usize,
+        database: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(name) = self
+            .store
+            .read(cx)
+            .get(index)
+            .map(|config| config.name.clone())
+        else {
+            return;
+        };
+        let title = match &database {
+            Some(database) => format!("{name} · {database}"),
+            None => name,
+        };
+        if let Some(view) = self.open_tab(index, database, title.into(), None, window, cx) {
+            view.focus_handle(cx).focus(window, cx);
+        }
+    }
+
+    /// Opens a tab showing the first page of a table, collection or key, which is what
+    /// double-clicking it in the tree is for. The tab opens at once and shows either the rows
+    /// or why they could not be read; the query editor above them targets the same database.
     fn open_preview(
         &mut self,
         index: usize,
         node: &ObjectNode,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(config) = self.store.read(cx).get(index).cloned() else {
-            return;
-        };
         let Some(driver) = self
             .states
             .get(index)
@@ -541,32 +703,95 @@ impl QuarryPanel {
         let Some(runtime) = QuarryRuntime::global(cx) else {
             return;
         };
-
-        let name: SharedString = node.name.clone();
-        let path = node.path.clone();
-        let preview = {
-            let driver = driver.clone();
-            runtime.spawn(async move { driver.preview(&path, PREVIEW_ROW_LIMIT).await })
+        let Some(connection_name) = self
+            .store
+            .read(cx)
+            .get(index)
+            .map(|config| config.name.clone())
+        else {
+            return;
         };
+        let title = SharedString::from(format!("{connection_name} · {}", node.name));
+        let database = node.path.first().cloned();
+        let Some(view) = self.open_tab(index, database, title, None, window, cx) else {
+            return;
+        };
+        view.update(cx, |view, cx| view.set_loading(cx));
 
-        let workspace = self.workspace.clone();
+        let path = node.path.clone();
+        let preview = runtime.spawn(async move { driver.preview(&path, PREVIEW_ROW_LIMIT).await });
+        let view = view.downgrade();
         let task = cx.spawn(async move |_, cx| {
             let result = preview.await;
-            workspace
-                .update_in(cx, |workspace, window, cx| {
-                    let view = cx.new(|cx| {
-                        let mut view = QueryView::new(name, config.engine, driver, window, cx);
-                        match result {
-                            Ok(result) => view.show_result(result, cx),
-                            Err(error) => log::error!("Quarry preview failed: {error:#}"),
-                        }
-                        view
-                    });
-                    workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
-                })
-                .ok();
+            view.update(cx, |view, cx| match result {
+                Ok(result) => view.show_result(result, cx),
+                Err(error) => view.show_error(format!("{error:#}").into(), cx),
+            })
+            .ok();
         });
         self._tasks.push(task);
+    }
+
+    /// Opens a view's or routine's source in a query tab, ready to be edited and run.
+    fn open_definition(
+        &mut self,
+        index: usize,
+        node: &ObjectNode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((state_id, driver)) = self
+            .states
+            .get(index)
+            .and_then(|state| state.driver.clone().map(|driver| (state.id, driver)))
+        else {
+            return;
+        };
+        let Some(runtime) = QuarryRuntime::global(cx) else {
+            return;
+        };
+        let path = node.path.clone();
+        let name = node.name.clone();
+        let definition = runtime.spawn(async move { driver.definition(&path).await });
+        let database = node.path.first().cloned();
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let definition = definition.await;
+            this.update_in(cx, |this, window, cx| {
+                let Some(index) = this.index_of(state_id) else {
+                    return;
+                };
+                match definition {
+                    Ok(text) => {
+                        let title = SharedString::from(format!("{name} (definition)"));
+                        this.open_tab(index, database, title, Some(text), window, cx);
+                    }
+                    Err(error) => {
+                        if let Some(state) = this.states.get_mut(index) {
+                            state.error = Some(format!("{error:#}").into());
+                        }
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        });
+        self._tasks.push(task);
+    }
+
+    /// Whether `node` or anything loaded beneath it matches the filter. Ancestors of a match stay
+    /// visible so the match keeps its place in the tree.
+    fn matches_filter(&self, index: usize, node: &ObjectNode, filter: &str) -> bool {
+        if node.name.to_lowercase().contains(filter) {
+            return true;
+        }
+        self.states
+            .get(index)
+            .and_then(|state| state.children.get(&node.path))
+            .is_some_and(|children| {
+                children
+                    .iter()
+                    .any(|child| self.matches_filter(index, child, filter))
+            })
     }
 
     fn render_node(
@@ -578,23 +803,24 @@ impl QuarryPanel {
     ) -> AnyElement {
         let expanded = self.is_expanded(index, &node.path);
         let icon = match node.kind {
-            ObjectKind::Database | ObjectKind::Schema => IconName::Folder,
+            ObjectKind::Database | ObjectKind::Schema | ObjectKind::Folder => IconName::Folder,
             ObjectKind::Table | ObjectKind::Collection => IconName::Table,
             ObjectKind::View => IconName::Eye,
             ObjectKind::Column | ObjectKind::Key => IconName::Hash,
             ObjectKind::Index => IconName::ListTree,
+            ObjectKind::Routine => IconName::Code,
+            ObjectKind::Sequence => IconName::Hash,
         };
-        let openable = matches!(
-            node.kind,
-            ObjectKind::Table | ObjectKind::View | ObjectKind::Collection
-        );
+        let previewable = node.kind.is_previewable();
+        let has_definition = node.kind.has_definition();
+        let queryable_scope = matches!(node.kind, ObjectKind::Database | ObjectKind::Schema);
         let node = node.clone();
+        let row_id = SharedString::from(format!("quarry-{index}-{}", node.path.join("/")));
+        let group = SharedString::from(format!("quarry-node-{index}-{}", node.path.join("/")));
 
         h_flex()
-            .id(SharedString::from(format!(
-                "quarry-{index}-{}",
-                node.path.join("/")
-            )))
+            .id(row_id.clone())
+            .group(group.clone())
             .w_full()
             .gap_1()
             .pr_1()
@@ -619,11 +845,50 @@ impl QuarryPanel {
                     .size(LabelSize::XSmall)
                     .color(Color::Muted)
             }))
+            .child(div().flex_1())
+            .when(queryable_scope, |this| {
+                let database = node.path.first().cloned();
+                this.child(
+                    div().visible_on_hover(group.clone()).child(
+                        IconButton::new(
+                            SharedString::from(format!("{row_id}-query")),
+                            IconName::Plus,
+                        )
+                        .icon_size(IconSize::XSmall)
+                        .tooltip(Tooltip::text("New Query Here"))
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.new_query(index, database.clone(), window, cx);
+                            },
+                        )),
+                    ),
+                )
+            })
+            .when(has_definition, |this| {
+                let node = node.clone();
+                this.child(
+                    div().visible_on_hover(group.clone()).child(
+                        IconButton::new(
+                            SharedString::from(format!("{row_id}-definition")),
+                            IconName::Code,
+                        )
+                        .icon_size(IconSize::XSmall)
+                        .tooltip(Tooltip::text("Open Definition"))
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.open_definition(index, &node, window, cx);
+                            },
+                        )),
+                    ),
+                )
+            })
             .on_click(
                 cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                    if openable && event.click_count() >= 2 {
+                    if event.click_count() >= 2 && previewable {
                         this.open_preview(index, &node, window, cx);
-                    } else if node.has_children {
+                    } else if event.click_count() >= 2 && has_definition {
+                        this.open_definition(index, &node, window, cx);
+                    } else if event.click_count() == 1 && node.has_children {
                         this.toggle_expanded(index, &node, cx);
                     }
                 }),
@@ -636,6 +901,7 @@ impl QuarryPanel {
         index: usize,
         path: &[SharedString],
         depth: usize,
+        filter: &str,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let Some(state) = self.states.get(index) else {
@@ -647,9 +913,12 @@ impl QuarryPanel {
 
         let mut elements = Vec::new();
         for node in children.clone() {
+            if !filter.is_empty() && !self.matches_filter(index, &node, filter) {
+                continue;
+            }
             elements.push(self.render_node(index, &node, depth, cx));
             if self.is_expanded(index, &node.path) {
-                elements.extend(self.render_subtree(index, &node.path, depth + 1, cx));
+                elements.extend(self.render_subtree(index, &node.path, depth + 1, filter, cx));
             }
         }
         elements
@@ -659,6 +928,7 @@ impl QuarryPanel {
         &self,
         index: usize,
         config: &ConnectionConfig,
+        filter: &str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let state = self.states.get(index);
@@ -701,6 +971,24 @@ impl QuarryPanel {
                         )
                     })
                     .child(div().flex_1())
+                    .child(
+                        IconButton::new(("quarry-new-query", index), IconName::Plus)
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(|_, cx| Tooltip::simple("New Query", cx))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.new_query(index, None, window, cx);
+                            })),
+                    )
+                    .when(connected, |this| {
+                        this.child(
+                            IconButton::new(("quarry-disconnect", index), IconName::Disconnected)
+                                .icon_size(IconSize::XSmall)
+                                .tooltip(|_, cx| Tooltip::simple("Disconnect", cx))
+                                .on_click(cx.listener(move |this, _, _window, cx| {
+                                    this.disconnect(index, cx);
+                                })),
+                        )
+                    })
                     .child(
                         IconButton::new(("quarry-refresh", index), IconName::RotateCw)
                             .icon_size(IconSize::XSmall)
@@ -745,7 +1033,7 @@ impl QuarryPanel {
                     .into_any_element()
             }))
             .when(connected, |this| {
-                this.children(self.render_subtree(index, &[], 1, cx))
+                this.children(self.render_subtree(index, &[], 1, filter, cx))
             })
             .into_any_element()
     }
@@ -807,6 +1095,7 @@ impl Panel for QuarryPanel {
 impl Render for QuarryPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let connections = self.store.read(cx).connections().to_vec();
+        let filter = self.filter.read(cx).text(cx).trim().to_lowercase();
 
         v_flex()
             .key_context("QuarryPanel")
@@ -851,6 +1140,7 @@ impl Render for QuarryPanel {
                             .size(LabelSize::XSmall)
                             .color(Color::Muted)
                     }))
+                    .child(draft.name.clone())
                     .child(draft.url.clone())
                     .child(draft.password.clone())
                     .children(draft.error.clone().map(|error| {
@@ -859,9 +1149,30 @@ impl Render for QuarryPanel {
                             .color(Color::Error)
                     }))
                     .child(
-                        Label::new("Enter to save · a password in the URL is ignored")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Button::new("quarry-test-connection", "Test")
+                                    .label_size(LabelSize::Small)
+                                    .disabled(matches!(draft.test, TestState::Testing))
+                                    .on_click(cx.listener(|this, _, _, cx| this.test_draft(cx))),
+                            )
+                            .child(match &draft.test {
+                                TestState::Untested => {
+                                    Label::new("Enter to save · a password in the URL is ignored")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted)
+                                }
+                                TestState::Testing => Label::new("testing…")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Info),
+                                TestState::Succeeded => Label::new("connected successfully")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Success),
+                                TestState::Failed(error) => Label::new(error.clone())
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Error),
+                            }),
                     )
                     .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
                         this.confirm_draft(window, cx);
@@ -901,6 +1212,17 @@ impl Render for QuarryPanel {
                     }))
                     .into_any_element()
             }))
+            .when(!connections.is_empty(), |this| {
+                this.child(
+                    div()
+                        .w_full()
+                        .px_2()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(cx.theme().colors().border)
+                        .child(self.filter.clone()),
+                )
+            })
             .child(
                 v_flex()
                     .id("quarry-connections")
@@ -912,7 +1234,9 @@ impl Render for QuarryPanel {
                         connections
                             .iter()
                             .enumerate()
-                            .map(|(index, config)| self.render_connection(index, config, cx))
+                            .map(|(index, config)| {
+                                self.render_connection(index, config, &filter, cx)
+                            })
                             .collect::<Vec<_>>(),
                     )
                     .when(connections.is_empty() && self.draft.is_none(), |this| {
@@ -934,9 +1258,9 @@ pub async fn load(
     workspace: WeakEntity<Workspace>,
     mut cx: gpui::AsyncWindowContext,
 ) -> Result<Entity<QuarryPanel>> {
-    cx.update(|_window, cx| {
+    cx.update(|window, cx| {
         let store = ConnectionStore::global(cx)
             .ok_or_else(|| anyhow::anyhow!("the Quarry connection store is unavailable"))?;
-        anyhow::Ok(cx.new(|cx| QuarryPanel::new(workspace, store, cx)))
+        anyhow::Ok(cx.new(|cx| QuarryPanel::new(workspace, store, window, cx)))
     })?
 }
