@@ -52,7 +52,8 @@ pub struct EntryViewState {
     auto_expanded_thinking_block: Option<(usize, usize)>,
     user_toggled_thinking_blocks: HashSet<(usize, usize)>,
     expanded_compactions: HashSet<usize>,
-    expanded_tool_calls: HashSet<acp_v2::ToolCallId>,
+    expanded_tool_calls: HashSet<acp_v1::ToolCallId>,
+    full_terminal_output_tool_calls: HashSet<acp_v1::ToolCallId>,
 }
 
 impl EntryViewState {
@@ -75,6 +76,7 @@ impl EntryViewState {
             user_toggled_thinking_blocks: HashSet::default(),
             expanded_compactions: HashSet::default(),
             expanded_tool_calls: HashSet::default(),
+            full_terminal_output_tool_calls: HashSet::default(),
         }
     }
 
@@ -97,6 +99,17 @@ impl EntryViewState {
     pub(crate) fn toggle_tool_call_expansion(&mut self, tool_call_id: &acp_v2::ToolCallId) {
         if !self.expanded_tool_calls.remove(tool_call_id) {
             self.expanded_tool_calls.insert(tool_call_id.clone());
+        }
+    }
+
+    pub(crate) fn is_terminal_output_full(&self, tool_call_id: &acp_v1::ToolCallId) -> bool {
+        self.full_terminal_output_tool_calls.contains(tool_call_id)
+    }
+
+    pub(crate) fn toggle_terminal_output_full(&mut self, tool_call_id: &acp_v1::ToolCallId) {
+        if !self.full_terminal_output_tool_calls.remove(tool_call_id) {
+            self.full_terminal_output_tool_calls
+                .insert(tool_call_id.clone());
         }
     }
 
