@@ -58,13 +58,17 @@ pub fn init(cx: &mut App) {
             workspace.register_action(TerminalPanel::new_terminal);
             workspace.register_action(TerminalPanel::open_terminal);
             workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-                if is_enabled_in_workspace(workspace, cx) {
-                    workspace.toggle_panel_focus::<TerminalPanel>(window, cx);
+                if is_enabled_in_workspace(workspace, cx)
+                    && workspace.toggle_panel_focus::<TerminalPanel>(window, cx)
+                {
+                    zoom_in_terminal_panel(workspace, cx);
                 }
             });
             workspace.register_action(|workspace, _: &Toggle, window, cx| {
                 if is_enabled_in_workspace(workspace, cx) {
-                    if !workspace.toggle_panel_focus::<TerminalPanel>(window, cx) {
+                    if workspace.toggle_panel_focus::<TerminalPanel>(window, cx) {
+                        zoom_in_terminal_panel(workspace, cx);
+                    } else {
                         workspace.close_panel::<TerminalPanel>(window, cx);
                     }
                 }
@@ -72,6 +76,22 @@ pub fn init(cx: &mut App) {
         },
     )
     .detach();
+}
+
+/// This fork always shows the terminal panel zoomed when it is opened with Toggle or
+/// ToggleFocus. Zooming only after the panel took focus, rather than dispatching ZoomIn from
+/// a keymap sequence, means a toggle that hands focus back to the editor never zooms the editor.
+fn zoom_in_terminal_panel(workspace: &Workspace, cx: &mut App) {
+    let Some(panel) = workspace.panel::<TerminalPanel>(cx) else {
+        return;
+    };
+    panel.update(cx, |panel, cx| {
+        for pane in panel.center.panes() {
+            pane.update(cx, |pane, cx| pane.set_zoomed(true, cx));
+        }
+        cx.emit(PanelEvent::ZoomIn);
+        cx.notify();
+    });
 }
 
 pub struct TerminalPanel {
