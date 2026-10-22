@@ -264,6 +264,26 @@ struct ParsedCatNumberedCode {
     line_count: usize,
 }
 
+/// A user message as one line of plain text: mention links (`[@name](uri)`)
+/// shrink to their `@name` label and whitespace collapses.
+fn sticky_message_text(markdown: &str) -> String {
+    let mut text = String::with_capacity(markdown.len());
+    let mut rest = markdown;
+    while let Some(start) = rest.find("[@") {
+        let Some(label_end) = rest[start..].find("](").map(|ix| start + ix) else {
+            break;
+        };
+        let Some(link_end) = rest[label_end..].find(')').map(|ix| label_end + ix) else {
+            break;
+        };
+        text.push_str(&rest[..start]);
+        text.push_str(&rest[start + 1..label_end]);
+        rest = &rest[link_end + 1..];
+    }
+    text.push_str(rest);
+    text.split_whitespace().join(" ")
+}
+
 fn parse_cat_numbered_markdown_code_block(markdown: &str) -> Option<ParsedCatNumberedCode> {
     let (_tag, code) = parse_single_fenced_code_block(markdown)?;
     parse_cat_numbered_code(code)
@@ -599,6 +619,9 @@ pub struct ThreadView {
     pub last_token_limit_telemetry: Option<acp_thread::TokenUsageRatio>,
     thread_feedback: ThreadFeedbackState,
     pub list_state: ListState,
+    /// The user message pinned over the top of the list, because the list is
+    /// scrolled past its start.
+    sticky_user_message_ix: Option<usize>,
     pub session_capabilities: SharedSessionCapabilities,
     pub expanded_tool_call_raw_inputs: HashSet<acp_v1::ToolCallId>,
     collapsed_sandbox_authorization_details: HashSet<acp_v1::ToolCallId>,
@@ -1034,6 +1057,7 @@ impl ThreadView {
             model_selector,
             profile_selector,
             list_state,
+            sticky_user_message_ix: None,
             session_capabilities,
             resumed_without_history,
             _subscriptions: subscriptions,
@@ -1109,6 +1133,9 @@ impl ThreadView {
                             });
                         }
                         this.schedule_save(cx);
+                        if this.compute_sticky_user_message_ix(cx) != this.sticky_user_message_ix {
+                            cx.notify();
+                        }
                     });
                 });
             });
@@ -7774,6 +7801,78 @@ impl ThreadView {
         }
     }
 
+    fn compute_sticky_user_message_ix(&self, cx: &App) -> Option<usize> {
+        if self.is_subagent() {
+            return None;
+        }
+        let entries = self.thread.read(cx).entries();
+        let scroll_top = self.list_state.logical_scroll_top();
+        let last_ix = scroll_top.item_ix.min(entries.len().checked_sub(1)?);
+        let user_message_ix = (0..=last_ix)
+            .rev()
+            .find(|&ix| matches!(entries.get(ix), Some(AgentThreadEntry::UserMessage(_))))?;
+        let message_start_visible =
+            user_message_ix == scroll_top.item_ix && scroll_top.offset_in_item <= px(0.);
+        (!message_start_visible).then_some(user_message_ix)
+    }
+
+    fn render_sticky_user_message(
+        &self,
+        entry_ix: usize,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let Some(AgentThreadEntry::UserMessage(message)) =
+            self.thread.read(cx).entries().get(entry_ix)
+        else {
+            return None;
+        };
+        let text = sticky_message_text(&message.content.to_markdown(cx));
+        if text.is_empty() {
+            return None;
+        }
+
+        let max_content_width = AgentSettings::get_global(cx).max_content_width;
+        let colors = cx.theme().colors();
+        Some(
+            h_flex()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .justify_center()
+                .px_5()
+                .pt_1()
+                .child(
+                    div()
+                        .id("sticky-user-message")
+                        .when_some(max_content_width, |this, max_width| this.max_w(max_width))
+                        .w_full()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border)
+                        .bg(colors.editor_background)
+                        .shadow_sm()
+                        .cursor_pointer()
+                        .hover(|style| style.border_color(colors.border_focused))
+                        .text_ui_sm(cx)
+                        .text_color(colors.text_muted)
+                        .line_clamp(2)
+                        .child(text)
+                        .tooltip(Tooltip::text("Scroll to Message"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.list_state.scroll_to(ListOffset {
+                                item_ix: entry_ix,
+                                offset_in_item: px(0.),
+                            });
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn scroll_output_to_next_message(
         &mut self,
         _: &ScrollOutputToNextMessage,
@@ -13098,6 +13197,10 @@ impl Render for ThreadView {
 
         let has_messages = self.list_state.item_count() > 0;
         let list_state = self.list_state.clone();
+        self.sticky_user_message_ix = self.compute_sticky_user_message_ix(cx);
+        let sticky_user_message = self
+            .sticky_user_message_ix
+            .and_then(|entry_ix| self.render_sticky_user_message(entry_ix, cx));
 
         let conversation = v_flex()
             .when(self.resumed_without_history, |this| {
@@ -13107,7 +13210,9 @@ impl Render for ThreadView {
                 if has_messages {
                     this.flex_1()
                         .size_full()
+                        .relative()
                         .child(self.render_entries(cx))
+                        .children(sticky_user_message)
                         .vertical_scrollbar_for(&list_state, window, cx)
                         .into_any()
                 } else {
