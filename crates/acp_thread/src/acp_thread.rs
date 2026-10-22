@@ -6439,6 +6439,65 @@ impl AcpThread {
         })
     }
 
+    /// Shows a turn that runs without a prompt of this thread (one an agent
+    /// host kept running while Zed was closed) as running until `stop_reason`
+    /// reports its end. Cancelling it, or sending a new message, cancels it at
+    /// the agent like any other turn.
+    pub fn adopt_running_turn(
+        &mut self,
+        stop_reason: oneshot::Receiver<acp_v1::StopReason>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.running_turn.is_some() {
+            return;
+        }
+        self.turn_id += 1;
+        let turn_id = self.turn_id;
+        self.running_turn = Some(RunningTurn {
+            id: turn_id,
+            first_entry_index: self.entries.len().saturating_sub(1),
+            // Waiting for the end lives outside the turn: a cancellation waits
+            // for `send_task`, and the end of an adopted turn is not this
+            // thread's to promise.
+            send_task: Task::ready(()),
+        });
+        self.set_foreground_state(
+            acp_v2::StateUpdate::Running(acp_v2::RunningStateUpdate::new()),
+            cx,
+        );
+        cx.emit(AcpThreadEvent::StatusChanged);
+
+        cx.spawn(async move |this, cx| {
+            let stop_reason = stop_reason.await.ok();
+            this.update(cx, |this, cx| {
+                if !this
+                    .running_turn
+                    .as_ref()
+                    .is_some_and(|turn| turn.id == turn_id)
+                {
+                    return;
+                }
+                this.running_turn.take();
+                this.flush_streaming_text(cx);
+                let stop_reason = stop_reason.as_ref().and_then(stop_reason_from_v1);
+                this.set_foreground_state(
+                    acp_v2::StateUpdate::Idle(
+                        acp_v2::IdleStateUpdate::new().stop_reason(stop_reason.clone()),
+                    ),
+                    cx,
+                );
+                cx.emit(AcpThreadEvent::StatusChanged);
+                cx.emit(AcpThreadEvent::Stopped {
+                    activity_generation: this.activity.generation(),
+                    activity_duration: this.activity.duration(),
+                    stop_reason,
+                });
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<()> {
         self.cancel_inner(RequestPermissionOutcome::Cancelled, cx)
     }

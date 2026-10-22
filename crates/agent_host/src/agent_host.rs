@@ -60,6 +60,14 @@ const SESSION_SETUP_METHODS: [&str; 4] = [
 const PROMPT_METHOD: &str = "session/prompt";
 const CANCEL_REQUEST_METHOD: &str = "$/cancel_request";
 
+/// Sent by Zed for a session whose turn an earlier connection started. The
+/// host answers it, as it would that turn's `session/prompt`, when the turn
+/// ends; it never reaches the agent.
+pub const AWAIT_TURN_METHOD: &str = "_zed/agent_host/await_turn";
+/// Set in the `_meta` of a `session/load` or `session/resume` result when a
+/// turn an earlier connection started in that session is still running.
+pub const TURN_RUNNING_META_KEY: &str = "zedAgentHostTurnRunning";
+
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Allows agents to be launched through a host process. Only the Zed binary
@@ -359,6 +367,7 @@ struct Host {
     /// The connection that set up each session, which its updates and
     /// requests go to.
     session_owners: HashMap<String, u64>,
+    turn_waiters: Vec<TurnWaiter>,
     next_generation: u64,
     next_request_id: u64,
     client_requests: HashMap<u64, ClientRequest>,
@@ -387,6 +396,13 @@ struct ClientRequest {
 }
 
 /// A request from the agent that Zed has not answered yet.
+/// An `AWAIT_TURN_METHOD` request, answered when the turn of its session ends.
+struct TurnWaiter {
+    generation: u64,
+    id: Value,
+    session_id: String,
+}
+
 struct AgentRequest {
     key: String,
     method: String,
@@ -566,6 +582,8 @@ impl Host {
             return;
         }
         self.session_owners.retain(|_, owner| *owner != generation);
+        self.turn_waiters
+            .retain(|waiter| waiter.generation != generation);
 
         let mut answered_locally = Vec::new();
         self.agent_requests.retain_mut(|request| {
@@ -643,6 +661,30 @@ impl Host {
             .and_then(Value::as_str)
             .map(str::to_owned);
         let id = message.get("id").cloned().filter(|id| !id.is_null());
+
+        if method.as_deref() == Some(AWAIT_TURN_METHOD)
+            && let Some(id) = id
+        {
+            match params_session_id(&message) {
+                Some(session_id) if self.is_turn_running(&session_id) => {
+                    self.turn_waiters.push(TurnWaiter {
+                        generation,
+                        id,
+                        session_id,
+                    });
+                }
+                // The turn ended between the load and this request.
+                _ => {
+                    let response = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "stopReason": "end_turn" },
+                    });
+                    self.send_to(generation, STDOUT_TAG, &response.to_string());
+                }
+            }
+            return;
+        }
 
         match (method, id) {
             (Some(method), Some(id)) => {
@@ -759,6 +801,11 @@ impl Host {
                 else {
                     return;
                 };
+                if request.method == PROMPT_METHOD
+                    && let Some(session_id) = &request.session_id
+                {
+                    self.answer_turn_waiters(session_id, &message);
+                }
                 if !self.clients.contains_key(&request.generation) {
                     return;
                 }
@@ -774,6 +821,15 @@ impl Host {
                 } else {
                     None
                 };
+                if let Some(session_id) = &loaded_session
+                    && self.is_turn_running_elsewhere(session_id, request.generation)
+                    && let Some(result) = message.get_mut("result").and_then(Value::as_object_mut)
+                {
+                    let meta = result.entry("_meta").or_insert_with(|| json!({}));
+                    if let Some(meta) = meta.as_object_mut() {
+                        meta.insert(TURN_RUNNING_META_KEY.to_string(), true.into());
+                    }
+                }
                 message["id"] = request.id;
                 self.send_to(request.generation, STDOUT_TAG, &message.to_string());
                 // After the response, so that Zed knows the session by the time
@@ -792,6 +848,41 @@ impl Host {
                 // A Zed ignores updates of a session it has not loaded.
                 None => self.broadcast(STDOUT_TAG, &line),
             },
+        }
+    }
+
+    fn is_turn_running(&self, session_id: &str) -> bool {
+        self.client_requests.values().any(|request| {
+            request.method == PROMPT_METHOD && request.session_id.as_deref() == Some(session_id)
+        })
+    }
+
+    /// Whether a turn in `session_id` runs that a connection other than
+    /// `generation` started, which `generation` has no prompt response for.
+    fn is_turn_running_elsewhere(&self, session_id: &str, generation: u64) -> bool {
+        self.client_requests.values().any(|request| {
+            request.method == PROMPT_METHOD
+                && request.session_id.as_deref() == Some(session_id)
+                && request.generation != generation
+        })
+    }
+
+    /// Answers the `AWAIT_TURN_METHOD` requests of `session_id` with the
+    /// agent's `response` to the prompt that ran its turn.
+    fn answer_turn_waiters(&mut self, session_id: &str, response: &Value) {
+        let mut waiters = Vec::new();
+        self.turn_waiters.retain(|waiter| {
+            if waiter.session_id == session_id {
+                waiters.push((waiter.generation, waiter.id.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        for (generation, id) in waiters {
+            let mut response = response.clone();
+            response["id"] = id;
+            self.send_to(generation, STDOUT_TAG, &response.to_string());
         }
     }
 
@@ -988,6 +1079,65 @@ mod tests {
         );
         host.detach(second);
         assert!(host.is_idle());
+    }
+
+    #[test]
+    fn reconnected_zed_learns_of_the_running_turn() {
+        let (mut host, mut agent) = test_host();
+        let (first, _first_client) = attach(&mut host);
+        host.handle_client_line(
+            first,
+            json!({"jsonrpc": "2.0", "id": 4, "method": PROMPT_METHOD, "params": {"sessionId": "s"}})
+                .to_string(),
+        );
+        assert_eq!(next_message(&mut agent)["id"], json!(0));
+        host.detach(first);
+
+        let (second, mut second_client) = attach(&mut host);
+        host.handle_client_line(
+            second,
+            json!({"jsonrpc": "2.0", "id": 0, "method": "session/load", "params": {"sessionId": "s"}})
+                .to_string(),
+        );
+        assert_eq!(next_message(&mut agent)["id"], json!(1));
+        host.handle_agent_line(json!({"jsonrpc": "2.0", "id": 1, "result": {}}).to_string());
+        let load_response = next_message(&mut second_client);
+        assert_eq!(load_response["id"], json!(0));
+        assert_eq!(
+            load_response["result"]["_meta"][TURN_RUNNING_META_KEY],
+            json!(true)
+        );
+
+        host.handle_client_line(
+            second,
+            json!({"jsonrpc": "2.0", "id": 1, "method": AWAIT_TURN_METHOD, "params": {"sessionId": "s"}})
+                .to_string(),
+        );
+        assert_eq!(
+            next_line(&mut agent),
+            "",
+            "the agent never sees the host's own method"
+        );
+        assert_eq!(next_line(&mut second_client), "");
+
+        host.handle_agent_line(
+            json!({"jsonrpc": "2.0", "id": 0, "result": {"stopReason": "end_turn"}}).to_string(),
+        );
+        let turn_end = next_message(&mut second_client);
+        assert_eq!(turn_end["id"], json!(1));
+        assert_eq!(turn_end["result"]["stopReason"], json!("end_turn"));
+        assert!(host.turn_waiters.is_empty());
+
+        host.handle_client_line(
+            second,
+            json!({"jsonrpc": "2.0", "id": 2, "method": AWAIT_TURN_METHOD, "params": {"sessionId": "s"}})
+                .to_string(),
+        );
+        assert_eq!(
+            next_message(&mut second_client)["id"],
+            json!(2),
+            "a turn that already ended is answered at once"
+        );
     }
 
     #[test]
