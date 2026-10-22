@@ -170,6 +170,44 @@ pub struct ConnectionConfig {
     pub port: u16,
     pub database: Option<String>,
     pub username: Option<String>,
+    /// Which kind of server this is, so production stands out and asks before a write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<Environment>,
+    /// The panel groups connections that share a folder under one heading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Environment {
+    Development,
+    Staging,
+    Production,
+}
+
+impl Environment {
+    pub const ALL: [Environment; 3] = [
+        Environment::Development,
+        Environment::Staging,
+        Environment::Production,
+    ];
+
+    pub fn color(self) -> ui::Color {
+        match self {
+            Environment::Development => ui::Color::Success,
+            Environment::Staging => ui::Color::Warning,
+            Environment::Production => ui::Color::Error,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Environment::Development => "dev",
+            Environment::Staging => "staging",
+            Environment::Production => "prod",
+        }
+    }
 }
 
 impl ConnectionConfig {
