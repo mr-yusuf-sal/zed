@@ -13,15 +13,11 @@ Son güncelleme: 2026-10-22
 | `48f7571dd4` | **Madde 13, Docker'dan keşif:** Paneldeki kutu düğmesi `docker inspect` çıktısından veritabanı konteynerlerini, port ve kimlik bilgileriyle birlikte "Docker" klasörüne ekliyor. |
 | `4e282510b4` | **Hata:** İçinde `@`, `:`, `/` ya da `%` geçen MongoDB şifreleri bağlantıyı bozuyordu. Kimlik bilgileri artık `Credential` ile veriliyor. |
 | `0379246180` | **Madde 4, sonuçlarda arama:** Araç çubuğundaki kutu tüm hücrelerde arıyor. Türkçe `İ`/`ı` doğru eşleşiyor. Kolon sıralama ve kolon filtresi grid'de zaten vardı. |
-| (bu commit) | **Madde 5'in sürücü katmanı:** `Driver::preview_page(path, limit, offset)` eklendi ve beş sürücüye uygulandı. Derleniyor, canlı testleri **çalıştırılmadı**. |
+| `ce8cfef` | **Madde 5'in sürücü katmanı:** `Driver::preview_page(path, limit, offset)` eklendi ve beş sürücüye uygulandı. Derleniyor, canlı testleri **çalıştırılmadı**. |
+| `5e07cac3ba` | **Hata (madde 5'in canlı testlerinde çıktı):** ClickHouse, ORDER BY olmadan tabloyu paralel okuduğu için ilk bloktan (~65.000 satır) sonra aynı OFFSET her seferinde başka satırlar döndürüyordu; önizleme artık `max_threads = 1` ile okunuyor. Postgres, shared_buffers'ın dörtte birinden büyük bir tabloyu başka bir oturum tararken onun kaldığı yerden okumaya başlıyordu; havuz bağlantıları artık `synchronize_seqscans = off` ile açılıyor. `preview_page` için beş motora canlı test eklendi. Postgres, Redis, MongoDB ve ClickHouse'ta çalıştırıldı (docker-compose seed'i elde olmadığından testlerin beklediği veri yeniden kuruldu, eski canlı testler de geçti). SQL Server testi **hiç çalıştırılmadı**. |
+| (bu commit) | **Madde 5, Load More:** Panelden açılan önizleme tablonun yolunu saklıyor. Sonuç kesildiyse durum çubuğundaki **Load More** `preview_page(path, 500, satır_sayısı)` çağırıp gelen satırları sona ekliyor. Kolonlar adla birleştiriliyor: yeni kolon sona ekleniyor, eski satırlarda NULL oluyor; `edit_target` ve düzenlenmekte olan hücre aynı hücreyi göstermeye devam ediyor. Durum çubuğu "truncated at 2000" yerine "(truncated)" yazıyor; önizleme 500'de kesildiği için bu yanlıştı. GPUI testi sahte bir sürücüyle iki sayfa ekletip doğruluyor. Uygulamanın içinde elle **denenmedi**. |
 
 ## Yapılacaklar
-
-### 5. Önizlemede "sonraki sayfa": UI kaldı
-- `QueryView`, panelden açılan önizlemenin kaynağını (driver, path, offset) saklamalı.
-- Sonuç kesildiyse (`truncated`) durum çubuğunda **Load More** düğmesi olmalı. Düğme `preview_page(path, 500, mevcut_satır_sayısı)` çağırıp gelen satırları sona eklemeli.
-- MongoDB'de yeni sayfa yeni kolonlar getirebilir. Kolonlar adla birleştirilmeli, eski satırlar `None` ile doldurulmalı. `edit_target` indeksleri değişmez.
-- Önce canlı testler çalıştırılmalı: `cargo test -p quarry --test live --test live_nosql -- --ignored --test-threads=1`
 
 ### 6. EXPLAIN / sorgu planı
 - `Driver::explain(statement, database, analyze: bool) -> Result<Vec<ResultSet>>` eklenecek.
@@ -63,5 +59,9 @@ Son güncelleme: 2026-10-22
 - Araştırılmadı. Zed'in yerel ajanına araç eklemenin upstream koda dokunmadan yapılıp yapılamayacağına bakılmalı; dokunmak rebase'te çatışma demek. Alternatif olarak salt-okunur bir MCP sunucusu düşünülebilir.
 
 ## Notlar
-- Canlı testler, `C:\Users\JosephShall\tools\quarry` altındaki docker-compose konteynerlerini ve seed verisini kullanır.
-- Aynı çalışma ağacında başka oturumlar da çalışıyor (`git_ui`, `acp_thread` vb.). Commit'lere yalnızca `crates/quarry` dosyaları alınmalı.
+- Canlı testler, `C:\Users\JosephShall\tools\quarry` altındaki docker-compose konteynerlerini ve seed verisini kullanır. `*_preview_pages` testleri kendi tablolarını kurup siliyor, seed'e bağlı değil. `postgres_preview_does_not_join_another_scan` varsayılan shared_buffers'ı (128MB) varsayıyor; daha büyükse bunu söyleyerek düşüyor.
+- Aynı çalışma ağacında başka oturumlar da çalışıyor (`git_ui`, `acp_thread` vb.). Commit'lere yalnızca `crates/quarry` dosyaları alınmalı. Tek istisna: quarry'ye bağımlılık eklemek `Cargo.lock`'taki quarry bloğunu da değiştiriyor.
+- Load More'un bilinen sınırları:
+  - Sayfa eklenince grid en başa dönüyor; yeni kolon gelirse elle ayarlanmış kolon genişlikleri de sıfırlanıyor. `TableView::set_contents` liste durumunu sıfırlıyor ve kaydırma konumunu koruyacak bir API yok; `tabular_data_preview`'a dokunulmadı.
+  - Sayfalar OFFSET ile, sunucunun doğal sırasında okunuyor. Sayfalar arasında tablo değişirse satırlar kayabilir, tekrar edebilir ya da atlanabilir. Bu sekmede yapılan bir düzenleme de buna dahil: Postgres'te satırı başka bir sayfaya taşıyan bir UPDATE, Redis sorted set'te skor değişikliği.
+  - SQL Server'da ilk sayfanın TOP'u ile sonrakilerin OFFSET ... FETCH'inin aynı sırayı verdiği doğrulanmadı.
