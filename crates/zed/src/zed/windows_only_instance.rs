@@ -53,8 +53,9 @@ pub fn handle_single_instance(opener: OpenListener, args: &Args) -> bool {
                 })
             })
             .unwrap();
-    } else if !args.foreground {
-        // We are not the first instance, send args to the first instance
+    } else if !args.foreground && !args.hidden {
+        // We are not the first instance, send args to the first instance. A hidden start
+        // (e.g. at login) has nothing to hand off and must not bring the running Zed up.
         send_args_to_instance(args).log_err();
     }
 
