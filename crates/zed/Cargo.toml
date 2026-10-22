@@ -113,6 +113,7 @@ extension_host.workspace = true
 extensions_ui.workspace = true
 feature_flags.workspace = true
 feedback.workspace = true
+fork_sync.workspace = true
 file_finder.workspace = true
 fs.workspace = true
 futures.workspace = true
