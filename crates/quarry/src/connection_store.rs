@@ -1,4 +1,4 @@
-use crate::driver::{ConnectionConfig, Engine};
+use crate::driver::{ConnectionConfig, Engine, Environment};
 use anyhow::{Result, anyhow, bail};
 use db::kvp::KeyValueStore;
 use gpui::{App, AppContext as _, Context, Entity, Global};
@@ -50,6 +50,20 @@ impl ConnectionStore {
 
     pub fn get(&self, index: usize) -> Option<&ConnectionConfig> {
         self.connections.get(index)
+    }
+
+    /// The environment of the saved connection `config` was copied from. Query tabs keep their
+    /// own copy of the config, including across restarts, so marking a connection as production
+    /// afterwards has to reach the tabs already open on it.
+    pub fn environment_of(&self, config: &ConnectionConfig) -> Option<Environment> {
+        self.connections
+            .iter()
+            .find(|saved| {
+                saved.credential_url() == config.credential_url()
+                    && saved.username == config.username
+                    && saved.database == config.database
+            })
+            .map_or(config.environment, |saved| saved.environment)
     }
 
     pub fn add(&mut self, config: ConnectionConfig, cx: &mut Context<Self>) {
@@ -213,6 +227,8 @@ pub fn parse_connection_url(input: &str) -> Result<ConnectionConfig> {
         port,
         database: database.map(str::to_string),
         username,
+        environment: None,
+        folder: None,
     })
 }
 
@@ -302,6 +318,8 @@ mod tests {
             port: 27018,
             database: Some("app?authSource=admin".to_string()),
             username: Some("app".to_string()),
+            environment: None,
+            folder: None,
         };
         let repaired = repair_url_options(saved.clone());
         assert_eq!(repaired.database.as_deref(), Some("app"));

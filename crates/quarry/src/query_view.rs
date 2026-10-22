@@ -1,7 +1,7 @@
 use crate::{
     completion::QuarryCompletionProvider,
-    connection_store::{query_history, record_query},
-    driver::{CatalogEntry, CellEdit, ConnectionConfig, Driver, Engine, ResultSet},
+    connection_store::{ConnectionStore, query_history, record_query},
+    driver::{CatalogEntry, CellEdit, ConnectionConfig, Driver, Engine, Environment, ResultSet},
     result_table,
     runtime::QuarryRuntime,
     statements,
@@ -11,7 +11,7 @@ use db::kvp::KeyValueStore;
 use editor::{Editor, EditorEvent, MultiBufferOffset};
 use gpui::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, Render, Subscription, Task, WeakEntity, Window, actions,
+    Focusable, PromptLevel, Render, Subscription, Task, WeakEntity, Window, actions,
 };
 use language::LanguageRegistry;
 use project::Project;
@@ -319,13 +319,54 @@ impl QueryView {
         })
     }
 
-    fn run_query(&mut self, _: &RunQuery, _window: &mut Window, cx: &mut Context<Self>) {
+    fn run_query(&mut self, _: &RunQuery, window: &mut Window, cx: &mut Context<Self>) {
         let chunks = self.text_to_run(cx);
-        self.execute(chunks, cx);
+        self.confirm_and_execute(chunks, window, cx);
     }
 
-    fn run_all(&mut self, _: &RunAll, _window: &mut Window, cx: &mut Context<Self>) {
-        self.run_everything(cx);
+    fn run_all(&mut self, _: &RunAll, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.editor.read(cx).text(cx);
+        self.confirm_and_execute(vec![text], window, cx);
+    }
+
+    /// The connection's environment as it is saved now, not as it was when this tab opened.
+    fn environment(&self, cx: &App) -> Option<Environment> {
+        ConnectionStore::global(cx).map_or(self.config.environment, |store| {
+            store.read(cx).environment_of(&self.config)
+        })
+    }
+
+    /// Runs `chunks`, first asking when the connection is marked production and any of the
+    /// statements may change something there.
+    fn confirm_and_execute(
+        &mut self,
+        chunks: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let engine = self.config.engine;
+        let writes = split_statements(&chunks, engine)
+            .iter()
+            .filter(|statement| statements::may_write(statement, engine))
+            .count();
+        if writes == 0 || self.environment(cx) != Some(Environment::Production) {
+            self.execute(chunks, cx);
+            return;
+        }
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Run on production ({})?", self.config.name),
+            Some(&format!(
+                "{writes} statement(s) may change data or schema on a connection marked production."
+            )),
+            &["Run", "Cancel"],
+            cx,
+        );
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            if answer.await == Ok(0) {
+                this.update(cx, |this, cx| this.execute(chunks, cx)).ok();
+            }
+        }));
     }
 
     /// Runs every statement in the editor, for a tab that was opened to run a statement the
@@ -336,16 +377,7 @@ impl QueryView {
     }
 
     fn execute(&mut self, chunks: Vec<String>, cx: &mut Context<Self>) {
-        let engine = self.config.engine;
-        let statements: Vec<String> = chunks
-            .iter()
-            .flat_map(|chunk| {
-                statements::split(chunk, engine)
-                    .into_iter()
-                    .filter_map(|range| chunk.get(range).map(str::to_string))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        let statements = split_statements(&chunks, self.config.engine);
         if statements.is_empty() {
             return;
         }
@@ -688,6 +720,9 @@ impl QueryView {
             .py_0p5()
             .border_b_1()
             .border_color(cx.theme().colors().border)
+            .when_some(self.environment(cx), |toolbar, environment| {
+                toolbar.child(environment_badge(environment))
+            })
             .child(
                 Button::new("quarry-run", "Run")
                     .start_icon(Icon::new(IconName::PlayFilled).size(IconSize::Small))
@@ -995,6 +1030,25 @@ impl QueryView {
     }
 }
 
+pub fn environment_badge(environment: Environment) -> Label {
+    Label::new(environment.label().to_uppercase())
+        .size(LabelSize::XSmall)
+        .weight(gpui::FontWeight::BOLD)
+        .color(environment.color())
+}
+
+fn split_statements(chunks: &[String], engine: Engine) -> Vec<String> {
+    chunks
+        .iter()
+        .flat_map(|chunk| {
+            statements::split(chunk, engine)
+                .into_iter()
+                .filter_map(|range| chunk.get(range).map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 fn result_summary(result: &ResultSet) -> String {
     if let Some(message) = result.message()
         && result.columns.is_empty()
@@ -1077,9 +1131,13 @@ impl Item for QueryView {
         )))
     }
 
-    fn tab_content(&self, params: TabContentParams, _window: &Window, _cx: &App) -> AnyElement {
-        Label::new(self.title.clone())
-            .color(params.text_color())
+    fn tab_content(&self, params: TabContentParams, _window: &Window, cx: &App) -> AnyElement {
+        h_flex()
+            .gap_1()
+            .when_some(self.environment(cx), |tab, environment| {
+                tab.child(environment_badge(environment))
+            })
+            .child(Label::new(self.title.clone()).color(params.text_color()))
             .into_any_element()
     }
 
@@ -1095,6 +1153,11 @@ impl Render for QueryView {
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(cx.theme().colors().editor_background)
+            // A frame in the error colour, so a production tab cannot pass for any other.
+            .when(
+                self.environment(cx) == Some(Environment::Production),
+                |view| view.border_2().border_color(cx.theme().status().error),
+            )
             .on_action(cx.listener(Self::run_query))
             .on_action(cx.listener(Self::run_all))
             .on_action(cx.listener(Self::cancel_query))
