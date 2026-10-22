@@ -246,6 +246,20 @@ async fn open_pool(options: PgConnectOptions) -> Result<PgPool, sqlx::Error> {
         // The tree, a preview and an edit each hold a connection, and a browser rarely needs
         // more at once. Editor queries and cancelling open connections of their own.
         .max_connections(4)
+        // On a table larger than a quarter of shared_buffers, a sequential scan starts wherever
+        // another session's scan of the table has got to, so a preview read during someone
+        // else's scan begins mid-table and the page after it can repeat or skip rows. Pooled
+        // connections only browse, so they always read from the start. A server that rejects
+        // the setting is still browsed, just without that guarantee.
+        .after_connect(|connection, _| {
+            Box::pin(async move {
+                connection
+                    .execute("SET synchronize_seqscans = off")
+                    .await
+                    .log_err();
+                Ok(())
+            })
+        })
         .connect_with(options)
         .await
 }

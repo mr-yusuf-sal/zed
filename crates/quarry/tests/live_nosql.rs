@@ -342,6 +342,90 @@ fn clickhouse_cancel() {
     });
 }
 
+#[test]
+#[ignore = "needs the quarry clickhouse on :18123"]
+fn clickhouse_preview_pages() {
+    runtime().block_on(async {
+        let driver = clickhouse_driver().await;
+        driver
+            .query("DROP TABLE IF EXISTS quarry_live_pages", None, 10)
+            .await
+            .expect("drop");
+        driver
+            .query(
+                "CREATE TABLE quarry_live_pages (n UInt64) ENGINE = MergeTree ORDER BY tuple()",
+                None,
+                10,
+            )
+            .await
+            .expect("create");
+        // Four inserts make four parts, stored in the order they were inserted, and enough rows
+        // that a page can lie past the first block a parallel read hands back.
+        for batch in 0..4 {
+            driver
+                .query(
+                    &format!(
+                        "INSERT INTO quarry_live_pages SELECT number + {} FROM numbers(100000)",
+                        batch * 100_000
+                    ),
+                    None,
+                    10,
+                )
+                .await
+                .expect("insert");
+        }
+
+        let table = path(&["app", "quarry_live_pages"]);
+        let first = driver
+            .preview_page(&table, 500, 0)
+            .await
+            .expect("first page");
+        let deep = driver
+            .preview_page(&table, 500, 150_000)
+            .await
+            .expect("a page deep in the table");
+        let next = driver
+            .preview_page(&table, 500, 150_500)
+            .await
+            .expect("the page after it");
+        let last = driver
+            .preview_page(&table, 500, 399_800)
+            .await
+            .expect("last page");
+        let past_the_end = driver
+            .preview_page(&table, 500, 400_000)
+            .await
+            .expect("a page past the end");
+        driver
+            .query("DROP TABLE quarry_live_pages", None, 10)
+            .await
+            .expect("drop");
+
+        // Whether the page holds exactly the numbers in `expected`, in order; printed on failure
+        // as where it starts and ends rather than as hundreds of numbers.
+        let check = |label: &str, page: &ResultSet, expected: std::ops::Range<u64>| {
+            let values: Vec<u64> = (0..page.rows.len())
+                .filter_map(|row| cell(page, row, "n")?.parse().ok())
+                .collect();
+            assert!(
+                values.iter().copied().eq(expected.clone()),
+                "{label}: expected {expected:?}, got {} rows from {:?} to {:?}",
+                values.len(),
+                values.first(),
+                values.last()
+            );
+        };
+        check("first page", &first, 0..500);
+        check("deep page", &deep, 150_000..150_500);
+        check("the page after it", &next, 150_500..151_000);
+        assert!(first.truncated && deep.truncated && next.truncated);
+        check("last page", &last, 399_800..400_000);
+        assert!(!last.truncated);
+        assert!(past_the_end.rows.is_empty());
+        assert!(!past_the_end.truncated);
+    });
+}
+
 async fn redis_driver() -> RedisDriver {
     RedisDriver::connect("localhost", 6380, None, None, None)
         .await
@@ -639,6 +723,130 @@ fn redis_query_and_edit() {
     });
 }
 
+#[test]
+#[ignore = "needs the quarry redis on :6380"]
+fn redis_preview_pages() {
+    runtime().block_on(async {
+        let driver = redis_driver().await;
+        let keys = "quarry:live:pages:list quarry:live:pages:set quarry:live:pages:zset \
+                    quarry:live:pages:hash quarry:live:pages:stream quarry:live:pages:string";
+        driver
+            .query(&format!("DEL {keys}"), None, 10)
+            .await
+            .expect("clearing the scratch keys");
+        // Past the 128 entries up to which Redis stores a set, hash or sorted set as one compact
+        // value, so SSCAN and HSCAN walk a real hash table.
+        let items: Vec<String> = (0..250).map(|n| format!("item-{n:03}")).collect();
+        let scored: Vec<String> = items
+            .iter()
+            .enumerate()
+            .map(|(score, item)| format!("{score} {item}"))
+            .collect();
+        let fields: Vec<String> = items.iter().map(|item| format!("{item} value")).collect();
+        let mut setup = vec![
+            format!("RPUSH quarry:live:pages:list {}", items.join(" ")),
+            format!("SADD quarry:live:pages:set {}", items.join(" ")),
+            format!("ZADD quarry:live:pages:zset {}", scored.join(" ")),
+            format!("HSET quarry:live:pages:hash {}", fields.join(" ")),
+            "SET quarry:live:pages:string one".to_string(),
+        ];
+        setup.extend(
+            items
+                .iter()
+                .map(|item| format!("XADD quarry:live:pages:stream * item {item}")),
+        );
+        for statement in &setup {
+            driver
+                .query(statement, None, 10)
+                .await
+                .unwrap_or_else(|error| panic!("{statement}: {error:#}"));
+        }
+
+        for (kind, identity) in [
+            ("list", "value"),
+            ("set", "member"),
+            ("zset", "member"),
+            ("hash", "field"),
+            ("stream", "id"),
+        ] {
+            let key = path(&["db0", "quarry", "live", "pages", kind]);
+            let first = driver.preview_page(&key, 100, 0).await.expect("first page");
+            let second = driver
+                .preview_page(&key, 100, 100)
+                .await
+                .expect("second page");
+            let last = driver
+                .preview_page(&key, 100, 200)
+                .await
+                .expect("last page");
+            let past_the_end = driver
+                .preview_page(&key, 100, 250)
+                .await
+                .expect("a page past the end");
+            let both = driver.preview(&key, 200).await.expect("two pages at once");
+            println!(
+                "{kind}: {} + {} + {} rows, past the end {}",
+                first.rows.len(),
+                second.rows.len(),
+                last.rows.len(),
+                past_the_end.rows.len()
+            );
+
+            assert!(
+                first.truncated && second.truncated,
+                "{kind} pages say there is more"
+            );
+            assert_eq!(last.rows.len(), 50, "{kind} last page");
+            assert!(!last.truncated, "{kind} last page");
+            let paged: Vec<_> = first.rows.iter().chain(&second.rows).cloned().collect();
+            assert_eq!(
+                paged, both.rows,
+                "{kind}: the second page does not pick up where the first stopped"
+            );
+            let mut seen: Vec<&str> = [&first, &second, &last]
+                .into_iter()
+                .flat_map(|page| {
+                    (0..page.rows.len()).filter_map(move |row| cell(page, row, identity))
+                })
+                .collect();
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(seen.len(), 250, "{kind}: every item exactly once");
+            assert!(past_the_end.rows.is_empty(), "{kind} past the end");
+            assert!(!past_the_end.truncated, "{kind} past the end");
+            assert_eq!(second.edit_target, first.edit_target, "{kind} editability");
+        }
+
+        let list = driver
+            .preview_page(&path(&["db0", "quarry", "live", "pages", "list"]), 100, 100)
+            .await
+            .expect("second page of the list");
+        assert_eq!(
+            cell(&list, 0, "index"),
+            Some("100"),
+            "list indexes count from the start"
+        );
+
+        let string = path(&["db0", "quarry", "live", "pages", "string"]);
+        let value = driver.preview(&string, 10).await.expect("a string");
+        assert_eq!(cell(&value, 0, "value"), Some("one"));
+        let after = driver
+            .preview_page(&string, 10, 1)
+            .await
+            .expect("past a string");
+        assert!(after.rows.is_empty());
+        assert!(!after.truncated);
+
+        let cleanup = single(
+            driver
+                .query(&format!("DEL {keys}"), None, 10)
+                .await
+                .expect("cleanup"),
+        );
+        assert_eq!(cell(&cleanup, 0, "reply"), Some("6"));
+    });
+}
+
 async fn mongo_driver() -> MongoDriver {
     MongoDriver::connect("localhost", 27018, Some("app"), Some("app"), Some("app"))
         .await
@@ -842,6 +1050,97 @@ fn mongodb_query_and_edit() {
 
 #[test]
 #[ignore = "needs the quarry mongodb on :27018"]
+fn mongodb_preview_pages() {
+    runtime().block_on(async {
+        let driver = mongo_driver().await;
+        driver
+            .query(r#"{"drop": "quarry_live_pages"}"#, None, 10)
+            .await
+            .ok();
+        // The last five documents have a field the others lack, so the last page brings a
+        // column the first two did not have.
+        let documents: Vec<String> = (1..=25)
+            .map(|n| {
+                if n > 20 {
+                    format!(r#"{{"_id": {n}, "n": {n}, "late": true}}"#)
+                } else {
+                    format!(r#"{{"_id": {n}, "n": {n}}}"#)
+                }
+            })
+            .collect();
+        driver
+            .query(
+                &format!(
+                    r#"{{"insert": "quarry_live_pages", "documents": [{}]}}"#,
+                    documents.join(", ")
+                ),
+                None,
+                10,
+            )
+            .await
+            .expect("insert");
+
+        let collection = path(&["app", "quarry_live_pages"]);
+        let first = driver
+            .preview_page(&collection, 10, 0)
+            .await
+            .expect("first page");
+        let second = driver
+            .preview_page(&collection, 10, 10)
+            .await
+            .expect("second page");
+        let last = driver
+            .preview_page(&collection, 10, 20)
+            .await
+            .expect("last page");
+        let past_the_end = driver
+            .preview_page(&collection, 10, 1000)
+            .await
+            .expect("a page past the end");
+        let both = driver
+            .preview(&collection, 20)
+            .await
+            .expect("two pages at once");
+        driver
+            .query(r#"{"drop": "quarry_live_pages"}"#, None, 10)
+            .await
+            .expect("drop");
+        println!(
+            "columns: {:?}, then {:?}, then {:?}",
+            first.columns, second.columns, last.columns
+        );
+
+        assert!(first.truncated && second.truncated);
+        assert_eq!(last.rows.len(), 5);
+        assert!(!last.truncated);
+        assert_eq!(first.columns, path(&["_id", "n"]));
+        assert_eq!(last.columns, path(&["_id", "n", "late"]));
+        let paged: Vec<_> = first.rows.iter().chain(&second.rows).cloned().collect();
+        assert_eq!(
+            paged, both.rows,
+            "the second page does not pick up where the first stopped"
+        );
+        let ids: Vec<&str> = [&first, &second, &last]
+            .into_iter()
+            .flat_map(|page| (0..page.rows.len()).filter_map(move |row| cell(page, row, "_id")))
+            .collect();
+        let expected: Vec<String> = (1..=25).map(|n| n.to_string()).collect();
+        assert_eq!(ids, expected);
+        assert!(past_the_end.rows.is_empty());
+        assert!(!past_the_end.truncated);
+        for page in [&first, &second, &last] {
+            let target = page.edit_target.as_ref().expect("the page is editable");
+            let key = target
+                .key_columns
+                .first()
+                .and_then(|&index| page.columns.get(index));
+            assert_eq!(key.map(|name| name.as_ref()), Some("_id"));
+        }
+    });
+}
+
+#[test]
+#[ignore = "needs the quarry mongodb on :27018"]
 fn mongodb_create_script_round_trips() {
     runtime().block_on(async {
         let driver = mongo_driver().await;
@@ -913,8 +1212,7 @@ fn clickhouse_create_script() {
 #[test]
 #[ignore = "needs the quarry containers running under docker"]
 fn docker_discovery_finds_the_quarry_containers() {
-    let servers =
-        futures::executor::block_on(quarry::docker::discover()).expect("asking docker");
+    let servers = futures::executor::block_on(quarry::docker::discover()).expect("asking docker");
     for server in &servers {
         println!(
             "{} → {} {}:{} user={:?} db={:?} password={}",
