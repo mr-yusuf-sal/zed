@@ -75,6 +75,9 @@ pub fn init(cx: &mut App) {
 
 pub struct CommitView {
     commit: CommitDetails,
+    /// Set when the view compares two commits: it then shows what changed from
+    /// this commit to `commit` instead of what `commit` changed against its parent.
+    older_commit: Option<CommitDetails>,
     editor: Entity<SplittableEditor>,
     message: Entity<Markdown>,
     message_expanded: bool,
@@ -191,6 +194,7 @@ impl CommitView {
     ) {
         Self::open_with_options(
             commit_sha,
+            None,
             repo,
             workspace,
             stash,
@@ -201,8 +205,32 @@ impl CommitView {
         )
     }
 
+    /// Opens a view of everything that differs between the two commits' trees,
+    /// whatever history lies between them.
+    pub fn open_comparison(
+        older_sha: String,
+        newer_sha: String,
+        repo: WeakEntity<Repository>,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        Self::open_with_options(
+            newer_sha,
+            Some(older_sha),
+            repo,
+            workspace,
+            None,
+            None,
+            true,
+            window,
+            cx,
+        )
+    }
+
     fn open_with_options(
         commit_sha: String,
+        older_sha: Option<String>,
         repo: WeakEntity<Repository>,
         workspace: WeakEntity<Workspace>,
         stash: Option<usize>,
@@ -211,14 +239,22 @@ impl CommitView {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let revision = match &older_sha {
+            Some(older_sha) => format!("{older_sha}..{commit_sha}"),
+            None => commit_sha.clone(),
+        };
         let commit_diff = repo
             .update(cx, |repo, cx| {
-                repo.load_commit_diff(commit_sha.clone(), ignore_shallow_boundary, cx)
+                repo.load_commit_diff(revision.clone(), ignore_shallow_boundary, cx)
             })
             .ok();
         let commit_details = repo
             .update(cx, |repo, cx| repo.show_commit(commit_sha.clone(), cx))
             .ok();
+        let older_commit_details = older_sha.map(|older_sha| {
+            repo.update(cx, |repo, cx| repo.show_commit(older_sha, cx))
+                .ok()
+        });
 
         window
             .spawn(cx, async move |cx| {
@@ -227,6 +263,10 @@ impl CommitView {
                 let (commit_diff, commit_details) = futures::join!(commit_diff, commit_details);
                 let mut commit_diff = commit_diff.log_err()?;
                 let commit_details = commit_details.log_err()?;
+                let older_commit = match older_commit_details {
+                    Some(older_commit_details) => Some(older_commit_details?.await.log_err()?),
+                    None => None,
+                };
 
                 // Filter to specific file if requested
                 if let Some(ref filter_path) = file_filter {
@@ -243,6 +283,7 @@ impl CommitView {
                         let commit_view = cx.new(|cx| {
                             CommitView::new(
                                 commit_details,
+                                older_commit,
                                 commit_diff,
                                 repo,
                                 project.clone(),
@@ -259,14 +300,13 @@ impl CommitView {
                         pane.update(cx, |pane, cx| {
                             let ix = pane.items().position(|item| {
                                 let commit_view = item.downcast::<CommitView>();
-                                commit_view
-                                    .is_some_and(|view| view.read(cx).commit.sha == commit_sha)
+                                commit_view.is_some_and(|view| view.read(cx).revision() == revision)
                             });
                             if let Some(ix) = ix {
                                 let existing = pane
                                     .items()
                                     .filter_map(|item| item.downcast::<CommitView>())
-                                    .find(|view| view.read(cx).commit.sha == commit_sha)
+                                    .find(|view| view.read(cx).revision() == revision)
                                     .unwrap();
 
                                 pane.remove_item(existing.item_id(), false, false, window, cx);
@@ -290,6 +330,7 @@ impl CommitView {
 
     fn new(
         commit: CommitDetails,
+        older_commit: Option<CommitDetails>,
         commit_diff: CommitDiff,
         repository: Entity<Repository>,
         project: Entity<Project>,
@@ -336,7 +377,7 @@ impl CommitView {
 
             editor
         });
-        let commit_sha = Arc::<str>::from(commit.sha.as_ref());
+        let short_revision = Arc::<str>::from(short_revision(&commit, older_commit.as_ref()));
 
         let repository_clone = repository.clone();
         let project_clone = project.clone();
@@ -369,15 +410,12 @@ impl CommitView {
                         )
                     })
                     .context("project has no worktrees")?;
-                let short_sha = commit_sha
-                    .get(0..git::SHORT_SHA_LENGTH)
-                    .unwrap_or(&commit_sha);
                 let file_name = file
                     .path
                     .file_name()
                     .map(|name| name.to_string())
                     .unwrap_or_else(|| file.path.display(PathStyle::local()).to_string());
-                let display_name = format!("{short_sha} - {file_name}");
+                let display_name = format!("{short_revision} - {file_name}");
 
                 let file = Arc::new(GitBlob {
                     path: file.path.clone(),
@@ -515,6 +553,7 @@ impl CommitView {
 
         Self {
             commit,
+            older_commit,
             editor,
             message,
             message_expanded: false,
@@ -595,6 +634,7 @@ impl CommitView {
                                             cx.update(|window, cx| {
                                                 Self::open_with_options(
                                                     commit_sha,
+                                                    None,
                                                     repository,
                                                     workspace,
                                                     stash,
@@ -627,6 +667,7 @@ impl CommitView {
                             .on_click(move |_, window, cx| {
                                 Self::open_with_options(
                                     commit_sha.clone(),
+                                    None,
                                     repository.downgrade(),
                                     workspace.clone(),
                                     stash,
@@ -706,6 +747,97 @@ impl CommitView {
         self.open_file_at_head(&file, window, cx);
     }
 
+    /// What this view diffs, in the form `Repository::load_commit_diff` takes it.
+    fn revision(&self) -> String {
+        match &self.older_commit {
+            Some(older_commit) => format!("{}..{}", older_commit.sha, self.commit.sha),
+            None => self.commit.sha.to_string(),
+        }
+    }
+
+    /// The width of the header's leading column, which matches the editor gutter so
+    /// that the header's text lines up with the diff below it.
+    fn header_leading_column_width(
+        &self,
+        content_width: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Pixels {
+        let gutter_width = self.editor.update(cx, |editor, cx| {
+            let editor = editor.rhs_editor().clone();
+            editor.update(cx, |editor, cx| {
+                let snapshot = editor.snapshot(window, cx);
+                let style = editor.style(cx);
+                let font_id = window.text_system().resolve_font(&style.text.font());
+                let font_size = style.text.font_size.to_pixels(window.rem_size());
+                snapshot
+                    .gutter_dimensions(font_id, font_size, style, window, cx)
+                    .full_width()
+            })
+        });
+        let min_side_padding = rems_from_px(6_f32).to_pixels(window.rem_size());
+        gutter_width.max(content_width + min_side_padding)
+    }
+
+    fn render_comparison_header(
+        &self,
+        older_commit: &CommitDetails,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let icon_size = IconSize::Medium;
+        let leading_column_width = self.header_leading_column_width(
+            icon_size.rems().to_pixels(window.rem_size()),
+            window,
+            cx,
+        );
+        let commit_row = |commit: &CommitDetails| {
+            h_flex()
+                .gap_1p5()
+                .min_w_0()
+                .child(
+                    Label::new(short_sha(&commit.sha).to_string())
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .buffer_font(cx),
+                )
+                .child(
+                    Label::new(commit_subject(&commit.message).to_string())
+                        .size(LabelSize::Small)
+                        .truncate(),
+                )
+        };
+
+        h_flex()
+            .w_full()
+            .py_2p5()
+            .pr_2p5()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(
+                h_flex()
+                    .flex_none()
+                    .w(leading_column_width)
+                    .justify_center()
+                    .child(
+                        Icon::new(IconName::Diff)
+                            .size(icon_size)
+                            .color(Color::Muted),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .child(Label::new(format!(
+                        "Changes from {} to {}",
+                        short_sha(&older_commit.sha),
+                        short_sha(&self.commit.sha)
+                    )))
+                    .child(commit_row(older_commit))
+                    .child(commit_row(&self.commit)),
+            )
+    }
+
     fn render_header(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let commit = &self.commit;
         let author_name = commit.author_name.clone();
@@ -722,22 +854,8 @@ impl CommitView {
         );
 
         let avatar_size = rems_from_px(40_f32);
-        let avatar_size_px = avatar_size.to_pixels(window.rem_size());
-        let gutter_width = self.editor.update(cx, |editor, cx| {
-            let editor = editor.rhs_editor().clone();
-            editor.update(cx, |editor, cx| {
-                let snapshot = editor.snapshot(window, cx);
-                let style = editor.style(cx);
-                let font_id = window.text_system().resolve_font(&style.text.font());
-                let font_size = style.text.font_size.to_pixels(window.rem_size());
-                snapshot
-                    .gutter_dimensions(font_id, font_size, style, window, cx)
-                    .full_width()
-            })
-        });
-        let avatar_min_side_padding = rems_from_px(6_f32).to_pixels(window.rem_size());
-        let avatar_container_min = avatar_size_px + avatar_min_side_padding;
-        let avatar_container_width = gutter_width.max(avatar_container_min);
+        let avatar_container_width =
+            self.header_leading_column_width(avatar_size.to_pixels(window.rem_size()), window, cx);
 
         let clipboard_has_sha = cx
             .read_from_clipboard()
@@ -1190,12 +1308,36 @@ impl Item for CommitView {
     }
 
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        if let Some(older_commit) = &self.older_commit {
+            return short_revision(&self.commit, Some(older_commit)).into();
+        }
         let short_sha = self.commit.sha.get(0..7).unwrap_or(&*self.commit.sha);
         let subject = truncate_and_trailoff(self.commit.message.split('\n').next().unwrap(), 20);
         format!("{short_sha} — {subject}").into()
     }
 
     fn tab_tooltip_content(&self, _: &App) -> Option<TabTooltipContent> {
+        if let Some(older_commit) = &self.older_commit {
+            let commit_rows = [older_commit, &self.commit].map(|commit| {
+                (
+                    SharedString::from(short_sha(&commit.sha).to_string()),
+                    SharedString::from(commit_subject(&commit.message).to_string()),
+                )
+            });
+            return Some(TabTooltipContent::Custom(Box::new(Tooltip::element(
+                move |_, _| {
+                    v_flex()
+                        .children(commit_rows.iter().map(|(short_sha, subject)| {
+                            h_flex()
+                                .gap_1p5()
+                                .child(Label::new(short_sha.clone()).color(Color::Muted))
+                                .child(Label::new(subject.clone()))
+                        }))
+                        .into_any_element()
+                },
+            ))));
+        }
+
         let short_sha = self.commit.sha.get(0..16).unwrap_or(&*self.commit.sha);
         let subject = self.commit.message.split('\n').next().unwrap();
 
@@ -1368,6 +1510,7 @@ impl Item for CommitView {
                 message_scroll_handle: ScrollHandle::new(),
                 multibuffer: self.multibuffer.clone(),
                 commit: self.commit.clone(),
+                older_commit: self.older_commit.clone(),
                 stash: self.stash,
                 repository: self.repository.clone(),
                 project: self.project.clone(),
@@ -1384,13 +1527,19 @@ impl Item for CommitView {
 impl Render for CommitView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_stash = self.stash.is_some();
+        let header = match &self.older_commit {
+            Some(older_commit) => self
+                .render_comparison_header(older_commit, window, cx)
+                .into_any_element(),
+            None => self.render_header(window, cx).into_any_element(),
+        };
 
         v_flex()
             .key_context(if is_stash { "StashDiff" } else { "CommitDiff" })
             .on_action(cx.listener(Self::open_file_at_head_action))
             .size_full()
             .bg(cx.theme().colors().editor_background)
-            .child(self.render_header(window, cx))
+            .child(header)
             .when(
                 !self.editor.read(cx).rhs_editor().read(cx).is_empty(cx),
                 |this| this.child(div().flex_grow(1.).child(self.editor.clone())),
@@ -1425,6 +1574,7 @@ impl Render for CommitViewToolbar {
         let (additions, deletions) = commit_view_ref.calculate_changed_lines(cx);
 
         let commit_sha = commit_view_ref.commit.sha.clone();
+        let is_comparison = commit_view_ref.older_commit.is_some();
 
         let remote_info = commit_view_ref.remote.as_ref().map(|remote| {
             let provider = remote.host.name();
@@ -1487,14 +1637,20 @@ impl Render for CommitViewToolbar {
                             );
                         }),
                 )
-                .children(remote_info.map(|(provider_name, url)| {
-                    let icon = ui::git_hosting_provider_icon(provider_name.as_str());
+                // Hosting providers only build permalinks to a single commit, which for
+                // a comparison would show the newer end's own changes instead.
+                .children(
+                    remote_info
+                        .filter(|_| !is_comparison)
+                        .map(|(provider_name, url)| {
+                            let icon = ui::git_hosting_provider_icon(provider_name.as_str());
 
-                    IconButton::new("view_on_provider", icon)
-                        .icon_size(IconSize::Small)
-                        .tooltip(Tooltip::text(format!("View on {}", provider_name)))
-                        .on_click(move |_, _, cx| cx.open_url(&url))
-                }))
+                            IconButton::new("view_on_provider", icon)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text(format!("View on {}", provider_name)))
+                                .on_click(move |_, _, cx| cx.open_url(&url))
+                        }),
+                )
             })
     }
 }
@@ -1521,6 +1677,25 @@ impl ToolbarItemView for CommitViewToolbar {
         _cx: &mut Context<Self>,
     ) {
     }
+}
+
+fn short_sha(sha: &str) -> &str {
+    sha.get(0..git::SHORT_SHA_LENGTH).unwrap_or(sha)
+}
+
+fn short_revision(commit: &CommitDetails, older_commit: Option<&CommitDetails>) -> String {
+    match older_commit {
+        Some(older_commit) => format!(
+            "{}..{}",
+            short_sha(&older_commit.sha),
+            short_sha(&commit.sha)
+        ),
+        None => short_sha(&commit.sha).to_string(),
+    }
+}
+
+fn commit_subject(message: &str) -> &str {
+    message.lines().next().unwrap_or_default()
 }
 
 fn stash_matches_index(sha: &str, stash_index: usize, repo: &Repository) -> bool {
