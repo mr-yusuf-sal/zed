@@ -533,7 +533,14 @@ impl Render for RenameBranchModal {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CreateRefKind {
+    Tag,
+    Branch,
+}
+
 struct CreateTagModal {
+    kind: CreateRefKind,
     commit: Oid,
     at_head: bool,
     editor: Entity<Editor>,
@@ -543,6 +550,7 @@ struct CreateTagModal {
 
 impl CreateTagModal {
     fn new(
+        kind: CreateRefKind,
         commit: Oid,
         at_head: bool,
         repo: Entity<Repository>,
@@ -552,10 +560,15 @@ impl CreateTagModal {
     ) -> Self {
         let editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Tag name", window, cx);
+            let placeholder = match kind {
+                CreateRefKind::Tag => "Tag name",
+                CreateRefKind::Branch => "Branch name",
+            };
+            editor.set_placeholder_text(placeholder, window, cx);
             editor
         });
         Self {
+            kind,
             commit,
             at_head,
             editor,
@@ -579,21 +592,37 @@ impl CreateTagModal {
     }
 
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
-        let tag_name = self.editor.read(cx).text(cx).trim().to_string();
-        if tag_name.is_empty() {
+        let ref_name = self.editor.read(cx).text(cx).trim().to_string();
+        if ref_name.is_empty() {
             return;
         }
 
+        let kind = self.kind;
         let repo = self.repo.clone();
         let commit = self.commit.to_string();
         let workspace = self.workspace.clone();
-        let success_message = format!(
-            "Created tag \"{tag_name}\" at {}",
-            self.tag_target_commit_label()
-        );
+        let (success_message, error_message) = match kind {
+            CreateRefKind::Tag => (
+                format!(
+                    "Created tag \"{ref_name}\" at {}",
+                    self.tag_target_commit_label()
+                ),
+                "Failed to create tag",
+            ),
+            CreateRefKind::Branch => (
+                format!(
+                    "Created and switched to branch \"{ref_name}\" at {}",
+                    self.tag_target_commit_label()
+                ),
+                "Failed to create branch",
+            ),
+        };
         cx.spawn(async move |_, cx| {
-            repo.update(cx, |repo, _| repo.create_tag(tag_name, commit))
-                .await??;
+            repo.update(cx, |repo, _| match kind {
+                CreateRefKind::Tag => repo.create_tag(ref_name, commit),
+                CreateRefKind::Branch => repo.create_branch(ref_name, Some(commit)),
+            })
+            .await??;
 
             workspace
                 .update(cx, |workspace, cx| {
@@ -603,7 +632,7 @@ impl CreateTagModal {
                 .log_err();
             Ok(())
         })
-        .detach_and_prompt_err("Failed to create tag", window, cx, |error, _, _| {
+        .detach_and_prompt_err(error_message, window, cx, |error, _, _| {
             Some(error.to_string())
         });
         cx.emit(DismissEvent);
@@ -620,7 +649,12 @@ impl Focusable for CreateTagModal {
 
 impl Render for CreateTagModal {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let title = format!("Create Tag at {}", self.tag_target_commit_label());
+        let title = match self.kind {
+            CreateRefKind::Tag => format!("Create Tag at {}", self.tag_target_commit_label()),
+            CreateRefKind::Branch => {
+                format!("Create Branch at {}", self.tag_target_commit_label())
+            }
+        };
         v_flex()
             .key_context("CreateTagModal")
             .on_action(cx.listener(Self::cancel))
@@ -694,7 +728,36 @@ pub(crate) fn create_tag_at_commit(
 ) {
     let workspace_handle = cx.weak_entity();
     workspace.toggle_modal(window, cx, |window, cx| {
-        CreateTagModal::new(commit, at_head, repo, workspace_handle, window, cx)
+        CreateTagModal::new(
+            CreateRefKind::Tag,
+            commit,
+            at_head,
+            repo,
+            workspace_handle,
+            window,
+            cx,
+        )
+    });
+}
+
+pub(crate) fn create_branch_at_commit(
+    commit: Oid,
+    repo: Entity<Repository>,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let workspace_handle = cx.weak_entity();
+    workspace.toggle_modal(window, cx, |window, cx| {
+        CreateTagModal::new(
+            CreateRefKind::Branch,
+            commit,
+            false,
+            repo,
+            workspace_handle,
+            window,
+            cx,
+        )
     });
 }
 
@@ -1665,6 +1728,7 @@ mod view_commit_tests {
                 commit_context_menu::CommitContextMenuData {
                     sha: selected_commit,
                     tag_names: Vec::new(),
+                    extra_entries: None,
                 },
                 commit_context_menu::CommitContextMenuSource::GitPanel,
                 None,
