@@ -2636,7 +2636,7 @@ fn terminal_view_selection(terminal_view: &Entity<TerminalView>, cx: &App) -> Op
         .filter(|text| !text.is_empty())
 }
 
-fn editor_selection_ranges(
+pub(crate) fn editor_selection_ranges(
     editor: &Entity<Editor>,
     include_current_line: bool,
     cx: &mut App,
