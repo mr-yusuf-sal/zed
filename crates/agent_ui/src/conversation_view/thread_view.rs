@@ -634,6 +634,7 @@ pub struct ThreadView {
     pub edits_expanded: bool,
     pub plan_expanded: bool,
     pub queue_expanded: bool,
+    background_processes_expanded: bool,
     pub editor_expanded: bool,
     pub should_be_following: bool,
     pub editing_message: Option<usize>,
@@ -1076,6 +1077,7 @@ impl ThreadView {
             edits_expanded: false,
             plan_expanded: false,
             queue_expanded: true,
+            background_processes_expanded: false,
             editor_expanded: false,
             should_be_following: false,
             editing_message: None,
@@ -3612,8 +3614,14 @@ impl ThreadView {
             (generic, legacy) => generic.or(legacy),
         };
         let has_awaiting_permission = awaiting_permission.is_some();
+        let background_processes = self.render_background_processes(cx);
 
-        if changed_buffers.is_empty() && !has_plan && queue_is_empty && !has_awaiting_permission {
+        if changed_buffers.is_empty()
+            && !has_plan
+            && queue_is_empty
+            && !has_awaiting_permission
+            && background_processes.is_none()
+        {
             return None;
         }
 
@@ -3699,6 +3707,16 @@ impl ThreadView {
                         .when(queue_expanded, |parent| {
                             parent.child(self.render_message_queue_entries(window, cx))
                         })
+                    })
+                    .when_some(background_processes, |this, element| {
+                        this.when(
+                            has_awaiting_permission
+                                || has_plan
+                                || !changed_buffers.is_empty()
+                                || !queue_is_empty,
+                            |this| this.child(Divider::horizontal().color(DividerColor::Border)),
+                        )
+                        .child(element)
                     }),
             )
             .into_any()
@@ -4363,6 +4381,117 @@ impl ThreadView {
                     })),
             )
             .into_any_element()
+    }
+
+    /// Commands that outlived their tool call. An agent that backgrounds a
+    /// command (Claude Code's `run_in_background`) completes the tool call as
+    /// soon as the command detaches, but keeps its terminal open until the
+    /// command itself exits.
+    fn background_processes(&self, cx: &App) -> Vec<(usize, SharedString, Instant)> {
+        self.thread
+            .read(cx)
+            .entries()
+            .iter()
+            .enumerate()
+            .filter_map(|(entry_ix, entry)| {
+                let AgentThreadEntry::ToolCall(tool_call) = entry else {
+                    return None;
+                };
+                if !matches!(tool_call.status(), ToolCallStatus::Completed) {
+                    return None;
+                }
+                let terminal = tool_call
+                    .terminals()
+                    .find(|terminal| terminal.read(cx).output().is_none())?;
+                let command = tool_call
+                    .label
+                    .read(cx)
+                    .source()
+                    .replace('`', "")
+                    .split_whitespace()
+                    .join(" ");
+                Some((entry_ix, command.into(), terminal.read(cx).started_at()))
+            })
+            .collect()
+    }
+
+    fn render_background_processes(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let processes = self.background_processes(cx);
+        if processes.is_empty() {
+            return None;
+        }
+        let expanded = self.background_processes_expanded;
+        let title: SharedString = if processes.len() == 1 {
+            "1 Background Process".into()
+        } else {
+            format!("{} Background Processes", processes.len()).into()
+        };
+
+        Some(
+            v_flex()
+                .child(
+                    h_flex()
+                        .id("background_processes_summary")
+                        .p_1()
+                        .w_full()
+                        .gap_1()
+                        .when(expanded, |this| {
+                            this.border_b_1().border_color(cx.theme().colors().border)
+                        })
+                        .child(Disclosure::new("background_processes_disclosure", expanded))
+                        .child(Label::new(title).size(LabelSize::Small).color(Color::Muted))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.background_processes_expanded =
+                                !this.background_processes_expanded;
+                            cx.notify();
+                        })),
+                )
+                .when(expanded, |this| {
+                    this.children(
+                        processes
+                            .into_iter()
+                            .map(|(entry_ix, command, started_at)| {
+                                h_flex()
+                                    .id(("background-process", entry_ix))
+                                    .px_2()
+                                    .py_1()
+                                    .gap_2()
+                                    .w_full()
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                                    .child(
+                                        Icon::new(IconName::ToolTerminal)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .child(
+                                        div().flex_1().min_w_0().child(
+                                            Label::new(command)
+                                                .size(LabelSize::Small)
+                                                .buffer_font(cx)
+                                                .truncate(),
+                                        ),
+                                    )
+                                    .child(
+                                        Label::new(util::time::duration_alt_display(
+                                            started_at.elapsed(),
+                                        ))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                    )
+                                    .tooltip(Tooltip::text("Scroll to Command"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.list_state.scroll_to(ListOffset {
+                                            item_ix: entry_ix,
+                                            offset_in_item: px(0.),
+                                        });
+                                        cx.notify();
+                                    }))
+                            }),
+                    )
+                })
+                .into_any_element(),
+        )
     }
 
     fn clear_queue(&mut self, cx: &mut Context<Self>) {
