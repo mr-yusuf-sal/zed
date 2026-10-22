@@ -23,9 +23,14 @@ actions!(
 const COMMIT_TAG_LIST_WIDTH_IN_REMS: Rems = rems(10.);
 pub(crate) const CUSTOM_GIT_COMMANDS_DOCS_SLUG: &str = "tasks#custom-git-commands";
 
+/// Entries a caller adds to the commit menu, between the built-in entries and
+/// the custom commands.
+pub(crate) type CommitMenuEntries = Box<dyn FnOnce(ContextMenu, &mut Window) -> ContextMenu>;
+
 pub(crate) struct CommitContextMenuData {
     pub(crate) sha: Oid,
     pub(crate) tag_names: Vec<SharedString>,
+    pub(crate) extra_entries: Option<CommitMenuEntries>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -56,7 +61,8 @@ pub(crate) fn commit_context_menu(
         None => format!("Commit {sha_short}"),
     };
 
-    ContextMenu::build(window, cx, move |context_menu, _, _| {
+    let extra_entries = commit.extra_entries;
+    ContextMenu::build(window, cx, move |context_menu, window, _| {
         context_menu
             .context(focus_handle)
             .header(header)
@@ -153,6 +159,10 @@ pub(crate) fn commit_context_menu(
                         cx,
                     );
                 })
+            })
+            .map(|menu| match extra_entries {
+                Some(add_entries) => add_entries(menu.separator(), window),
+                None => menu,
             })
             .map(|mut menu| {
                 menu = menu.separator().header("Custom Commands");

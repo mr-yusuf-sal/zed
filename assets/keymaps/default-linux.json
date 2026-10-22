@@ -1671,6 +1671,8 @@
     "bindings": {
       "tab": "git_graph::FocusNextTabStop",
       "shift-tab": "git_graph::FocusPreviousTabStop",
+      "shift-up": "git_graph::ExtendSelectionUp",
+      "shift-down": "git_graph::ExtendSelectionDown",
     },
   },
   {
