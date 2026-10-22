@@ -3488,9 +3488,13 @@ pub struct AcpThread {
     available_commands: Vec<acp_v2::AvailableCommand>,
     _observe_prompt_capabilities: Task<anyhow::Result<()>>,
     _idle_sleep_subscriptions: Vec<Subscription>,
-    terminals: HashMap<acp_v2::TerminalId, Entity<Terminal>>,
-    pending_terminal_output: HashMap<acp_v2::TerminalId, Vec<Vec<u8>>>,
-    pending_terminal_exit: HashMap<acp_v2::TerminalId, acp_v1::TerminalExitStatus>,
+    terminals: HashMap<acp_v1::TerminalId, Entity<Terminal>>,
+    pending_terminal_output: HashMap<acp_v1::TerminalId, Vec<Vec<u8>>>,
+    pending_terminal_exit: HashMap<acp_v1::TerminalId, acp_v1::TerminalExitStatus>,
+    /// The tool calls whose subagent the agent reports as still working. A
+    /// subagent launched in the background outlives its tool call, which
+    /// completes as soon as the launch does.
+    running_subagent_tool_calls: HashSet<acp_v1::ToolCallId>,
     had_error: bool,
     local_execution_error: Option<Arc<anyhow::Error>>,
     /// The user's unsent prompt text, persisted so it can be restored when reloading the thread.
@@ -3843,6 +3847,7 @@ impl AcpThread {
             subagents: IndexMap::default(),
             plans: HashMap::default(),
             visible_plan: None,
+            running_subagent_tool_calls: HashSet::default(),
             provisional_title: None,
             project,
             running_turn: None,
@@ -3963,6 +3968,26 @@ impl AcpThread {
 
     pub fn entries(&self) -> &[AgentThreadEntry] {
         &self.entries
+    }
+
+    pub fn is_subagent_running(&self, tool_call_id: &acp_v1::ToolCallId) -> bool {
+        self.running_subagent_tool_calls.contains(tool_call_id)
+    }
+
+    pub fn set_subagent_running(
+        &mut self,
+        tool_call_id: acp_v1::ToolCallId,
+        running: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = if running {
+            self.running_subagent_tool_calls.insert(tool_call_id)
+        } else {
+            self.running_subagent_tool_calls.remove(&tool_call_id)
+        };
+        if changed {
+            cx.notify();
+        }
     }
 
     pub fn notices(&self) -> &[(usize, acp_v2::Notice)] {

@@ -367,6 +367,10 @@ struct Host {
     /// The connection that set up each session, which its updates and
     /// requests go to.
     session_owners: HashMap<String, u64>,
+    /// The session each subagent session runs under, from the agent's
+    /// `subagent_update`s. Zed never sets a subagent session up itself, so its
+    /// messages go to the owner of the session at the root of this chain.
+    subagent_parents: HashMap<String, String>,
     turn_waiters: Vec<TurnWaiter>,
     next_generation: u64,
     next_request_id: u64,
@@ -612,10 +616,39 @@ impl Host {
         match session_id {
             Some(session_id) => self
                 .session_owners
-                .get(session_id)
+                .get(root_session(&self.subagent_parents, session_id))
                 .copied()
                 .filter(|generation| self.clients.contains_key(generation)),
             None => self.clients.keys().max().copied(),
+        }
+    }
+
+    /// Records the parent of the subagent session that `message`, a
+    /// `subagent_update` of its parent session, reports.
+    fn record_subagent_parent(&mut self, message: &Value) {
+        let Some(update) = message
+            .get("params")
+            .and_then(|params| params.get("update"))
+        else {
+            return;
+        };
+        if update.get("sessionUpdate").and_then(Value::as_str) != Some("subagent_update") {
+            return;
+        }
+        let (Some(parent), Some(child)) = (
+            params_session_id(message),
+            update.get("sessionId").and_then(Value::as_str),
+        ) else {
+            return;
+        };
+        if child != parent && !self.subagent_parents.contains_key(child) {
+            self.subagent_parents.insert(child.to_owned(), parent);
+            // A subagent can ask for permission before its announcement
+            // reaches the host.
+            let root = root_session(&self.subagent_parents, child).to_owned();
+            if let Some(generation) = self.target(Some(&root)) {
+                self.deliver_held_requests(generation, Some(&root));
+            }
         }
     }
 
@@ -840,14 +873,19 @@ impl Host {
                     self.deliver_held_requests(request.generation, Some(&session_id));
                 }
             }
-            _ => match params_session_id(&message)
-                .as_deref()
-                .and_then(|session_id| self.target(Some(session_id)))
-            {
-                Some(generation) => self.send_to(generation, STDOUT_TAG, &line),
-                // A Zed ignores updates of a session it has not loaded.
-                None => self.broadcast(STDOUT_TAG, &line),
-            },
+            _ => {
+                match params_session_id(&message)
+                    .as_deref()
+                    .and_then(|session_id| self.target(Some(session_id)))
+                {
+                    Some(generation) => self.send_to(generation, STDOUT_TAG, &line),
+                    // A Zed ignores updates of a session it has not loaded.
+                    None => self.broadcast(STDOUT_TAG, &line),
+                }
+                // After the update, so that Zed knows the subagent by the
+                // time its held requests arrive.
+                self.record_subagent_parent(&message);
+            }
         }
     }
 
@@ -894,7 +932,11 @@ impl Host {
         }
         let mut lines = Vec::new();
         for request in &mut self.agent_requests {
-            if request.delivered_to.is_none() && request.session_id.as_deref() == session_id {
+            let request_session = request
+                .session_id
+                .as_deref()
+                .map(|request_session| root_session(&self.subagent_parents, request_session));
+            if request.delivered_to.is_none() && request_session == session_id {
                 request.delivered_to = Some(generation);
                 lines.push(request.message.to_string());
             }
@@ -926,6 +968,23 @@ impl Host {
         };
         self.send_to_agent(response.to_string());
     }
+}
+
+/// The session that `session_id` is a subagent of, following nested subagents
+/// up, or `session_id` itself when it is no subagent's.
+fn root_session<'a>(
+    subagent_parents: &'a HashMap<String, String>,
+    mut session_id: &'a str,
+) -> &'a str {
+    // Bounded, so that a parent cycle in what the agent sent cannot hang the
+    // host.
+    for _ in 0..subagent_parents.len() {
+        match subagent_parents.get(session_id) {
+            Some(parent) => session_id = parent,
+            None => break,
+        }
+    }
+    session_id
 }
 
 fn params_session_id(message: &Value) -> Option<String> {
@@ -1079,6 +1138,55 @@ mod tests {
         );
         host.detach(second);
         assert!(host.is_idle());
+    }
+
+    #[test]
+    fn subagent_requests_go_to_the_owner_of_their_root_session() {
+        let (mut host, mut agent) = test_host();
+        let (generation, mut client) = attach(&mut host);
+        host.handle_client_line(
+            generation,
+            json!({"jsonrpc": "2.0", "id": 0, "method": "session/load", "params": {"sessionId": "s"}})
+                .to_string(),
+        );
+        assert_eq!(next_message(&mut agent)["id"], json!(0));
+        host.handle_agent_line(json!({"jsonrpc": "2.0", "id": 0, "result": {}}).to_string());
+        assert_eq!(next_message(&mut client)["id"], json!(0));
+
+        let subagent_update = |parent: &str, child: &str| {
+            json!({"jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": parent,
+                "update": {"sessionUpdate": "subagent_update", "sessionId": child, "state": {"state": "running"}},
+            }})
+            .to_string()
+        };
+        host.handle_agent_line(subagent_update("s", "child"));
+        assert_eq!(
+            next_message(&mut client)["params"]["update"]["sessionId"],
+            json!("child")
+        );
+        host.handle_agent_line(
+            json!({"jsonrpc": "2.0", "id": 5, "method": "session/request_permission", "params": {"sessionId": "child"}})
+                .to_string(),
+        );
+        assert_eq!(next_message(&mut client)["id"], json!(5));
+
+        host.handle_agent_line(
+            json!({"jsonrpc": "2.0", "id": 6, "method": "session/request_permission", "params": {"sessionId": "grandchild"}})
+                .to_string(),
+        );
+        assert_eq!(
+            next_line(&mut client),
+            "",
+            "a request of an unannounced subagent waits for its announcement"
+        );
+        host.handle_agent_line(subagent_update("child", "grandchild"));
+        assert_eq!(
+            next_message(&mut client)["params"]["update"]["sessionId"],
+            json!("grandchild"),
+            "the announcement comes before the request it releases"
+        );
+        assert_eq!(next_message(&mut client)["id"], json!(6));
     }
 
     #[test]
