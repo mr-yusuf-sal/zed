@@ -768,6 +768,23 @@ fn create_worktree_in_workspace(
     });
 }
 
+#[derive(Clone)]
+struct DraggedProjectGroup {
+    key: ProjectGroupKey,
+    label: SharedString,
+    ix: usize,
+}
+
+impl Render for DraggedProjectGroup {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .px_2()
+            .py_1()
+            .elevation_2(cx)
+            .child(Label::new(self.label.clone()))
+    }
+}
+
 /// The sidebar re-derives its entire entry list from scratch on every
 /// change via `update_entries` → `rebuild_contents`. Avoid adding
 /// incremental or inter-event coordination state — if something can
@@ -2347,6 +2364,12 @@ impl Sidebar {
 
         let key_for_toggle = key.clone();
         let key_for_focus = key.clone();
+        let key_for_drop = key.clone();
+        let dragged_group = DraggedProjectGroup {
+            key: key.clone(),
+            label: label.clone(),
+            ix,
+        };
 
         let color = cx.theme().colors();
         let sidebar_base_bg = if is_sticky {
@@ -2411,6 +2434,34 @@ impl Sidebar {
             .when(!has_filter, |this| {
                 this.hover(|s| s.bg(color.ghost_element_hover))
                     .group_active(&group_name, |s| s.bg(color.ghost_element_active))
+                    .on_drag(dragged_group, |dragged, _, _, cx| {
+                        cx.new(|_| dragged.clone())
+                    })
+                    .drag_over::<DraggedProjectGroup>(move |style, dragged, _, cx| {
+                        let style = style
+                            .bg(cx.theme().colors().drop_target_background)
+                            .border_color(cx.theme().colors().drop_target_border);
+                        if ix < dragged.ix {
+                            style.border_t_2()
+                        } else if ix > dragged.ix {
+                            style.border_b_2()
+                        } else {
+                            style
+                        }
+                    })
+                    .on_drop(cx.listener(
+                        move |this, dragged: &DraggedProjectGroup, _window, cx| {
+                            if let Some(multi_workspace) = this.multi_workspace.upgrade() {
+                                multi_workspace.update(cx, |multi_workspace, cx| {
+                                    multi_workspace.move_project_group_to(
+                                        &dragged.key,
+                                        &key_for_drop,
+                                        cx,
+                                    );
+                                });
+                            }
+                        },
+                    ))
             })
             .child(
                 h_flex()

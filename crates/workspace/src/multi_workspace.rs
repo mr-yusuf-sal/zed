@@ -929,6 +929,39 @@ impl MultiWorkspace {
         true
     }
 
+    /// Moves the group into the target group's slot, which lands it after the
+    /// target when moving down and before it when moving up.
+    pub fn move_project_group_to(
+        &mut self,
+        key: &ProjectGroupKey,
+        target: &ProjectGroupKey,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(from) = self
+            .project_groups
+            .iter()
+            .position(|group| group.key == *key)
+        else {
+            return false;
+        };
+        let Some(to) = self
+            .project_groups
+            .iter()
+            .position(|group| group.key == *target)
+        else {
+            return false;
+        };
+        if from == to {
+            return false;
+        }
+        let group = self.project_groups.remove(from);
+        self.project_groups.insert(to, group);
+        cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
+        self.serialize(cx);
+        cx.notify();
+        true
+    }
+
     pub fn workspaces_for_project_group(
         &self,
         key: &ProjectGroupKey,
