@@ -435,6 +435,21 @@ impl PickerDelegate for SidebarRecentProjectsDelegate {
                             cx.emit(DismissEvent);
                         })),
                 )
+                .child(
+                    ButtonLike::new("clone_from_remote")
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .gap_1()
+                                .justify_between()
+                                .child(Label::new("Clone from Remote"))
+                                .child(KeyBinding::for_action(&git::Clone, cx)),
+                        )
+                        .on_click(cx.listener(|_, _, window, cx| {
+                            window.dispatch_action(git::Clone.boxed_clone(), cx);
+                            cx.emit(DismissEvent);
+                        })),
+                )
                 .into_any(),
         )
     }

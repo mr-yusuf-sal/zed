@@ -15315,6 +15315,7 @@ dependencies = [
  "fs",
  "futures 0.3.34",
  "fuzzy_nucleo",
+ "git",
  "gpui",
  "http_client",
  "indoc",
