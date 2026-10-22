@@ -725,6 +725,11 @@ impl MessageEditor {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
+        // While following the agent, the files it opens and the selections it
+        // moves are its own, not context the user picked.
+        if workspace.read(cx).is_being_followed(CollaboratorId::Agent) {
+            return;
+        }
         let Some(auto_context) = self.auto_context.as_ref() else {
             return;
         };
@@ -759,6 +764,9 @@ impl MessageEditor {
                 })
                 .collect::<Vec<_>>()
         });
+        // The selection's mention already names its file, so it takes the
+        // file mention's place rather than sitting next to it.
+        let file = file.filter(|_| selection_key.is_none());
 
         let Some(auto_context) = self.auto_context.as_mut() else {
             return;
@@ -789,14 +797,7 @@ impl MessageEditor {
         }
 
         if selection_changed && !selections.is_empty() {
-            // Keep the selection right after the file it was made in.
-            let offset = self
-                .auto_context
-                .as_ref()
-                .and_then(|auto_context| self.auto_mention_end(&auto_context.file.crease_ids, cx))
-                .unwrap_or(0);
-            let crease_ids =
-                self.insert_auto_selection_mention(selections, offset, &workspace, window, cx);
+            let crease_ids = self.insert_auto_selection_mention(selections, &workspace, window, cx);
             if let Some(auto_context) = self.auto_context.as_mut() {
                 auto_context.selection.crease_ids = crease_ids;
             }
@@ -850,7 +851,6 @@ impl MessageEditor {
     fn insert_auto_selection_mention(
         &mut self,
         selections: Vec<(Entity<Buffer>, Range<text::Anchor>)>,
-        offset: usize,
         workspace: &Entity<Workspace>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -869,7 +869,7 @@ impl MessageEditor {
                 )
             })
             .collect::<Vec<_>>();
-        let Some(start) = self.insert_auto_text(offset, placeholder_text, window, cx) else {
+        let Some(start) = self.insert_auto_text(0, placeholder_text, window, cx) else {
             return Vec::new();
         };
 
@@ -915,25 +915,6 @@ impl MessageEditor {
             }
         });
         Some(anchor)
-    }
-
-    /// The offset just past the given mentions and the space that follows
-    /// them, if any of them are still in the message.
-    fn auto_mention_end(&self, crease_ids: &[CreaseId], cx: &App) -> Option<usize> {
-        let editor = self.editor.read(cx);
-        let snapshot = editor.buffer().read(cx).snapshot(cx);
-        let crease_snapshot = editor.display_map.read(cx).crease_snapshot();
-        let end = crease_snapshot
-            .creases()
-            .filter(|(crease_id, _)| crease_ids.contains(crease_id))
-            .map(|(_, crease)| crease.range().end.to_offset(&snapshot))
-            .max()?;
-        let end = if snapshot.chars_at(end).next() == Some(' ') {
-            end + 1usize
-        } else {
-            end
-        };
-        Some(end.0)
     }
 
     fn remove_auto_mentions(&mut self, crease_ids: Vec<CreaseId>, cx: &mut Context<Self>) {
