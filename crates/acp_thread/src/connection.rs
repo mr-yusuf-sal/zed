@@ -248,6 +248,26 @@ pub trait AgentConnection {
     /// Requests cancellation; success does not establish that execution stopped.
     fn cancel(&self, session_id: &acp_v2::SessionId, cx: &mut App) -> Result<()>;
 
+    /// Whether the agent can stop the subagent that does the work of
+    /// `tool_call_id` in `session_id` on its own, leaving the turn running.
+    fn can_stop_subagent(
+        &self,
+        _session_id: &acp_v1::SessionId,
+        _tool_call_id: &acp_v1::ToolCallId,
+    ) -> bool {
+        false
+    }
+
+    /// Asks the agent to stop the subagent that does the work of
+    /// `tool_call_id` in `session_id`, when [`Self::can_stop_subagent`].
+    fn stop_subagent(
+        &self,
+        _session_id: &acp_v1::SessionId,
+        _tool_call_id: &acp_v1::ToolCallId,
+        _cx: &mut App,
+    ) {
+    }
+
     /// Request-scoped elicitations are connection-level because they can arrive before a session
     /// thread exists. Session-scoped elicitations stay in the thread timeline, but use
     /// `ElicitationStore` for shared processing.
