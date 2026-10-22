@@ -4428,8 +4428,12 @@ impl ThreadView {
             .collect()
     }
 
-    /// Subagent launches still running, with how many tool calls each has made.
-    fn running_subagents(&self, cx: &App) -> Vec<(usize, SharedString, usize)> {
+    /// Subagent launches still running, with how many tool calls each has
+    /// made, and the tool call to stop each by when the agent can stop it alone.
+    fn running_subagents(
+        &self,
+        cx: &App,
+    ) -> Vec<(usize, SharedString, usize, Option<acp_v1::ToolCallId>)> {
         let thread = self.thread.read(cx);
         let entries = thread.entries();
         entries
@@ -4468,7 +4472,15 @@ impl ThreadView {
                             if self.subagent_parent_id(child).as_ref() == Some(&tool_call.id))
                     })
                     .count();
-                Some((entry_ix, label.into(), tool_call_count))
+                let stoppable_tool_call_id = thread
+                    .can_stop_subagent(&tool_call.id)
+                    .then(|| tool_call.id.clone());
+                Some((
+                    entry_ix,
+                    label.into(),
+                    tool_call_count,
+                    stoppable_tool_call_id,
+                ))
             })
             .collect()
     }
@@ -4499,6 +4511,7 @@ impl ThreadView {
             IconName::Thread
         };
         let this = cx.weak_entity();
+        let thread = self.thread.clone();
 
         Some(
             PopoverMenu::new("running-work-menu")
@@ -4518,7 +4531,11 @@ impl ThreadView {
                     let subagents = subagents.clone();
                     let processes = processes.clone();
                     let this = this.clone();
+                    let thread = thread.clone();
                     Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                        // An entry's end slot is only shown when the menu has
+                        // an end slot action.
+                        menu = menu.end_slot_action(Box::new(menu::EndSlot));
                         let scroll_to = |entry_ix: usize| {
                             let this = this.clone();
                             move |_: &mut Window, cx: &mut App| {
@@ -4534,17 +4551,37 @@ impl ThreadView {
                         };
                         if !subagents.is_empty() {
                             menu = menu.header("Subagents");
-                            for (entry_ix, label, tool_call_count) in &subagents {
+                            for (entry_ix, label, tool_call_count, stoppable_tool_call_id) in
+                                &subagents
+                            {
                                 let label = format!(
                                     "{label} · {tool_call_count} {}",
                                     pluralize("tool call", *tool_call_count)
                                 );
-                                menu = menu.item(
-                                    ContextMenuEntry::new(label)
-                                        .icon(IconName::Thread)
-                                        .icon_color(Color::Muted)
-                                        .handler(scroll_to(*entry_ix)),
-                                );
+                                menu = match stoppable_tool_call_id {
+                                    Some(tool_call_id) => menu.entry_with_end_slot(
+                                        label,
+                                        None,
+                                        scroll_to(*entry_ix),
+                                        IconName::Stop,
+                                        "Stop Subagent".into(),
+                                        {
+                                            let thread = thread.clone();
+                                            let tool_call_id = tool_call_id.clone();
+                                            move |_, cx| {
+                                                thread.update(cx, |thread, cx| {
+                                                    thread.stop_subagent(&tool_call_id, cx)
+                                                });
+                                            }
+                                        },
+                                    ),
+                                    None => menu.item(
+                                        ContextMenuEntry::new(label)
+                                            .icon(IconName::Thread)
+                                            .icon_color(Color::Muted)
+                                            .handler(scroll_to(*entry_ix)),
+                                    ),
+                                };
                             }
                         }
                         if !processes.is_empty() {

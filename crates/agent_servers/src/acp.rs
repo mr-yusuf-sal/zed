@@ -116,7 +116,7 @@ struct ClientContext {
     sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
     session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>>,
     request_elicitations: Entity<ElicitationStore>,
-    subagents: RefCell<HashMap<acp::SessionId, SubagentSession>>,
+    subagents: Rc<RefCell<HashMap<acp::SessionId, SubagentSession>>>,
 }
 
 /// A session that the agent runs a subagent in, as its `subagent_update`s
@@ -129,6 +129,9 @@ struct SubagentSession {
     /// it, or the last one that sent it a message and so resumed it.
     tool_call_id: Option<acp::ToolCallId>,
     running: bool,
+    /// Whether the agent stops the subagent alone when it gets the
+    /// subagent's session in `session/cancel`.
+    cancellable: bool,
 }
 
 fn dispatch_queue_closed_error() -> acp::Error {
@@ -288,6 +291,7 @@ pub struct AcpConnection {
     connection: ConnectionTo<Agent>,
     sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
     pending_sessions: RefCell<HashMap<acp::SessionId, PendingAcpSession>>,
+    subagents: Rc<RefCell<HashMap<acp::SessionId, SubagentSession>>>,
     auth_methods: Vec<acp_v2::AuthMethod>,
     agent_server_store: WeakEntity<AgentServerStore>,
     agent_capabilities: acp::AgentCapabilities,
@@ -852,6 +856,25 @@ fn session_update_kind(message: &UntypedMessage) -> Option<&str> {
 }
 
 impl AcpConnection {
+    /// The session of the running subagent that does the work of
+    /// `tool_call_id` in `session_id`, when the agent stops it on its own.
+    fn cancellable_subagent(
+        &self,
+        session_id: &acp::SessionId,
+        tool_call_id: &acp::ToolCallId,
+    ) -> Option<acp::SessionId> {
+        let subagents = self.subagents.borrow();
+        subagents
+            .iter()
+            .find(|(subagent_id, subagent)| {
+                subagent.running
+                    && subagent.cancellable
+                    && subagent.tool_call_id.as_ref() == Some(tool_call_id)
+                    && root_subagent_session(&subagents, subagent_id) == *session_id
+            })
+            .map(|(subagent_id, _)| subagent_id.clone())
+    }
+
     pub fn subscribe_debug_messages(
         &self,
     ) -> (
@@ -895,6 +918,7 @@ impl AcpConnection {
         let client_session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>> =
             Rc::new(RefCell::new(None));
         let request_elicitations = cx.new(|_| ElicitationStore::default());
+        let subagents = Rc::new(RefCell::new(HashMap::default()));
 
         // Set up the foreground dispatch channel for bridging Send handler
         // closures to the !Send foreground thread.
@@ -945,7 +969,7 @@ impl AcpConnection {
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
-            subagents: RefCell::default(),
+            subagents: subagents.clone(),
         };
         let dispatch_task = cx.spawn({
             let mut dispatch_rx = dispatch_rx;
@@ -1108,6 +1132,7 @@ impl AcpConnection {
             agent_version,
             sessions,
             pending_sessions: RefCell::new(HashMap::default()),
+            subagents,
             agent_capabilities: response.agent_capabilities,
             request_elicitations,
             defaults,
@@ -1133,6 +1158,7 @@ impl AcpConnection {
     fn new_for_test(
         connection: ConnectionTo<Agent>,
         sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
+        subagents: Rc<RefCell<HashMap<acp::SessionId, SubagentSession>>>,
         agent_capabilities: acp::AgentCapabilities,
         request_elicitations: Entity<ElicitationStore>,
         agent_server_store: WeakEntity<AgentServerStore>,
@@ -1152,6 +1178,7 @@ impl AcpConnection {
             connection,
             sessions,
             pending_sessions: RefCell::new(HashMap::default()),
+            subagents,
             auth_methods: vec![],
             agent_server_store,
             agent_capabilities,
@@ -2082,6 +2109,28 @@ impl AgentConnection for AcpConnection {
         self.connection.send_notification(params).log_err();
     }
 
+    fn can_stop_subagent(
+        &self,
+        session_id: &acp::SessionId,
+        tool_call_id: &acp::ToolCallId,
+    ) -> bool {
+        self.cancellable_subagent(session_id, tool_call_id)
+            .is_some()
+    }
+
+    fn stop_subagent(
+        &self,
+        session_id: &acp::SessionId,
+        tool_call_id: &acp::ToolCallId,
+        _cx: &mut App,
+    ) {
+        if let Some(subagent_id) = self.cancellable_subagent(session_id, tool_call_id) {
+            self.connection
+                .send_notification(acp::CancelNotification::new(subagent_id))
+                .log_err();
+        }
+    }
+
     fn request_elicitations(&self) -> Option<Entity<ElicitationStore>> {
         Some(self.request_elicitations.clone())
     }
@@ -2415,6 +2464,23 @@ pub mod test_support {
             self.inner.cancel(session_id, cx)
         }
 
+        fn can_stop_subagent(
+            &self,
+            session_id: &acp::SessionId,
+            tool_call_id: &acp::ToolCallId,
+        ) -> bool {
+            self.inner.can_stop_subagent(session_id, tool_call_id)
+        }
+
+        fn stop_subagent(
+            &self,
+            session_id: &acp::SessionId,
+            tool_call_id: &acp::ToolCallId,
+            cx: &mut App,
+        ) {
+            self.inner.stop_subagent(session_id, tool_call_id, cx)
+        }
+
         fn request_elicitations(&self) -> Option<Entity<ElicitationStore>> {
             self.inner.request_elicitations()
         }
@@ -2635,11 +2701,12 @@ pub mod test_support {
         let auth_methods = acp_thread::auth_methods::from_v1(response.auth_methods)?;
 
         let request_elicitations = cx.new(|_| ElicitationStore::default());
+        let subagents = Rc::new(RefCell::new(HashMap::default()));
         let dispatch_context = ClientContext {
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
-            subagents: RefCell::default(),
+            subagents: subagents.clone(),
         };
         let dispatch_task = cx.spawn({
             let mut dispatch_rx = dispatch_rx;
@@ -2657,6 +2724,7 @@ pub mod test_support {
             AcpConnection::new_for_test(
                 client_conn,
                 sessions,
+                subagents,
                 agent_capabilities,
                 request_elicitations,
                 agent_server_store,
@@ -4894,6 +4962,7 @@ mod tests {
             AcpConnection::new_for_test(
                 client_conn,
                 sessions,
+                Rc::default(),
                 acp::AgentCapabilities::default(),
                 request_elicitations,
                 WeakEntity::new_invalid(),
@@ -5219,12 +5288,13 @@ exit 7
         Arc<std::sync::Mutex<Option<async_channel::Receiver<()>>>>,
         Task<anyhow::Result<()>>,
     ) {
-        connect_fake_agent_with_handle(close_session_gate, None, cx).await
+        connect_fake_agent_with_handle(close_session_gate, None, Arc::default(), cx).await
     }
 
     async fn connect_fake_agent_with_handle(
         close_session_gate: Option<async_channel::Receiver<()>>,
         agent_sender: Option<futures::channel::oneshot::Sender<ConnectionTo<Client>>>,
+        cancelled_sessions: Arc<std::sync::Mutex<Vec<acp::SessionId>>>,
         cx: &mut gpui::TestAppContext,
     ) -> (
         Rc<AcpConnection>,
@@ -5355,7 +5425,16 @@ exit 7
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_notification(
-                async move |_notif: acp::CancelNotification, _cx| Ok(()),
+                {
+                    let cancelled_sessions = cancelled_sessions.clone();
+                    async move |notification: acp::CancelNotification, _cx| {
+                        cancelled_sessions
+                            .lock()
+                            .expect("cancelled sessions lock should not be poisoned")
+                            .push(notification.session_id);
+                        Ok(())
+                    }
+                },
                 agent_client_protocol::on_receive_notification!(),
             )
             .connect_with(agent_transport, async move |agent| {
@@ -5400,11 +5479,12 @@ exit 7
         let agent_capabilities = response.agent_capabilities;
 
         let request_elicitations = cx.new(|_| ElicitationStore::default());
+        let subagents = Rc::new(RefCell::new(HashMap::default()));
         let dispatch_context = ClientContext {
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
-            subagents: RefCell::default(),
+            subagents: subagents.clone(),
         };
         // `TestAppContext::spawn` hands out an `AsyncApp` by value, whereas the
         // production path uses `Context::spawn` which hands out `&mut AsyncApp`.
@@ -5427,6 +5507,7 @@ exit 7
             AcpConnection::new_for_test(
                 client_conn,
                 sessions,
+                subagents,
                 agent_capabilities,
                 request_elicitations,
                 agent_server_store,
@@ -5459,7 +5540,7 @@ exit 7
     ) {
         let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
         let (connection, project, _, _, _, _, _keep_agent_alive) =
-            connect_fake_agent_with_handle(None, Some(agent_sender), cx).await;
+            connect_fake_agent_with_handle(None, Some(agent_sender), Arc::default(), cx).await;
         let agent = agent_receiver.await.expect("fake agent handle");
         let session_id = acp::SessionId::new("permission-session");
         let thread = cx
@@ -5861,7 +5942,7 @@ exit 7
     async fn test_subagent_sessions_show_in_their_parent_session(cx: &mut gpui::TestAppContext) {
         let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
         let (connection, project, _, _, _, _, _keep_agent_alive) =
-            connect_fake_agent_with_handle(None, Some(agent_sender), cx).await;
+            connect_fake_agent_with_handle(None, Some(agent_sender), Arc::default(), cx).await;
         let agent = agent_receiver.await.expect("receive fake agent handle");
 
         let session_id = acp::SessionId::new("parent");
@@ -5942,6 +6023,10 @@ exit 7
                 thread.is_subagent_running(&launch_id),
                 "the subagent outlives its completed launch"
             );
+            assert!(
+                !thread.can_stop_subagent(&launch_id),
+                "the announcement did not offer to cancel the subagent"
+            );
             let parent_tool_use_ids = thread
                 .entries()
                 .iter()
@@ -5968,6 +6053,118 @@ exit 7
         cx.run_until_parked();
         thread.read_with(cx, |thread, _| {
             assert!(!thread.is_subagent_running(&launch_id));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_stopping_a_subagent_cancels_only_its_session(cx: &mut gpui::TestAppContext) {
+        let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
+        let cancelled_sessions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (connection, project, _, _, _, _, _keep_agent_alive) = connect_fake_agent_with_handle(
+            None,
+            Some(agent_sender),
+            cancelled_sessions.clone(),
+            cx,
+        )
+        .await;
+        let agent = agent_receiver.await.expect("receive fake agent handle");
+
+        let thread = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    acp::SessionId::new("parent"),
+                    project,
+                    util::path_list::PathList::new(&[std::path::Path::new("/a")]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("session should load");
+
+        let launch_id = acp::ToolCallId::new("launch");
+        let send_update = |session_id: &str, update: serde_json::Value| {
+            agent
+                .send_notification(
+                    UntypedMessage::new(
+                        "session/update",
+                        serde_json::json!({ "sessionId": session_id, "update": update }),
+                    )
+                    .expect("build session update"),
+                )
+                .expect("send session update");
+        };
+        send_update(
+            "parent",
+            serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "launch",
+                "title": "Agent",
+                "status": "in_progress",
+                "_meta": { "claudeCode": { "toolName": "Agent" } },
+            }),
+        );
+        send_update(
+            "parent",
+            serde_json::json!({
+                "sessionUpdate": "subagent_update",
+                "sessionId": "child",
+                "title": "general-purpose",
+                "capabilities": { "cancel": {} },
+                "state": { "state": "running" },
+            }),
+        );
+        send_update(
+            "child",
+            serde_json::json!({
+                "sessionUpdate": "session_message",
+                "messageId": "launch",
+                "senderSessionId": "parent",
+                "recipientSessionId": "child",
+                "content": [{ "type": "text", "text": "Look around" }],
+            }),
+        );
+        send_update(
+            "parent",
+            serde_json::json!({
+                "sessionUpdate": "subagent_update",
+                "sessionId": "child",
+                "state": { "state": "requires_action" },
+            }),
+        );
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _| {
+            assert!(thread.is_subagent_running(&launch_id));
+            assert!(
+                thread.can_stop_subagent(&launch_id),
+                "an update without capabilities keeps the announced cancel"
+            );
+            assert!(!thread.can_stop_subagent(&acp::ToolCallId::new("other")));
+        });
+
+        thread.update(cx, |thread, cx| thread.stop_subagent(&launch_id, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            *cancelled_sessions
+                .lock()
+                .expect("cancelled sessions lock should not be poisoned"),
+            vec![acp::SessionId::new("child")],
+            "only the subagent's session is cancelled, not its parent's"
+        );
+
+        send_update(
+            "parent",
+            serde_json::json!({
+                "sessionUpdate": "subagent_update",
+                "sessionId": "child",
+                "state": { "state": "idle", "stopReason": "cancelled" },
+            }),
+        );
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, _| {
+            assert!(!thread.is_subagent_running(&launch_id));
+            assert!(!thread.can_stop_subagent(&launch_id));
         });
     }
 
@@ -6962,7 +7159,13 @@ fn handle_read_text_file(
 /// The session that `session_id` runs a subagent of, following nested
 /// subagents up, or `session_id` itself when it is no subagent's.
 fn root_session_id(ctx: &ClientContext, session_id: &acp::SessionId) -> acp::SessionId {
-    let subagents = ctx.subagents.borrow();
+    root_subagent_session(&ctx.subagents.borrow(), session_id)
+}
+
+fn root_subagent_session(
+    subagents: &HashMap<acp::SessionId, SubagentSession>,
+    session_id: &acp::SessionId,
+) -> acp::SessionId {
     let mut session_id = session_id;
     // Bounded, so that a parent cycle in what the agent sent cannot hang Zed.
     for _ in 0..subagents.len() {
@@ -7009,7 +7212,12 @@ fn handle_subagent_notification(message: UntypedMessage, cx: &mut AsyncApp, ctx:
                             parent_session_id: session_id,
                             tool_call_id: None,
                             running: false,
+                            cancellable: false,
                         });
+                // Only the announcement lists the capabilities.
+                if let Some(capabilities) = update.get("capabilities") {
+                    subagent.cancellable = capabilities.get("cancel").is_some();
+                }
                 if let Some(running) = running {
                     subagent.running = running;
                 }

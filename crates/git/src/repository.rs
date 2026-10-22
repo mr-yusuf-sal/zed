@@ -649,6 +649,16 @@ async fn is_shallow_boundary_commit(
         .any(|line| line.trim() == oid.trim()))
 }
 
+/// Splits an `older..newer` revision range into its two ends. Symmetric `...`
+/// ranges and ranges with an implied `HEAD` end are not split.
+fn split_revision_range(revision: &str) -> Option<(&str, &str)> {
+    let (older, newer) = revision.split_once("..")?;
+    if older.is_empty() || newer.is_empty() || newer.starts_with('.') {
+        return None;
+    }
+    Some((older, newer))
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Remote {
     pub name: SharedString,
@@ -918,6 +928,9 @@ pub trait GitRepository: Send + Sync {
 
     fn show(&self, commit: String) -> BoxFuture<'_, Result<CommitDetails>>;
 
+    /// Loads the files `commit` changed against its first parent, or, when `commit`
+    /// is an `older..newer` range, the files whose contents differ between the two
+    /// commits regardless of the history between them.
     fn load_commit(
         &self,
         commit: String,
@@ -1464,7 +1477,11 @@ impl GitRepository for RealGitRepository {
         let git = self.git_binary();
         let shallow_file_path = self.common_dir.join("shallow");
         cx.background_spawn(async move {
+            let revision_range = split_revision_range(&commit);
+            // A range is diffed tree to tree, so history missing behind either end
+            // does not matter, and `rev-parse` cannot resolve a range to one commit.
             if !ignore_shallow_boundary
+                && revision_range.is_none()
                 && is_shallow_boundary_commit(&git, &shallow_file_path, &commit).await?
             {
                 return Ok(CommitDiff {
@@ -1473,27 +1490,46 @@ impl GitRepository for RealGitRepository {
                 });
             }
 
-            let show_output = git
-                .build_command(&[
+            // `git show` on a range prints the changes of every commit in it one
+            // after another instead of the difference between its two ends.
+            let (subcommand, mut command) = match revision_range {
+                Some((older, newer)) => (
+                    "diff",
+                    git.build_command(&[
+                        "diff",
+                        "-z",
+                        "--no-renames",
+                        "--raw",
+                        "--no-abbrev",
+                        older,
+                        newer,
+                    ]),
+                ),
+                None => (
                     "show",
-                    "--format=",
-                    "-z",
-                    "--no-renames",
-                    "--raw",
-                    "--no-abbrev",
-                    "--first-parent",
-                ])
-                .arg(&commit)
+                    git.build_command(&[
+                        "show",
+                        "--format=",
+                        "-z",
+                        "--no-renames",
+                        "--raw",
+                        "--no-abbrev",
+                        "--first-parent",
+                        commit.as_str(),
+                    ]),
+                ),
+            };
+            let show_output = command
                 .arg("--")
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .output()
                 .await
-                .context("starting git show process")?;
+                .with_context(|| format!("starting git {subcommand} process"))?;
             anyhow::ensure!(
                 show_output.status.success(),
-                "git show failed: {}",
+                "git {subcommand} failed: {}",
                 String::from_utf8_lossy(&show_output.stderr)
             );
 
@@ -4933,6 +4969,117 @@ mod tests {
             .expect("failed to load root commit");
         assert!(!commit_diff.is_shallow_boundary);
         assert_eq!(commit_diff.files.len(), 1);
+    }
+
+    #[test]
+    fn test_split_revision_range() {
+        assert_eq!(split_revision_range("abc..def"), Some(("abc", "def")));
+        assert_eq!(
+            split_revision_range("HEAD~2..main"),
+            Some(("HEAD~2", "main"))
+        );
+        assert_eq!(split_revision_range("abc...def"), None);
+        assert_eq!(split_revision_range("abc.."), None);
+        assert_eq!(split_revision_range("..def"), None);
+        assert_eq!(split_revision_range("HEAD"), None);
+    }
+
+    #[gpui::test]
+    async fn test_load_commit_range(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let source_dir = tempfile::tempdir().expect("failed to create source repository");
+        git_init_repo(source_dir.path());
+        fs::write(source_dir.path().join("a.txt"), "one\n").expect("failed to write a.txt");
+        git_command(source_dir.path(), ["add", "a.txt"]);
+        git_command(source_dir.path(), ["commit", "-m", "first"]);
+        fs::write(source_dir.path().join("a.txt"), "two\n").expect("failed to update a.txt");
+        fs::write(source_dir.path().join("b.txt"), "temporary\n").expect("failed to write b.txt");
+        git_command(source_dir.path(), ["add", "a.txt", "b.txt"]);
+        git_command(source_dir.path(), ["commit", "-m", "second"]);
+        fs::write(source_dir.path().join("a.txt"), "three\n").expect("failed to update a.txt");
+        fs::write(source_dir.path().join("c.txt"), "new\n").expect("failed to write c.txt");
+        git_command(source_dir.path(), ["rm", "--quiet", "b.txt"]);
+        git_command(source_dir.path(), ["add", "a.txt", "c.txt"]);
+        git_command(source_dir.path(), ["commit", "-m", "third"]);
+        let first = git_command_output(source_dir.path(), ["rev-parse", "HEAD~2"]);
+        let second = git_command_output(source_dir.path(), ["rev-parse", "HEAD~1"]);
+        let third = git_command_output(source_dir.path(), ["rev-parse", "HEAD"]);
+
+        let file_contents = |commit_diff: &CommitDiff| {
+            commit_diff
+                .files
+                .iter()
+                .map(|file| {
+                    (
+                        file.path.as_unix_str().to_owned(),
+                        file.old_content.clone(),
+                        file.new_content.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let source_repository = RealGitRepository::new(
+            &source_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .expect("failed to open source repository");
+        let commit_diff = source_repository
+            .load_commit(format!("{first}..{third}"), false, cx.to_async())
+            .await
+            .expect("failed to load commit range");
+        assert!(!commit_diff.is_shallow_boundary);
+        assert_eq!(
+            file_contents(&commit_diff),
+            vec![
+                (
+                    "a.txt".to_string(),
+                    Some(b"one\n".to_vec()),
+                    Some(b"three\n".to_vec())
+                ),
+                ("c.txt".to_string(), None, Some(b"new\n".to_vec())),
+            ],
+            "a range compares its two ends, so a file added and removed in between is not listed"
+        );
+
+        let clone_dir = tempfile::tempdir().expect("failed to create clone directory");
+        git_command(
+            clone_dir.path(),
+            [
+                "clone".to_string(),
+                "--depth=2".to_string(),
+                format!("file://{}", source_dir.path().display()),
+                "shallow".to_string(),
+            ],
+        );
+        let shallow_repository = RealGitRepository::new(
+            &clone_dir.path().join("shallow").join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .expect("failed to open shallow repository");
+        let commit_diff = shallow_repository
+            .load_commit(format!("{second}..{third}"), false, cx.to_async())
+            .await
+            .expect("failed to load a range that starts at the shallow boundary");
+        assert!(!commit_diff.is_shallow_boundary);
+        assert_eq!(
+            file_contents(&commit_diff),
+            vec![
+                (
+                    "a.txt".to_string(),
+                    Some(b"two\n".to_vec()),
+                    Some(b"three\n".to_vec())
+                ),
+                ("b.txt".to_string(), Some(b"temporary\n".to_vec()), None),
+                ("c.txt".to_string(), None, Some(b"new\n".to_vec())),
+            ]
+        );
     }
 
     #[gpui::test]

@@ -8,7 +8,7 @@ use crate::{
     commit_view::CommitView,
     create_branch_at_commit, git_status_icon,
 };
-use collections::{BTreeMap, HashMap, IndexSet};
+use collections::{BTreeMap, BTreeSet, HashMap, IndexSet};
 use db::kvp::KeyValueStore;
 use editor::Editor;
 use file_icons::FileIcons;
@@ -40,7 +40,7 @@ use project::{
 use smallvec::{SmallVec, smallvec};
 use std::{
     cell::Cell,
-    ops::{Range, RangeInclusive},
+    ops::Range,
     rc::Rc,
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
@@ -1518,6 +1518,23 @@ impl RefMenuEntry {
     }
 }
 
+/// A cheap copy of the selection for render closures that outlive `&self`.
+#[derive(Clone)]
+struct SelectedRows {
+    cursor: Option<usize>,
+    rows: Rc<BTreeSet<usize>>,
+}
+
+impl SelectedRows {
+    fn contains(&self, idx: usize) -> bool {
+        if self.rows.is_empty() {
+            self.cursor == Some(idx)
+        } else {
+            self.rows.contains(&idx)
+        }
+    }
+}
+
 struct DetailPanelCommitMessage {
     sha: Oid,
     message: Entity<Markdown>,
@@ -1537,10 +1554,13 @@ pub struct GitGraph {
     /// hidden regardless of whether the table is resizable. `true` means the column is hidden.
     column_visibility: TableRow<bool>,
     selected_entry_idx: Option<usize>,
-    /// The row a shift-extended selection started from. The selection is the
-    /// contiguous range between this and `selected_entry_idx`, which stays the
-    /// row the cursor is on; `None` means only `selected_entry_idx` is selected.
+    /// The row a shift-extended range starts from: the row the cursor was on
+    /// when the range was first extended, or the row last ctrl-clicked.
     selection_anchor_idx: Option<usize>,
+    /// Every selected row once more than one is selected. Empty means only
+    /// `selected_entry_idx` is selected, which keeps the single-commit code
+    /// paths untouched; otherwise the cursor is always one of these rows.
+    multi_selected_idxs: Rc<BTreeSet<usize>>,
     hovered_entry_idx: Option<usize>,
     graph_canvas_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     log_source: LogSource,
@@ -1570,6 +1590,7 @@ impl GitGraph {
     fn invalidate_state(&mut self, cx: &mut Context<Self>) {
         self.graph_data.clear();
         self.selection_anchor_idx = None;
+        self.multi_selected_idxs = Rc::default();
         self.search_state.matches.clear();
         self.search_state.selected_index = None;
         self.search_state.state.next_state();
@@ -1808,6 +1829,7 @@ impl GitGraph {
             column_visibility,
             selected_entry_idx: None,
             selection_anchor_idx: None,
+            multi_selected_idxs: Rc::default(),
             hovered_entry_idx: None,
             graph_canvas_bounds: Rc::new(Cell::new(None)),
             selected_commit_diff: None,
@@ -2364,9 +2386,7 @@ impl GitGraph {
                     author_email = None;
                 }
 
-                let is_selected = self
-                    .selected_range()
-                    .is_some_and(|range| range.contains(&idx));
+                let is_selected = self.selected_rows().contains(idx);
                 let is_matched = self.search_state.matches.contains(&commit.data.sha);
                 let column_label = |label: SharedString| {
                     Label::new(label)
@@ -2450,6 +2470,7 @@ impl GitGraph {
     fn clear_selection(&mut self, cx: &mut Context<Self>) {
         self.selected_entry_idx = None;
         self.selection_anchor_idx = None;
+        self.multi_selected_idxs = Rc::default();
         self.selected_commit_diff = None;
         self.selected_commit_diff_stats = None;
         self.selected_commit_message = None;
@@ -2460,18 +2481,37 @@ impl GitGraph {
         cx.notify();
     }
 
-    /// The selected rows, clamped to the loaded commits because the anchor is
-    /// an index and the graph can reload with fewer rows under it.
-    fn selected_range(&self) -> Option<RangeInclusive<usize>> {
-        let cursor = self.selected_entry_idx?;
-        let anchor = self.selection_anchor_idx.unwrap_or(cursor);
-        let last_idx = self.graph_data.commits.len().checked_sub(1)?;
-        Some(anchor.min(cursor).min(last_idx)..=anchor.max(cursor).min(last_idx))
+    fn selected_rows(&self) -> SelectedRows {
+        SelectedRows {
+            cursor: self.selected_entry_idx,
+            rows: self.multi_selected_idxs.clone(),
+        }
+    }
+
+    /// The selected rows in graph order, newest first. Rows past the end of the
+    /// loaded commits are dropped because the selection is kept as indices and
+    /// the graph can reload with fewer rows under it.
+    fn selected_indices(&self) -> Vec<usize> {
+        let commit_count = self.graph_data.commits.len();
+        if self.multi_selected_idxs.is_empty() {
+            return self
+                .selected_entry_idx
+                .filter(|idx| *idx < commit_count)
+                .into_iter()
+                .collect();
+        }
+        self.multi_selected_idxs
+            .iter()
+            .copied()
+            .take_while(|idx| *idx < commit_count)
+            .collect()
     }
 
     fn selected_commit_count(&self) -> usize {
-        self.selected_range()
-            .map_or(0, |range| range.end() - range.start() + 1)
+        if self.multi_selected_idxs.is_empty() {
+            return self.selected_entry_idx.is_some() as usize;
+        }
+        self.multi_selected_idxs.len()
     }
 
     fn extend_selection_up(
@@ -2503,16 +2543,62 @@ impl GitGraph {
         self.extend_selection((cursor + 1).min(last_idx), ScrollStrategy::Nearest, cx);
     }
 
+    /// Selects the contiguous range from the anchor to `idx`, replacing any
+    /// other selected rows, the way shift-click does in a file list.
     fn extend_selection(
         &mut self,
         idx: usize,
         scroll_strategy: ScrollStrategy,
         cx: &mut Context<Self>,
     ) {
-        if self.selection_anchor_idx.is_none() {
-            self.selection_anchor_idx = Some(self.selected_entry_idx.unwrap_or(idx));
-        }
+        let anchor = *self
+            .selection_anchor_idx
+            .get_or_insert(self.selected_entry_idx.unwrap_or(idx));
+        self.multi_selected_idxs = if anchor == idx {
+            Rc::default()
+        } else {
+            Rc::new((anchor.min(idx)..=anchor.max(idx)).collect())
+        };
         self.move_selection_cursor(idx, scroll_strategy, cx);
+        cx.notify();
+    }
+
+    /// Adds `idx` to the selection or removes it, the way ctrl-click does in a
+    /// file list. The toggled row becomes the anchor for a following shift-click.
+    fn toggle_selection(
+        &mut self,
+        idx: usize,
+        scroll_strategy: ScrollStrategy,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(cursor) = self.selected_entry_idx else {
+            self.select_entry(idx, scroll_strategy, cx);
+            return;
+        };
+
+        let rows = Rc::make_mut(&mut self.multi_selected_idxs);
+        if rows.is_empty() {
+            rows.insert(cursor);
+        }
+        let cursor_target = if rows.remove(&idx) {
+            if cursor == idx {
+                rows.iter().next_back().copied()
+            } else {
+                Some(cursor)
+            }
+        } else {
+            rows.insert(idx);
+            Some(idx)
+        };
+        if rows.len() <= 1 {
+            rows.clear();
+        }
+        self.selection_anchor_idx = Some(idx);
+
+        match cursor_target {
+            Some(cursor_target) => self.move_selection_cursor(cursor_target, scroll_strategy, cx),
+            None => self.clear_selection(cx),
+        }
         cx.notify();
     }
 
@@ -2703,7 +2789,9 @@ impl GitGraph {
         scroll_strategy: ScrollStrategy,
         cx: &mut Context<Self>,
     ) {
-        if self.selection_anchor_idx.take().is_some() {
+        self.selection_anchor_idx = None;
+        if !self.multi_selected_idxs.is_empty() {
+            self.multi_selected_idxs = Rc::default();
             cx.notify();
         }
         self.move_selection_cursor(idx, scroll_strategy, cx);
@@ -3114,9 +3202,7 @@ impl GitGraph {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let right_clicked_inside_selection = self
-            .selected_range()
-            .is_some_and(|range| range.contains(&index));
+        let right_clicked_inside_selection = self.selected_rows().contains(index);
         if right_clicked_inside_selection && self.selected_commit_count() > 1 {
             self.deploy_multi_selection_context_menu(position, index, window, cx);
             return;
@@ -3521,14 +3607,36 @@ impl GitGraph {
 
     /// The selected commits in graph order, newest first.
     fn selected_commit_shas(&self) -> Vec<Oid> {
-        self.selected_range()
-            .map(|range| {
-                range
-                    .filter_map(|idx| self.graph_data.commits.get(idx))
-                    .map(|commit| commit.data.sha)
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.selected_indices()
+            .into_iter()
+            .filter_map(|idx| self.graph_data.commits.get(idx))
+            .map(|commit| commit.data.sha)
+            .collect()
+    }
+
+    /// The two selected commits as `(older, newer)`, when exactly two are selected.
+    fn selected_comparison(&self) -> Option<(Oid, Oid)> {
+        match self.selected_commit_shas().as_slice() {
+            [newer, older] => Some((*older, *newer)),
+            _ => None,
+        }
+    }
+
+    fn compare_selected_commits(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((older, newer)) = self.selected_comparison() else {
+            return;
+        };
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        CommitView::open_comparison(
+            older.to_string(),
+            newer.to_string(),
+            repository.downgrade(),
+            self.workspace.clone(),
+            window,
+            cx,
+        );
     }
 
     fn render_multi_selection_panel(
@@ -3539,11 +3647,15 @@ impl GitGraph {
         let Some(repository) = self.get_repository(cx) else {
             return Empty.into_any_element();
         };
-        let Some(first_selected_idx) = self.selected_range().map(|range| *range.start()) else {
-            return Empty.into_any_element();
-        };
-        let shas = Rc::new(self.selected_commit_shas());
+        let selected_indices = self.selected_indices();
+        let shas = Rc::new(
+            selected_indices
+                .iter()
+                .filter_map(|idx| Some((*idx, self.graph_data.commits.get(*idx)?.data.sha)))
+                .collect::<Vec<_>>(),
+        );
         let commit_count = shas.len();
+        let can_compare = commit_count == 2;
 
         let header = h_flex()
             .w_full()
@@ -3568,6 +3680,25 @@ impl GitGraph {
             .pb_2()
             .gap_1()
             .flex_wrap()
+            .child(
+                Button::new("compare-selection", "Compare")
+                    .start_icon(
+                        Icon::new(IconName::Diff)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .style(ButtonStyle::OutlinedGhost)
+                    .label_size(LabelSize::Small)
+                    .disabled(!can_compare)
+                    .tooltip(Tooltip::text(if can_compare {
+                        "Show what changed from the older commit to the newer one"
+                    } else {
+                        "Select exactly two commits to compare them"
+                    }))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.compare_selected_commits(window, cx);
+                    })),
+            )
             .child(
                 Button::new("cherry-pick-selection", "Cherry-pick")
                     .start_icon(
@@ -3621,7 +3752,7 @@ impl GitGraph {
             move |range, _window, cx| {
                 range
                     .filter_map(|ix| {
-                        let sha = *shas.get(ix)?;
+                        let (graph_idx, sha) = *shas.get(ix)?;
                         let subject: SharedString = match repository.update(cx, |repository, cx| {
                             repository.fetch_commit_data(sha, false, cx).clone()
                         }) {
@@ -3651,7 +3782,7 @@ impl GitGraph {
                                     git_graph
                                         .update(cx, |this, cx| {
                                             this.select_entry(
-                                                first_selected_idx + ix,
+                                                graph_idx,
                                                 ScrollStrategy::Nearest,
                                                 cx,
                                             );
@@ -3985,9 +4116,20 @@ impl GitGraph {
         cx: &mut Context<Self>,
     ) {
         let commit_count = self.selected_commit_count();
+        let can_compare = self.selected_comparison().is_some();
         let git_graph = cx.entity();
         let context_menu = ContextMenu::build(window, cx, move |menu, window, _| {
             menu.header(format!("{commit_count} Commits"))
+                .when(can_compare, |menu| {
+                    menu.entry(
+                        "Compare Commits",
+                        None,
+                        window.handler_for(&git_graph, |this, window, cx| {
+                            this.compare_selected_commits(window, cx);
+                        }),
+                    )
+                    .separator()
+                })
                 .entry(
                     format!("Cherry-pick {commit_count} Commits"),
                     None,
@@ -4608,7 +4750,7 @@ impl GitGraph {
         let mut lines: BTreeMap<usize, Vec<_>> = BTreeMap::new();
 
         let hovered_entry_idx = self.hovered_entry_idx;
-        let selected_range = self.selected_range();
+        let selected_rows = self.selected_rows();
         let context_menu_target_index = self
             .context_menu
             .as_ref()
@@ -4636,9 +4778,7 @@ impl GitGraph {
                     for visible_row_idx in 0..rows.len() {
                         let absolute_row_idx = first_visible_row + visible_row_idx;
                         let is_hovered = hovered_entry_idx == Some(absolute_row_idx);
-                        let is_selected = selected_range
-                            .as_ref()
-                            .is_some_and(|range| range.contains(&absolute_row_idx));
+                        let is_selected = selected_rows.contains(absolute_row_idx);
                         let is_context_menu_target =
                             context_menu_target_index == Some(absolute_row_idx);
 
@@ -4849,9 +4989,7 @@ impl GitGraph {
 
                         // Match the node halo to the row's effective background so
                         // the ring blends seamlessly on hovered/selected rows.
-                        let node_background = if selected_range
-                            .as_ref()
-                            .is_some_and(|range| range.contains(&absolute_row_idx))
+                        let node_background = if selected_rows.contains(absolute_row_idx)
                             || context_menu_target_index == Some(absolute_row_idx)
                         {
                             background.blend(selected_bg)
@@ -4924,7 +5062,7 @@ impl GitGraph {
         // band painted behind the labels in the gutter lines up with the rest of
         // the row.
         let hovered_entry_idx = self.hovered_entry_idx;
-        let selected_range = self.selected_range();
+        let selected_rows = self.selected_rows();
         let context_menu_entry_idx = self
             .context_menu
             .as_ref()
@@ -4941,9 +5079,7 @@ impl GitGraph {
         // the labels render on top of them.
         let mut elements = Vec::with_capacity(viewport_range.len());
         for absolute_idx in viewport_range.clone() {
-            let is_selected = selected_range
-                .as_ref()
-                .is_some_and(|range| range.contains(&absolute_idx))
+            let is_selected = selected_rows.contains(absolute_idx)
                 || context_menu_entry_idx == Some(absolute_idx);
             let is_hovered = hovered_entry_idx == Some(absolute_idx);
             if !is_selected && !is_hovered {
@@ -5104,6 +5240,10 @@ impl GitGraph {
 
         if event.modifiers().shift {
             self.extend_selection(entry_idx, scroll_strategy, cx);
+            return;
+        }
+        if event.modifiers().secondary() {
+            self.toggle_selection(entry_idx, scroll_strategy, cx);
             return;
         }
 
@@ -5509,7 +5649,7 @@ impl Render for GitGraph {
                         )
                         .child({
                             let row_height = Self::row_height(window, cx);
-                            let selected_range = self.selected_range();
+                            let selected_rows = self.selected_rows();
                             let hovered_entry_idx = self.hovered_entry_idx;
                             let context_menu_target_index = self
                                 .context_menu
@@ -5537,7 +5677,7 @@ impl Render for GitGraph {
                                 .width_config(table_width_config)
                                 .column_filter(table_filter)
                                 .map_row(move |(index, row), window, cx| {
-                                    let is_selected = selected_range.as_ref().is_some_and(|range| range.contains(&index));
+                                    let is_selected = selected_rows.contains(index);
                                     let is_hovered = hovered_entry_idx == Some(index);
                                     let is_context_menu_target =
                                         context_menu_target_index == Some(index);
@@ -8538,7 +8678,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_extending_selection_selects_a_range_and_copies_it(cx: &mut TestAppContext) {
+    async fn test_shift_and_ctrl_selection(cx: &mut TestAppContext) {
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
@@ -8599,7 +8739,7 @@ mod tests {
 
             graph.select_entry(3, ScrollStrategy::Nearest, cx);
             graph.extend_selection(1, ScrollStrategy::Nearest, cx);
-            assert_eq!(graph.selected_range(), Some(1..=3));
+            assert_eq!(graph.selected_indices(), vec![1, 2, 3]);
             assert_eq!(graph.selected_commit_count(), 3);
             assert_eq!(graph.selected_entry_idx, Some(1));
 
@@ -8607,8 +8747,8 @@ mod tests {
             graph.extend_selection_down(&ExtendSelectionDown, window, cx);
             graph.extend_selection_down(&ExtendSelectionDown, window, cx);
             assert_eq!(
-                graph.selected_range(),
-                Some(3..=4),
+                graph.selected_indices(),
+                vec![3, 4],
                 "the anchor stays put while the cursor moves past it"
             );
 
@@ -8620,12 +8760,140 @@ mod tests {
                 1,
                 "a plain selection drops the range even on the cursor's own row"
             );
+
+            graph.toggle_selection(0, ScrollStrategy::Nearest, cx);
+            graph.toggle_selection(2, ScrollStrategy::Nearest, cx);
+            assert_eq!(graph.selected_indices(), vec![0, 2, 4]);
+            assert_eq!(graph.selected_entry_idx, Some(2));
+            assert_eq!(graph.selected_comparison(), None);
+
+            graph.toggle_selection(2, ScrollStrategy::Nearest, cx);
+            assert_eq!(
+                graph.selected_indices(),
+                vec![0, 4],
+                "deselecting the cursor's row moves the cursor to a row still selected"
+            );
+            assert_eq!(graph.selected_entry_idx, Some(4));
+            assert_eq!(
+                graph.selected_comparison(),
+                Some((shas[4], shas[0])),
+                "a comparison runs from the older commit to the newer one"
+            );
+
+            graph.toggle_selection(0, ScrollStrategy::Nearest, cx);
+            assert_eq!(graph.selected_indices(), vec![4]);
+            assert_eq!(graph.selected_commit_count(), 1);
         });
 
         assert_eq!(
             cx.read_from_clipboard().and_then(|item| item.text()),
             Some(format!("{}\n{}", shas[3], shas[4]))
         );
+    }
+
+    #[gpui::test]
+    async fn test_compare_selected_commits_opens_one_tab_per_comparison(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({ ".git": {}, "file.txt": "content" }),
+        )
+        .await;
+
+        let shas = (1..=3u8)
+            .map(|byte| Oid::from_bytes(&[byte; 20]).expect("valid commit SHA"))
+            .collect::<Vec<_>>();
+        let commits = shas
+            .iter()
+            .enumerate()
+            .map(|(index, sha)| {
+                Arc::new(InitialGraphCommitData {
+                    sha: *sha,
+                    parents: shas.get(index + 1).copied().into_iter().collect(),
+                    ref_names: Vec::new(),
+                })
+            })
+            .collect();
+        fs.set_graph_commits(Path::new("/project/.git"), commits);
+
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().clone());
+
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace.downgrade(),
+                None,
+                window,
+                cx,
+            )
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(git_graph.clone()), None, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        let commit_view_titles = |cx: &mut gpui::VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                workspace
+                    .active_pane()
+                    .read(cx)
+                    .items()
+                    .filter_map(|item| item.downcast::<CommitView>())
+                    .map(|view| view.read(cx).tab_content_text(0, cx))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let comparison_title: SharedString =
+            format!("{}..{}", shas[2].display_short(), shas[0].display_short()).into();
+
+        for _ in 0..2 {
+            git_graph.update_in(cx, |graph, window, cx| {
+                graph.select_entry(0, ScrollStrategy::Nearest, cx);
+                graph.toggle_selection(2, ScrollStrategy::Nearest, cx);
+                graph.compare_selected_commits(window, cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                commit_view_titles(cx),
+                vec![comparison_title.clone()],
+                "comparing the same two commits again reuses the comparison's tab"
+            );
+        }
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            CommitView::open(
+                shas[0].to_string(),
+                repository.downgrade(),
+                workspace.weak_handle(),
+                None,
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let titles = commit_view_titles(cx);
+        assert_eq!(
+            titles.len(),
+            2,
+            "opening the newer commit on its own does not replace the comparison: {titles:?}"
+        );
+        assert!(titles.contains(&comparison_title));
     }
 
     #[gpui::test]
