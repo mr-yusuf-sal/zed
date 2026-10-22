@@ -3829,6 +3829,16 @@ impl AcpThread {
         self.running_subagent_tool_calls.contains(tool_call_id)
     }
 
+    pub fn can_stop_subagent(&self, tool_call_id: &acp_v1::ToolCallId) -> bool {
+        self.connection
+            .can_stop_subagent(self.session_id(), tool_call_id)
+    }
+
+    pub fn stop_subagent(&self, tool_call_id: &acp_v1::ToolCallId, cx: &mut App) {
+        self.connection
+            .stop_subagent(self.session_id(), tool_call_id, cx)
+    }
+
     pub fn set_subagent_running(
         &mut self,
         tool_call_id: acp_v1::ToolCallId,
