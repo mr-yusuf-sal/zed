@@ -321,6 +321,18 @@ pub trait Driver: Send + Sync {
         None
     }
 
+    /// The plan the server would use for `statement`, as rows to read in the grid. With
+    /// `analyze` the statement is run to measure the plan, so callers offer that only for
+    /// statements that do not write.
+    async fn explain(
+        &self,
+        _statement: &str,
+        _database: Option<&str>,
+        _analyze: bool,
+    ) -> Result<Vec<ResultSet>> {
+        anyhow::bail!("this engine has no query plan to show")
+    }
+
     /// Applies one cell change and returns how many rows it touched. Implementations must
     /// refuse rather than guess when the key does not identify the row.
     async fn update_cell(&self, edit: &CellEdit) -> Result<u64> {

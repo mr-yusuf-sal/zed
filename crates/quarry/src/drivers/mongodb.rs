@@ -74,6 +74,32 @@ impl MongoDriver {
         })
     }
 
+    /// Reads a command typed in the editor and decides which database it runs in.
+    fn parse_command(&self, statement: &str, database: Option<&str>) -> Result<(Document, String)> {
+        let json = serde_json::from_str::<serde_json::Value>(statement)
+            .context("the query must be a JSON command document, e.g. {\"find\": \"users\"}")?;
+        let serde_json::Value::Object(json) = json else {
+            bail!("the query must be a JSON object, e.g. {{\"find\": \"users\"}}");
+        };
+        // Extended JSON, so `{"_id": {"$oid": "..."}}` in a filter is an ObjectId rather than a
+        // nested document with a `$oid` field.
+        let mut command = Document::try_from(json).context("converting the command to BSON")?;
+
+        // A `$db` written into the command is the most specific choice there is, so it wins
+        // over the editor's database picker. It is removed because the driver adds its own.
+        let database = match command.remove("$db") {
+            Some(Bson::String(database)) => Some(database),
+            Some(other) => bail!("\"$db\" must be a string, got {other}"),
+            None => None,
+        }
+        .or_else(|| database.map(str::to_string))
+        .or_else(|| self.default_database.clone())
+        .context(
+            "no database: pick one, add \"$db\" to the command or put one in the connection",
+        )?;
+        Ok((command, database))
+    }
+
     async fn collections(&self, database: &str) -> Result<Vec<(String, CollectionType)>> {
         let mut collections: Vec<(String, CollectionType)> = self
             .client
@@ -332,27 +358,7 @@ impl Driver for MongoDriver {
         database: Option<&str>,
         row_limit: usize,
     ) -> Result<Vec<ResultSet>> {
-        let json = serde_json::from_str::<serde_json::Value>(statement)
-            .context("the query must be a JSON command document, e.g. {\"find\": \"users\"}")?;
-        let serde_json::Value::Object(json) = json else {
-            bail!("the query must be a JSON object, e.g. {{\"find\": \"users\"}}");
-        };
-        // Extended JSON, so `{"_id": {"$oid": "..."}}` in a filter is an ObjectId rather than a
-        // nested document with a `$oid` field.
-        let mut command = Document::try_from(json).context("converting the command to BSON")?;
-
-        // A `$db` written into the command is the most specific choice there is, so it wins
-        // over the editor's database picker. It is removed because the driver adds its own.
-        let database = match command.remove("$db") {
-            Some(Bson::String(database)) => Some(database),
-            Some(other) => bail!("\"$db\" must be a string, got {other}"),
-            None => None,
-        }
-        .or_else(|| database.map(str::to_string))
-        .or_else(|| self.default_database.clone())
-        .context(
-            "no database: pick one, add \"$db\" to the command or put one in the connection",
-        )?;
+        let (command, database) = self.parse_command(statement, database)?;
         let database = self.client.database(&database);
 
         let command_name = command.keys().next().cloned().unwrap_or_default();
@@ -393,6 +399,36 @@ impl Driver for MongoDriver {
             }]);
         }
         Ok(vec![to_result_set(vec![response], false)])
+    }
+
+    /// Wraps the command in `explain`. The plan is a deeply nested document, so it is shown as
+    /// indented JSON, one line per row, rather than squeezed into one cell.
+    async fn explain(
+        &self,
+        statement: &str,
+        database: Option<&str>,
+        analyze: bool,
+    ) -> Result<Vec<ResultSet>> {
+        let (command, database) = self.parse_command(statement, database)?;
+        let verbosity = if analyze {
+            "executionStats"
+        } else {
+            "queryPlanner"
+        };
+        let plan = self
+            .client
+            .database(&database)
+            .run_command(doc! { "explain": command, "verbosity": verbosity })
+            .await
+            .context("explaining the command")?;
+        Ok(vec![ResultSet {
+            columns: vec![SharedString::from("plan")],
+            rows: to_json(plan)
+                .lines()
+                .map(|line| vec![Some(SharedString::from(line.to_string()))])
+                .collect(),
+            ..ResultSet::default()
+        }])
     }
 
     async fn preview_page(

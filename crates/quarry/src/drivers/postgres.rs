@@ -16,6 +16,9 @@ use util::ResultExt as _;
 /// the editor asks.
 const CATALOG_LIMIT: usize = 20_000;
 
+/// A plan longer than this is cut; no one reads further down one.
+const EXPLAIN_ROW_LIMIT: usize = 10_000;
+
 pub struct PostgresDriver {
     /// Connection settings minus the database, so a pool can be opened for any of them.
     options: PgConnectOptions,
@@ -617,6 +620,24 @@ impl Driver for PostgresDriver {
     ) -> Result<Vec<ResultSet>> {
         self.run(self.database_or_default(database), statement, row_limit)
             .await
+    }
+
+    async fn explain(
+        &self,
+        statement: &str,
+        database: Option<&str>,
+        analyze: bool,
+    ) -> Result<Vec<ResultSet>> {
+        let options = if analyze { "(ANALYZE, BUFFERS) " } else { "" };
+        let statement = statement.trim().trim_end_matches(';');
+        // On the query session, so the plan sees the session's search_path and open
+        // transaction just as running the statement there would.
+        self.run(
+            self.database_or_default(database),
+            &format!("EXPLAIN {options}{statement}"),
+            EXPLAIN_ROW_LIMIT,
+        )
+        .await
     }
 
     async fn preview_page(
