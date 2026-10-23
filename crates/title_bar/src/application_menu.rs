@@ -1,13 +1,12 @@
 use gpui::{Action, Entity, OwnedMenu, OwnedMenuItem, Subscription, actions};
 use project::DisableAiSettings;
 use settings::{Settings, SettingsStore};
-use workspace::AccessibleMode;
 
 use schemars::JsonSchema;
 use serde::Deserialize;
 
 use smallvec::SmallVec;
-use ui::{ContextMenu, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
+use ui::{ContextMenu, PopoverMenu, PopoverMenuHandle, prelude::*};
 
 use crate::title_bar_settings::TitleBarSettings;
 
@@ -173,36 +172,6 @@ impl ApplicationMenu {
         })
     }
 
-    fn render_application_menu(&self, entry: &MenuEntry) -> impl IntoElement {
-        let handle = entry.handle.clone();
-
-        let menu_name = entry.menu.name.clone();
-        let entry = entry.clone();
-
-        // Application menu must have same ids as first menu item in standard menu
-        div()
-            .id(format!("{}-menu-item", menu_name))
-            .occlude()
-            .child(
-                PopoverMenu::new(format!("{}-menu-popover", menu_name))
-                    .menu(move |window, cx| {
-                        Self::build_menu_from_items(entry.clone(), window, cx).into()
-                    })
-                    .trigger_with_tooltip(
-                        IconButton::new(
-                            SharedString::from(format!("{}-menu-trigger", menu_name)),
-                            ui::IconName::Menu,
-                        )
-                        .style(ButtonStyle::Subtle)
-                        .icon_size(IconSize::Small)
-                        .tab_index(0isize)
-                        .aria_label("Application menu"),
-                        Tooltip::text("Open Application Menu"),
-                    )
-                    .with_handle(handle),
-            )
-    }
-
     fn render_standard_menu(&self, entry: &MenuEntry) -> impl IntoElement {
         let current_handle = entry.handle.clone();
 
@@ -303,15 +272,6 @@ impl ApplicationMenu {
         let next_handle = self.entries[next_index].handle.clone();
         cx.defer_in(window, move |_, window, cx| next_handle.show(window, cx));
     }
-
-    pub fn all_menus_shown(&self, cx: &mut Context<Self>) -> bool {
-        show_menus(cx)
-            || self.entries.iter().any(|entry| entry.handle.is_deployed())
-            || self.pending_menu_open.is_some()
-            // In accessible mode, keep the full menu bar expanded so every menu
-            // is individually reachable and labeled for assistive technology.
-            || cx.accessible_mode()
-    }
 }
 
 pub(crate) fn show_menus(cx: &mut App) -> bool {
@@ -325,8 +285,6 @@ pub(crate) fn open_menus_on_hover(cx: &mut App) -> bool {
 
 impl Render for ApplicationMenu {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let all_menus_shown = self.all_menus_shown(cx);
-
         if let Some(pending_menu_open) = self.pending_menu_open.take()
             && let Some(entry) = self
                 .entries
@@ -360,16 +318,11 @@ impl Render for ApplicationMenu {
             .flex()
             .flex_row()
             .gap_x_1()
-            .when(!all_menus_shown && !self.entries.is_empty(), |this| {
-                this.child(self.render_application_menu(&self.entries[0]))
-            })
-            .when(all_menus_shown, |this| {
-                this.children(
-                    self.entries
-                        .iter()
-                        .map(|entry| self.render_standard_menu(entry)),
-                )
-            })
+            .children(
+                self.entries
+                    .iter()
+                    .map(|entry| self.render_standard_menu(entry)),
+            )
     }
 }
 
