@@ -31,11 +31,12 @@ try {
     Write-Host "Install failed: $_"
 }
 
-# Agent hosts (`zed --agent-host`) run Claude Code turns that must outlive Zed. They keep
+# Agent hosts (`zed --agent-host`) run Claude Code turns, and terminal hosts
+# (`zed --terminal-host`) run terminal shells, that must outlive Zed. They keep
 # running from the exe moved aside above; the new Zed reconnects to them.
 function Get-ZedUi {
     Get-CimInstance Win32_Process -Filter "Name = 'zed.exe'" |
-        Where-Object { $_.CommandLine -notmatch '--agent-host' }
+        Where-Object { $_.CommandLine -notmatch '--(agent|terminal)-host' }
 }
 Get-ZedUi | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 for ($i = 0; $i -lt 30 -and (Get-ZedUi); $i++) { Start-Sleep -Milliseconds 500 }

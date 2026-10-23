@@ -23,6 +23,19 @@ impl ProcessIdGetter {
         }
     }
 
+    /// For a shell running in a terminal host, which owns its handle and PTY.
+    /// The handle is one that never resolves to a process, so the shell's pid
+    /// is always the one used.
+    pub(crate) fn for_hosted_process(pid: u32) -> ProcessIdGetter {
+        // `-1` is the current process's pseudo-handle on Windows, and `0` is
+        // Zed's own stdin on Unix.
+        #[cfg(windows)]
+        let handle = 0;
+        #[cfg(unix)]
+        let handle = -1;
+        ProcessIdGetter::new(handle, pid)
+    }
+
     pub fn fallback_pid(&self) -> Pid {
         Pid::from_u32(self.fallback_pid)
     }

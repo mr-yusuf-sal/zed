@@ -237,6 +237,15 @@ fn main() {
         return;
     }
 
+    // `zed --terminal-host` Makes zed run a terminal's shell that outlives the editor
+    if let Some(socket) = &args.terminal_host {
+        if let Err(error) = terminal::terminal_host::run(socket) {
+            eprintln!("terminal host failed: {error:#}");
+            process::exit(1);
+        }
+        return;
+    }
+
     #[cfg(target_os = "windows")]
     if args.record_etw_trace {
         let Some(etw_socket) = args.etw_socket else {
@@ -311,6 +320,7 @@ fn main() {
     }
     ztracing::init();
     agent_host::enable();
+    terminal::terminal_host::enable();
 
     #[cfg(unix)]
     util::increase_open_file_limit().log_err();
@@ -1811,6 +1821,11 @@ struct Args {
     /// Zed quits, communicating with Zed over a socket.
     #[arg(long, hide = true)]
     agent_host: Option<PathBuf>,
+
+    /// Used for running a terminal's shell in a process that keeps going when
+    /// Zed quits, communicating with Zed over a socket.
+    #[arg(long, hide = true)]
+    terminal_host: Option<PathBuf>,
 
     /// Run zed in the foreground, only used on Windows, to match the behavior on macOS.
     #[arg(long)]

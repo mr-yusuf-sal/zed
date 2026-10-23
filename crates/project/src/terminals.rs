@@ -533,6 +533,58 @@ impl Project {
         })
     }
 
+    /// Shows a shell that a terminal host kept running while Zed was closed.
+    /// `cwd` only picks the settings the terminal is shown with; the shell
+    /// keeps whatever directory it is in.
+    pub fn attach_hosted_terminal(
+        &mut self,
+        session_id: String,
+        cwd: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Terminal>>> {
+        let settings = self.terminal_settings(&cwd, cx).clone();
+        let builder = TerminalBuilder::attach_hosted(
+            session_id,
+            settings.shell,
+            settings.env,
+            settings.cursor_shape,
+            settings.alternate_scroll,
+            settings.max_scroll_history_lines,
+            settings.path_hyperlink_regexes,
+            Duration::from_millis(settings.path_hyperlink_timeout_ms),
+            cx.entity_id().as_u64(),
+            cx,
+            self.path_style(cx),
+        );
+        cx.spawn(async move |project, cx| {
+            let builder = builder.await?;
+            project.update(cx, |project, cx| {
+                let terminal_handle = cx.new(|cx| builder.subscribe(cx));
+
+                project
+                    .terminals
+                    .local_handles
+                    .push(terminal_handle.downgrade());
+
+                let id = terminal_handle.entity_id();
+                cx.observe_release(&terminal_handle, move |project, _terminal, cx| {
+                    let handles = &mut project.terminals.local_handles;
+
+                    if let Some(index) = handles
+                        .iter()
+                        .position(|terminal| terminal.entity_id() == id)
+                    {
+                        handles.remove(index);
+                        cx.notify();
+                    }
+                })
+                .detach();
+
+                terminal_handle
+            })
+        })
+    }
+
     pub fn terminal_settings<'a>(
         &'a self,
         path: &'a Option<PathBuf>,
