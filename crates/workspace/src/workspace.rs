@@ -2426,11 +2426,11 @@ impl Workspace {
             if is_empty_workspace && !serialized_workspace_has_paths {
                 if let Some(default_docks) = persistence::read_default_dock_state(&kvp) {
                     window
+                        .update(cx, |_, window, cx| {
+                            workspace.update(cx, |workspace, cx| {
                                 if workspace.inherited_panel_sizes.is_some() {
                                     return;
                                 }
-                        .update(cx, |_, window, cx| {
-                            workspace.update(cx, |workspace, cx| {
                                 for (dock, serialized_dock) in [
                                     (&workspace.right_dock, &default_docks.right),
                                     (&workspace.left_dock, &default_docks.left),
@@ -2564,6 +2564,8 @@ impl Workspace {
                 zoom: bottom_dock_zoom,
             },
         }
+    }
+
     pub fn dock_layout(&self, window: &Window, cx: &App) -> DockLayout {
         let mut panel_sizes = HashMap::default();
         for dock in [&self.left_dock, &self.bottom_dock, &self.right_dock] {
@@ -2590,8 +2592,6 @@ impl Workspace {
         }
         self.set_dock_structure(layout.docks, window, cx);
         self.inherited_panel_sizes = Some(layout.panel_sizes);
-    }
-
     }
 
     pub fn set_dock_structure(
