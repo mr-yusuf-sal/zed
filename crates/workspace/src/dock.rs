@@ -30,6 +30,78 @@ pub(crate) const AUTO_HIDE_REVEAL_EDGE: Pixels = px(4.);
 pub(crate) const AUTO_HIDE_DELAY: Duration = Duration::from_millis(300);
 const DOCK_PINNED_KEY_PREFIX: &str = "dock_pinned";
 
+/// How an edge panel (the left dock or the thread sidebar) shows itself.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum AutoHideMode {
+    /// Closed until opened explicitly; reaching the window edge doesn't reveal it.
+    Hidden,
+    /// Revealed at the window edge and hidden again once the mouse leaves it.
+    #[default]
+    Hover,
+    /// Kept open.
+    Pinned,
+}
+
+impl AutoHideMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Hidden => Self::Hover,
+            Self::Hover => Self::Pinned,
+            Self::Pinned => Self::Hidden,
+        }
+    }
+
+    pub fn icon(self) -> IconName {
+        match self {
+            Self::Hidden => IconName::EyeOff,
+            Self::Hover => IconName::Unpin,
+            Self::Pinned => IconName::Pin,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Hidden => "Hidden",
+            Self::Hover => "Show on Hover",
+            Self::Pinned => "Pinned",
+        }
+    }
+
+    fn to_stored(self) -> &'static str {
+        match self {
+            Self::Hidden => "hidden",
+            Self::Hover => "hover",
+            Self::Pinned => "pinned",
+        }
+    }
+
+    fn from_stored(value: &str) -> Option<Self> {
+        // "true" and "false" are what the earlier two-state pin wrote under the same keys.
+        match value {
+            "hidden" => Some(Self::Hidden),
+            "hover" | "false" => Some(Self::Hover),
+            "pinned" | "true" => Some(Self::Pinned),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn load(key: &str, cx: &App) -> Self {
+        KeyValueStore::global(cx)
+            .read_kvp(key)
+            .log_err()
+            .flatten()
+            .and_then(|value| Self::from_stored(&value))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn store(self, key: String, cx: &App) {
+        let kvp = KeyValueStore::global(cx);
+        db::write_and_log(cx, move || async move {
+            kvp.write_kvp(key, self.to_stored().to_string()).await
+        });
+    }
+}
+
 pub enum PanelEvent {
     ZoomIn,
     ZoomOut,
@@ -297,7 +369,7 @@ pub struct Dock {
     restoration: DockRestoreState,
     zoom_layer_open: bool,
     modal_layer: Entity<ModalLayer>,
-    pinned: bool,
+    auto_hide_mode: AutoHideMode,
     bounds: Option<Bounds<Pixels>>,
     // A dock opened by keyboard or button may never have had the mouse over it; it only starts
     // auto-hiding once the mouse has been inside, so it doesn't vanish on the next mouse move.
@@ -471,7 +543,7 @@ impl Dock {
                 restoration: DockRestoreState::Restoring { pending: None },
                 zoom_layer_open: false,
                 modal_layer,
-                pinned: Self::load_pinned(position, cx),
+                auto_hide_mode: AutoHideMode::load(&Self::auto_hide_mode_key(position), cx),
                 bounds: None,
                 hovered_since_open: false,
                 auto_hide_task: None,
@@ -618,35 +690,32 @@ impl Dock {
         self.position == DockPosition::Left
     }
 
-    pub fn is_pinned(&self) -> bool {
-        self.pinned || !self.supports_auto_hide()
+    pub fn auto_hide_mode(&self) -> AutoHideMode {
+        self.auto_hide_mode
     }
 
-    pub fn toggle_pinned(&mut self, cx: &mut Context<Self>) {
+    fn auto_hides(&self) -> bool {
+        self.supports_auto_hide() && self.auto_hide_mode == AutoHideMode::Hover
+    }
+
+    pub fn cycle_auto_hide_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.supports_auto_hide() {
             return;
         }
-        self.pinned = !self.pinned;
+        self.auto_hide_mode = self.auto_hide_mode.next();
         self.auto_hide_task = None;
-        let key = Self::pinned_key(self.position);
-        let pinned = self.pinned;
-        let kvp = KeyValueStore::global(cx);
-        db::write_and_log(cx, move || async move {
-            kvp.write_kvp(key, pinned.to_string()).await
-        });
+        self.auto_hide_mode
+            .store(Self::auto_hide_mode_key(self.position), cx);
+        match self.auto_hide_mode {
+            AutoHideMode::Hidden => self.close_and_return_focus(window, cx),
+            AutoHideMode::Pinned => self.open_with_active_panel(window, cx),
+            AutoHideMode::Hover => {}
+        }
         cx.notify();
     }
 
-    fn pinned_key(position: DockPosition) -> String {
+    fn auto_hide_mode_key(position: DockPosition) -> String {
         format!("{DOCK_PINNED_KEY_PREFIX}:{}", position.label())
-    }
-
-    fn load_pinned(position: DockPosition, cx: &App) -> bool {
-        KeyValueStore::global(cx)
-            .read_kvp(&Self::pinned_key(position))
-            .log_err()
-            .flatten()
-            .is_some_and(|value| value == "true")
     }
 
     pub(crate) fn auto_hide_on_mouse_move(
@@ -656,7 +725,7 @@ impl Dock {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.is_pinned() || cx.has_active_drag() {
+        if !self.auto_hides() || cx.has_active_drag() {
             return;
         }
 
@@ -673,7 +742,7 @@ impl Dock {
                 DockPosition::Bottom => false,
             };
             if within_height && at_edge {
-                self.reveal_on_hover(window, cx);
+                self.open_with_active_panel(window, cx);
             }
             return;
         }
@@ -696,7 +765,7 @@ impl Dock {
         }
     }
 
-    fn reveal_on_hover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_with_active_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_panel().is_none() {
             let Some(panel_ix) = self
                 .first_enabled_panel_idx(cx)
@@ -712,11 +781,18 @@ impl Dock {
     fn hide_after_mouse_left(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // A drag out of the dock (e.g. a file onto a pane) or an open modal still needs the
         // dock; the next mouse move after it ends re-arms the timer.
-        if self.is_pinned()
+        if !self.auto_hides()
             || !self.is_open
             || cx.has_active_drag()
             || self.modal_layer.read(cx).has_active_modal()
         {
+            return;
+        }
+        self.close_and_return_focus(window, cx);
+    }
+
+    fn close_and_return_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_open {
             return;
         }
         let dock_had_focus = self.focus_handle.contains_focused(window, cx);
@@ -1721,21 +1797,22 @@ impl Render for PanelButtons {
         let has_buttons = !buttons.is_empty();
 
         let pin_button = (has_buttons && dock.supports_auto_hide()).then(|| {
-            let is_pinned = dock.is_pinned();
-            let label = dock.position.label();
-            let tooltip: SharedString = if is_pinned {
-                format!("Unpin {label} Dock (Auto-Hide)").into()
-            } else {
-                format!("Pin {label} Dock").into()
-            };
+            let mode = dock.auto_hide_mode();
+            let tooltip: SharedString = format!(
+                "{} Dock: {} (click for {})",
+                dock.position.label(),
+                mode.label(),
+                mode.next().label()
+            )
+            .into();
             let dock_entity = self.dock.clone();
-            IconButton::new(("dock-pin", is_pinned as u64), IconName::Pin)
+            IconButton::new(("dock-auto-hide-mode", mode as u64), mode.icon())
                 .icon_size(IconSize::Small)
-                .toggle_state(is_pinned)
+                .toggle_state(mode == AutoHideMode::Pinned)
                 .aria_label(tooltip.clone())
                 .tooltip(Tooltip::text(tooltip))
-                .on_click(move |_, _, cx| {
-                    dock_entity.update(cx, |dock, cx| dock.toggle_pinned(cx));
+                .on_click(move |_, window, cx| {
+                    dock_entity.update(cx, |dock, cx| dock.cycle_auto_hide_mode(window, cx));
                 })
         });
 
