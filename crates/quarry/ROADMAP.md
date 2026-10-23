@@ -16,7 +16,8 @@ Son güncelleme: 2026-10-23
 | `ce8cfef` | **Madde 5'in sürücü katmanı:** `Driver::preview_page(path, limit, offset)` eklendi ve beş sürücüye uygulandı. Derleniyor, canlı testleri **çalıştırılmadı**. |
 | `5e07cac3ba` | **Hata (madde 5'in canlı testlerinde çıktı):** ClickHouse, ORDER BY olmadan tabloyu paralel okuduğu için ilk bloktan (~65.000 satır) sonra aynı OFFSET her seferinde başka satırlar döndürüyordu; önizleme artık `max_threads = 1` ile okunuyor. Postgres, shared_buffers'ın dörtte birinden büyük bir tabloyu başka bir oturum tararken onun kaldığı yerden okumaya başlıyordu; havuz bağlantıları artık `synchronize_seqscans = off` ile açılıyor. `preview_page` için beş motora canlı test eklendi. Postgres, Redis, MongoDB ve ClickHouse'ta çalıştırıldı (docker-compose seed'i elde olmadığından testlerin beklediği veri yeniden kuruldu, eski canlı testler de geçti). SQL Server testi **hiç çalıştırılmadı**. |
 | `ef14d14f4a` | **Madde 5, Load More:** Panelden açılan önizleme tablonun yolunu saklıyor. Sonuç kesildiyse durum çubuğundaki **Load More** `preview_page(path, 500, satır_sayısı)` çağırıp gelen satırları sona ekliyor. Kolonlar adla birleştiriliyor: yeni kolon sona ekleniyor, eski satırlarda NULL oluyor; `edit_target` ve düzenlenmekte olan hücre aynı hücreyi göstermeye devam ediyor. Durum çubuğu "truncated at 2000" yerine "(truncated)" yazıyor; önizleme 500'de kesildiği için bu yanlıştı. GPUI testi sahte bir sürücüyle iki sayfa ekletip doğruluyor. Uygulamanın içinde elle **denenmedi**. |
-| (bu commit) | **Madde 6, EXPLAIN:** Araç çubuğundaki Explain menüsü seçimin ya da imleçteki ifadenin planını grid'de gösteriyor. Postgres `EXPLAIN` / `EXPLAIN (ANALYZE, BUFFERS)`, SQL Server `SHOWPLAN_ALL` / `STATISTICS PROFILE` (ayar sonra kapatılıyor, kapatılamazsa oturum atılıyor), ClickHouse `EXPLAIN indexes = 1` (analyze yok), MongoDB `explain` komutu (girintili JSON, satır satır). Explain Analyze ifadeyi çalıştırdığı için veri değiştirebilecek ifadelerde reddediliyor. Dört motorda canlı testle doğrulandı. Redis'te menü yok. |
+| `e056b6669b` | **Madde 6, EXPLAIN:** Araç çubuğundaki Explain menüsü seçimin ya da imleçteki ifadenin planını grid'de gösteriyor. Postgres `EXPLAIN` / `EXPLAIN (ANALYZE, BUFFERS)`, SQL Server `SHOWPLAN_ALL` / `STATISTICS PROFILE` (ayar sonra kapatılıyor, kapatılamazsa oturum atılıyor), ClickHouse `EXPLAIN indexes = 1` (analyze yok), MongoDB `explain` komutu (girintili JSON, satır satır). Explain Analyze ifadeyi çalıştırdığı için veri değiştirebilecek ifadelerde reddediliyor. Dört motorda canlı testle doğrulandı. Redis'te menü yok. |
+| (bu commit) | **Madde 9, Redis:** Anahtarların sağ tık menüsünde Set TTL…, Remove TTL, Rename Key… (RENAMENX, var olan anahtarın üzerine yazmaz) ve Delete Key… (onaylı, UNLINK). Veritabanı ve klasörlerde Find Keys…: verilen glob, klasörün önekiyle birleştirilip sunucuda SCAN ile aranıyor ve sonuç yeni sekmede key/type/ttl olarak açılıyor. Şifre istemi genel bir satır içi isteme dönüştü. Bir klasör yenilenince altındaki açık klasörler de yeniden yükleniyor. Canlı testle doğrulandı. Ayrıca web oturumunun hiç çalıştıramadığı `sqlserver_preview_pages` testi çalıştırıldı ve geçti. |
 
 ## Yapılacaklar
 
@@ -31,11 +32,6 @@ Son güncelleme: 2026-10-23
 ### 8. MongoDB JSON görünümü ve şablonlar
 - Seçili satır, yanda salt-okunur bir JSON editöründe gösterilecek. Editörün katlama özelliği ağaç görünümü işlevi görür. MongoDB için `ResultSet`'e ham belge JSON'u eklenecek, diğer motorlarda satır kolonlardan nesneye çevrilecek. Tetikleyici `TableViewEvent::SelectionChanged`.
 - Motor başına şablon menüsü olacak (yeni `templates.rs`). MongoDB için: find, aggregate, count, distinct, insert, update, delete, createIndexes. SQL ve Redis için de temel kalıplar eklenecek.
-
-### 9. Redis
-- Anahtarların sağ tık menüsüne: Set TTL…, Persist, Rename…, Delete Key (onaylı).
-- Veritabanı ve klasör düğümlerine: Find Keys… (desen), sonucu `Driver::search(path, pattern)` ile yeni sekmede göstermek.
-- `password_prompt` genel bir satır içi isteme (`InlinePrompt { kind, editor }`) dönüştürülecek.
 
 ### 10. Şema karşılaştırma
 - Şemaya sağ tıklayıp "Select for Compare", ardından başka bir şemada (başka bir bağlantıda da olabilir, aynı motor) "Compare with …".
@@ -56,4 +52,4 @@ Son güncelleme: 2026-10-23
 - Load More'un bilinen sınırları:
   - Sayfa eklenince grid en başa dönüyor; yeni kolon gelirse elle ayarlanmış kolon genişlikleri de sıfırlanıyor. `TableView::set_contents` liste durumunu sıfırlıyor ve kaydırma konumunu koruyacak bir API yok; `tabular_data_preview`'a dokunulmadı.
   - Sayfalar OFFSET ile, sunucunun doğal sırasında okunuyor. Sayfalar arasında tablo değişirse satırlar kayabilir, tekrar edebilir ya da atlanabilir. Bu sekmede yapılan bir düzenleme de buna dahil: Postgres'te satırı başka bir sayfaya taşıyan bir UPDATE, Redis sorted set'te skor değişikliği.
-  - SQL Server'da ilk sayfanın TOP'u ile sonrakilerin OFFSET ... FETCH'inin aynı sırayı verdiği doğrulanmadı.
+  - SQL Server'da ilk sayfanın TOP'u ile sonrakilerin OFFSET ... FETCH'inin aynı sırayı verdiği yalnızca `sqlserver_preview_pages` testinin kurduğu tabloda doğrulandı.

@@ -1,5 +1,5 @@
 use crate::driver::{
-    CatalogEntry, CellEdit, Driver, EditTarget, ObjectKind, ObjectNode, ResultSet,
+    CatalogEntry, CellEdit, Driver, EditTarget, KeyAction, ObjectKind, ObjectNode, ResultSet,
 };
 use anyhow::{Context as _, Result, anyhow, bail};
 use collections::{BTreeMap, HashMap, HashSet};
@@ -842,6 +842,92 @@ impl Driver for RedisDriver {
                 detail: Some(SharedString::from(kind)),
             })
             .collect())
+    }
+
+    /// SCANs for `pattern` under the prefix `path` names, so "Find Keys" on `user` with `*:email`
+    /// looks for `user:*:email`. The pattern is a glob as MATCH reads it; the prefix is escaped.
+    async fn search(&self, path: &[SharedString], pattern: &str) -> Result<ResultSet> {
+        let (database, prefix) = Self::locate(path)?;
+        let pattern = pattern.trim();
+        let pattern = if pattern.is_empty() { "*" } else { pattern };
+        let pattern = if path.len() > 1 {
+            format!("{}:{pattern}", escape_glob(&prefix))
+        } else {
+            pattern.to_string()
+        };
+        let mut connection = self.connection(database).await?;
+        let keys = Self::scan(&mut connection, &pattern, TREE_KEY_LIMIT + 1).await?;
+        let truncated = keys.len() > TREE_KEY_LIMIT;
+        let keys: Vec<String> = keys.into_iter().take(TREE_KEY_LIMIT).collect();
+        let details = types_and_ttls(&mut connection, &keys).await?;
+        Ok(ResultSet {
+            columns: columns(&["key", "type", "ttl"]),
+            rows: keys
+                .into_iter()
+                .zip(details)
+                .map(|(key, (kind, ttl))| {
+                    vec![
+                        Some(SharedString::from(key)),
+                        Some(SharedString::from(kind)),
+                        (ttl > 0).then(|| SharedString::from(format_ttl(ttl))),
+                    ]
+                })
+                .collect(),
+            truncated,
+            ..ResultSet::default()
+        })
+    }
+
+    async fn key_action(&self, path: &[SharedString], action: &KeyAction) -> Result<()> {
+        let (database, key) = Self::locate(path)?;
+        if path.len() < 2 {
+            bail!("expected a key, got a database");
+        }
+        let mut connection = self.connection(database).await?;
+        match action {
+            KeyAction::Expire(Some(seconds)) => {
+                let set: bool = redis::cmd("EXPIRE")
+                    .arg(&key)
+                    .arg(*seconds)
+                    .query_async(&mut connection)
+                    .await
+                    .with_context(|| format!("setting the TTL of {key}"))?;
+                if !set {
+                    bail!("{key} no longer exists");
+                }
+            }
+            KeyAction::Expire(None) => {
+                redis::cmd("PERSIST")
+                    .arg(&key)
+                    .exec_async(&mut connection)
+                    .await
+                    .with_context(|| format!("removing the TTL of {key}"))?;
+            }
+            KeyAction::Rename(new_name) => {
+                // RENAMENX, so a typo cannot overwrite a key that happens to have that name.
+                let renamed: bool = redis::cmd("RENAMENX")
+                    .arg(&key)
+                    .arg(new_name)
+                    .query_async(&mut connection)
+                    .await
+                    .with_context(|| format!("renaming {key}"))?;
+                if !renamed {
+                    bail!("a key named {new_name} already exists; nothing was renamed");
+                }
+            }
+            KeyAction::Delete => {
+                // UNLINK frees a large value in the background instead of blocking the server.
+                let removed: u64 = redis::cmd("UNLINK")
+                    .arg(&key)
+                    .query_async(&mut connection)
+                    .await
+                    .with_context(|| format!("deleting {key}"))?;
+                if removed == 0 {
+                    bail!("{key} no longer exists");
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn update_cell(&self, edit: &CellEdit) -> Result<u64> {
