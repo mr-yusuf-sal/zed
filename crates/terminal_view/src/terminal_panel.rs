@@ -11,9 +11,9 @@ use collections::HashMap;
 use db::kvp::KeyValueStore;
 use futures::{channel::oneshot, future::join_all};
 use gpui::{
-    Action, Anchor, App, AsyncApp, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, IntoElement, ParentElement, Pixels, Render, Styled, Task, TaskExt, WeakEntity,
-    Window, actions,
+    Action, Anchor, App, AsyncApp, AsyncWindowContext, Axis, Context, Entity, EntityId,
+    EventEmitter, FocusHandle, Focusable, IntoElement, ParentElement, Pixels, Render, Styled, Task,
+    TaskExt, WeakEntity, Window, actions,
 };
 use itertools::Itertools;
 use project::{Fs, Project};
@@ -28,10 +28,10 @@ use ui::{
 use util::{ResultExt, TryFutureExt, defer};
 use workspace::{
     ActivateNextPane, ActivatePane, ActivatePaneDown, ActivatePaneLeft, ActivatePaneRight,
-    ActivatePaneUp, ActivatePreviousPane, DraggedTab, ItemId, MoveItemToPane,
+    ActivatePaneUp, ActivatePreviousPane, DraggedTab, ItemHandle, ItemId, Member, MoveItemToPane,
     MoveItemToPaneInDirection, MovePaneDown, MovePaneLeft, MovePaneRight, MovePaneUp, Pane,
-    PaneGroup, SplitDirection, SplitDown, SplitLeft, SplitMode, SplitRight, SplitUp, SwapPaneDown,
-    SwapPaneLeft, SwapPaneRight, SwapPaneUp, ToggleZoom, Workspace,
+    PaneAxis, PaneGroup, SplitDirection, SplitDown, SplitLeft, SplitMode, SplitRight, SplitUp,
+    SwapPaneDown, SwapPaneLeft, SwapPaneRight, SwapPaneUp, ToggleZoom, Workspace,
     dock::{DockPosition, Panel, PanelEvent, PanelHandle},
     item::SerializableItem,
     move_active_item, pane,
@@ -1218,61 +1218,116 @@ impl TerminalPanel {
         })
     }
 
-    /// Moves every terminal held by `source` into this panel's active pane.
+    /// Moves every terminal held by `source` into this panel, keeping the way
+    /// `source` had them split.
     ///
     /// Terminals belong to the window rather than to the project shown in it:
     /// switching projects in the sidebar hands the open terminals over to the
     /// newly displayed workspace instead of showing that workspace's own set.
-    /// Splits in `source` are flattened into a single pane.
+    /// Panes can't be moved themselves, since a pane belongs to its workspace,
+    /// so the split tree is rebuilt here out of new panes.
     pub fn take_terminals_from(
         &mut self,
         source: &Entity<TerminalPanel>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (items, active_item_id) = source.update(cx, |source, cx| {
-            let active_item_id = source
-                .active_pane
-                .read(cx)
-                .active_item()
-                .map(|item| item.item_id());
-            let panes = source.center.panes().into_iter().cloned().collect::<Vec<_>>();
-            let mut items = Vec::new();
-            for pane in &panes {
-                let pane_items = pane.read(cx).items().cloned().collect::<Vec<_>>();
-                pane.update(cx, |pane, cx| {
-                    pane.set_zoomed(false, cx);
-                    for item in &pane_items {
-                        pane.remove_item(item.item_id(), false, false, window, cx);
-                    }
-                });
-                items.extend(pane_items);
-            }
+        let Ok(project) = self
+            .workspace
+            .read_with(cx, |workspace, _| workspace.project().clone())
+        else {
+            return;
+        };
+        let layout = source.update(cx, |source, cx| {
+            let layout = take_terminal_layout(&source.center.root, &source.active_pane, window, cx);
             let first_pane = source.center.first_pane();
-            for pane in panes {
+            for pane in source
+                .center
+                .panes()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+            {
                 if pane != first_pane {
                     source.center.remove(&pane, cx).log_err();
                 }
             }
             source.active_pane = first_pane;
             cx.notify();
-            (items, active_item_id)
+            layout
         });
-        if items.is_empty() {
+        let Some(layout) = layout else {
             return;
-        }
+        };
 
-        self.active_pane.update(cx, |pane, cx| {
-            for item in items {
-                pane.add_item(item, false, false, None, window, cx);
-            }
-            if let Some(index) = active_item_id
-                .and_then(|id| pane.items().position(|item| item.item_id() == id))
-            {
-                pane.activate_item(index, false, false, window, cx);
-            }
-        });
+        let mut moved_active_pane = None;
+        let moved_root =
+            self.build_terminal_layout(layout, &project, &mut moved_active_pane, window, cx);
+        let has_own_terminals = self
+            .center
+            .panes()
+            .into_iter()
+            .any(|pane| pane.read(cx).items_len() > 0);
+        if has_own_terminals {
+            self.center = PaneGroup::with_root(Member::Axis(PaneAxis::new(
+                Axis::Horizontal,
+                vec![self.center.root.clone(), moved_root],
+            )));
+        } else {
+            self.center = PaneGroup::with_root(moved_root);
+            self.active_pane = moved_active_pane.unwrap_or_else(|| self.center.first_pane());
+        }
+        self.serialize(cx);
         cx.notify();
+    }
+
+    fn build_terminal_layout(
+        &self,
+        layout: TerminalLayout,
+        project: &Entity<Project>,
+        active_pane: &mut Option<Entity<Pane>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Member {
+        match layout {
+            TerminalLayout::Pane {
+                items,
+                active_item_id,
+                pinned_count,
+                was_active,
+            } => {
+                let pane =
+                    new_terminal_pane(self.workspace.clone(), project.clone(), false, window, cx);
+                pane.update(cx, |pane, cx| {
+                    for item in items {
+                        pane.add_item(item, false, false, None, window, cx);
+                    }
+                    pane.set_pinned_count(pinned_count);
+                    if let Some(index) = active_item_id
+                        .and_then(|id| pane.items().position(|item| item.item_id() == id))
+                    {
+                        pane.activate_item(index, false, false, window, cx);
+                    }
+                });
+                if was_active {
+                    *active_pane = Some(pane.clone());
+                }
+                Member::Pane(pane)
+            }
+            TerminalLayout::Axis {
+                axis,
+                flexes,
+                members,
+            } => {
+                let members = members
+                    .into_iter()
+                    .map(|member| {
+                        self.build_terminal_layout(member, project, active_pane, window, cx)
+                    })
+                    .collect();
+                Member::Axis(PaneAxis::load(axis, members, Some(flexes)))
+            }
+        }
     }
 
     fn has_no_terminals(&self, cx: &App) -> bool {
@@ -1379,6 +1434,73 @@ pub fn prepare_task_for_spawn(
 
 fn is_enabled_in_workspace(workspace: &Workspace, cx: &App) -> bool {
     workspace.project().read(cx).supports_terminal(cx)
+}
+
+enum TerminalLayout {
+    Pane {
+        items: Vec<Box<dyn ItemHandle>>,
+        active_item_id: Option<EntityId>,
+        pinned_count: usize,
+        was_active: bool,
+    },
+    Axis {
+        axis: Axis,
+        flexes: Vec<f32>,
+        members: Vec<TerminalLayout>,
+    },
+}
+
+/// Empties every pane under `member` and returns its terminals in the same
+/// split arrangement, leaving out panes that held none.
+fn take_terminal_layout(
+    member: &Member,
+    active_pane: &Entity<Pane>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<TerminalLayout> {
+    match member {
+        Member::Pane(pane) => {
+            let (items, active_item_id, pinned_count) = pane.update(cx, |pane, cx| {
+                let items = pane.items().cloned().collect::<Vec<_>>();
+                let active_item_id = pane.active_item().map(|item| item.item_id());
+                let pinned_count = pane.pinned_count();
+                pane.set_zoomed(false, cx);
+                for item in &items {
+                    pane.remove_item(item.item_id(), false, false, window, cx);
+                }
+                (items, active_item_id, pinned_count)
+            });
+            if items.is_empty() {
+                return None;
+            }
+            Some(TerminalLayout::Pane {
+                items,
+                active_item_id,
+                pinned_count,
+                was_active: pane == active_pane,
+            })
+        }
+        Member::Axis(pane_axis) => {
+            let source_flexes = pane_axis.flexes.lock().clone();
+            let mut members = Vec::new();
+            let mut flexes = Vec::new();
+            for (index, member) in pane_axis.members.iter().enumerate() {
+                if let Some(layout) = take_terminal_layout(member, active_pane, window, cx) {
+                    members.push(layout);
+                    flexes.push(source_flexes.get(index).copied().unwrap_or(1.));
+                }
+            }
+            if members.len() > 1 {
+                Some(TerminalLayout::Axis {
+                    axis: pane_axis.axis,
+                    flexes,
+                    members,
+                })
+            } else {
+                members.pop()
+            }
+        }
+    }
 }
 
 pub fn new_terminal_pane(
