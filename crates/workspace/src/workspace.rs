@@ -6844,6 +6844,9 @@ impl Workspace {
             .active_item(cx)
             .is_some_and(|item| item.is_permanent(cx))
         {
+            // The project panel the right dock reveals is the one the Main tab now shows.
+            self.right_dock
+                .update(cx, |dock, cx| dock.set_open(false, window, cx));
             self.update_window_title(window, cx);
             return;
         }
@@ -8774,9 +8777,24 @@ impl Workspace {
             return;
         }
         let workspace_bounds = self.bounds;
-        self.left_dock.update(cx, |dock, cx| {
+        // The project panel the right dock reveals is the one the Main tab shows, and it can't be
+        // on screen in both places.
+        if self.is_permanent_item_visible(cx) {
+            self.right_dock
+                .update(cx, |dock, cx| dock.set_open(false, window, cx));
+            return;
+        }
+        self.right_dock.update(cx, |dock, cx| {
             dock.auto_hide_on_mouse_move(mouse_position, workspace_bounds, window, cx);
         });
+    }
+
+    fn is_permanent_item_visible(&self, cx: &App) -> bool {
+        self.panes.iter().any(|pane| {
+            pane.read(cx)
+                .active_item()
+                .is_some_and(|item| item.is_permanent(cx))
+        })
     }
 
     pub fn has_active_modal(&self, _: &mut Window, cx: &mut App) -> bool {

@@ -673,6 +673,10 @@ impl Dock {
 
     fn set_open_internal(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
         let open = self.can_open() && (open || self.stays_open());
+        self.apply_open(open, window, cx);
+    }
+
+    fn apply_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
         if open != self.is_open {
             self.is_open = open;
             self.hovered_since_open = false;
@@ -688,9 +692,10 @@ impl Dock {
         }
     }
 
-    /// This fork shows no right dock. The project panel is kept in it only so that
-    /// `Workspace::panel` finds it, since it is shown as a permanent tab in the center instead, and
-    /// the git panel only for the actions it backs, such as push, pull and commit.
+    /// The right dock is only revealed by hovering the window's right edge, and then shows the
+    /// project panel, which otherwise lives in the Main tab. It also keeps the git panel, which is
+    /// never shown, only for the actions it backs, such as push, pull and commit. Nothing else
+    /// opens it.
     pub fn can_open(&self) -> bool {
         self.position != DockPosition::Right
     }
@@ -701,15 +706,16 @@ impl Dock {
     }
 
     pub fn supports_auto_hide(&self) -> bool {
-        false
+        self.position == DockPosition::Right
     }
 
     pub fn auto_hide_mode(&self) -> AutoHideMode {
         self.auto_hide_mode
     }
 
+    // The right dock has no other way to open, so the stored mode doesn't matter.
     fn auto_hides(&self) -> bool {
-        self.supports_auto_hide() && self.auto_hide_mode == AutoHideMode::Hover
+        self.supports_auto_hide()
     }
 
     /// Returns whether the dock was closed while it held focus. Moving focus elsewhere is left to
@@ -765,7 +771,7 @@ impl Dock {
                 DockPosition::Bottom => false,
             };
             if within_height && at_edge {
-                self.open_with_active_panel(window, cx);
+                self.reveal_on_hover(window, cx);
             }
             return;
         }
@@ -786,6 +792,19 @@ impl Dock {
                 .log_err();
             }));
         }
+    }
+
+    /// Shows the first enabled panel, whichever panel was activated in the dock before, since the
+    /// dock's other panels are not meant to be seen.
+    fn reveal_on_hover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel_ix) = self
+            .first_enabled_panel_idx(cx)
+            .log_with_level(log::Level::Info)
+        else {
+            return;
+        };
+        self.activate_panel_internal(panel_ix, window, cx);
+        self.apply_open(true, window, cx);
     }
 
     fn open_with_active_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
