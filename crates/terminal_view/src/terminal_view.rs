@@ -24,6 +24,7 @@ use settings::{
 };
 use std::{
     any::Any,
+    cell::Cell,
     cmp,
     ops::Range as StdRange,
     path::{Path, PathBuf},
@@ -166,6 +167,9 @@ pub struct TerminalView {
     rename_editor_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
     _terminal_subscriptions: Vec<Subscription>,
+    /// Whether the view is in a pane, which decides if removing it from one
+    /// was a move or a close. A `Cell` because `Item::on_removed` takes `&self`.
+    in_pane: Cell<bool>,
 }
 
 #[derive(Default, Clone)]
@@ -315,6 +319,7 @@ impl TerminalView {
             rename_editor_subscription: None,
             _subscriptions: subscriptions,
             _terminal_subscriptions: terminal_subscriptions,
+            in_pane: Cell::new(false),
         }
     }
 
@@ -1547,16 +1552,22 @@ impl Item for TerminalView {
 
     fn on_removed(&self, cx: &mut Context<Self>) {
         // Moving a terminal to another pane or workspace also removes it from
-        // its pane first, so its hosted shell is only ended if the view is
-        // gone once the move would have completed. Quitting Zed drops views
-        // without removing them, which leaves the shell to its host.
+        // its pane first, so its hosted shell is only ended if, once the move
+        // would have completed, the view is gone or in no pane. Whether it is
+        // gone alone isn't enough: closing a tab keeps the view alive in the
+        // close task past this point. Quitting Zed drops views without
+        // removing them, which leaves the shell to its host.
+        self.in_pane.set(false);
         let terminal = self.terminal.clone();
-        let view = cx.entity().downgrade();
-        cx.defer(move |cx| {
-            if view.upgrade().is_none() {
-                terminal.read(cx).kill_hosted_session();
+        cx.spawn(async move |view, cx| {
+            let still_in_pane = view
+                .read_with(cx, |view, _| view.in_pane.get())
+                .unwrap_or(false);
+            if !still_in_pane {
+                terminal.read_with(cx, |terminal, _| terminal.kill_hosted_session());
             }
-        });
+        })
+        .detach();
     }
 
     fn tab_tooltip_content(&self, cx: &App) -> Option<TabTooltipContent> {
@@ -1947,6 +1958,7 @@ impl Item for TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.in_pane.set(true);
         // A terminal can be handed over to another workspace in the same
         // window (see `TerminalPanel::take_terminals_from`); without this,
         // opening a path from it would act on the workspace it came from,
