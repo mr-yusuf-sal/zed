@@ -1391,18 +1391,38 @@ impl ExternalAgentServer for LocalRegistryNpxAgent {
             fs.create_dir(&install_dir).await?;
 
             let (package_name, package_spec) = bounded_npm_package_spec(&package);
-            node_runtime
-                .run_npm_subcommand(
-                    Some(&install_dir),
-                    "install",
-                    &[package_spec.as_str(), "--save-exact"],
-                )
-                .await?;
-            let executable = node_runtime::read_package_executable(
-                install_dir.join("node_modules"),
-                package_name,
-            )
-            .await?;
+            let node_modules = install_dir.join("node_modules");
+            let registry_version = package
+                .rsplit_once('@')
+                .and_then(|(_, version)| Version::parse(version).ok());
+            let installed_version =
+                node_runtime::read_package_installed_version(node_modules.clone(), package_name)
+                    .await
+                    .log_err()
+                    .flatten();
+            // `npm install` needs the network even when the package is already
+            // installed, and offline it retries for about a minute and a half
+            // before failing, so starting the agent without network access
+            // would hang and then fail although the agent is right there.
+            if registry_version.is_none() || installed_version != registry_version {
+                let install = node_runtime
+                    .run_npm_subcommand(
+                        Some(&install_dir),
+                        "install",
+                        &[package_spec.as_str(), "--save-exact"],
+                    )
+                    .await;
+                match (install, &installed_version) {
+                    (Ok(_), _) => {}
+                    (Err(error), Some(installed_version)) => log::warn!(
+                        "installing {package_spec} failed, starting the installed \
+                         {package_name}@{installed_version} instead: {error:#}"
+                    ),
+                    (Err(error), None) => return Err(error),
+                }
+            }
+            let executable =
+                node_runtime::read_package_executable(node_modules, package_name).await?;
 
             let node_binary = node_runtime.binary_path().await?;
             env.extend(node_runtime::npm_command_env(&node_binary));
