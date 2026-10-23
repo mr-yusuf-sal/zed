@@ -45,6 +45,7 @@ use terminal_element::TerminalElement;
 use terminal_panel::TerminalPanel;
 use terminal_path_like_target::{hover_path_like_target, open_path_like_target};
 use terminal_scrollbar::TerminalScrollHandle;
+use working_directory_picker::{pick_working_directory, working_directory_choices};
 use ui::{
     ContextMenu, Divider, ScrollAxes, Scrollbars, Tooltip, WithScrollbar,
     prelude::*,
@@ -1902,16 +1903,33 @@ impl Item for TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Option<Entity<Self>>> {
-        let Ok(terminal) = self.project.update(cx, |project, cx| {
-            let cwd = project
-                .active_project_directory(cx)
-                .map(|it| it.to_path_buf());
-            project.clone_terminal(self.terminal(), cx, cwd)
-        }) else {
-            return Task::ready(None);
-        };
+        // Like a new terminal, a split asks which project it starts in.
+        let directories = self
+            .workspace
+            .upgrade()
+            .map(|workspace| working_directory_choices(workspace.read(cx), cx))
+            .unwrap_or_default();
+        let picked = (directories.len() > 1)
+            .then(|| pick_working_directory(directories, self.workspace.clone(), window, cx));
+        let project = self.project.clone();
+        let source = self.terminal.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let terminal = terminal.await.log_err()?;
+            let picked = match picked {
+                Some(picked) => Some(picked.await?),
+                None => None,
+            };
+            let terminal = project
+                .update(cx, |project, cx| {
+                    let cwd = picked.or_else(|| {
+                        project
+                            .active_project_directory(cx)
+                            .map(|it| it.to_path_buf())
+                    });
+                    project.clone_terminal(&source, cx, cwd)
+                })
+                .ok()?
+                .await
+                .log_err()?;
             this.update_in(cx, |this, window, cx| {
                 cx.new(|cx| {
                     TerminalView::new(

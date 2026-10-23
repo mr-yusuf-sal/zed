@@ -472,8 +472,7 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.sidebar_auto_hide_mode != AutoHideMode::Hover || !self.multi_workspace_enabled(cx)
-        {
+        if self.sidebar_auto_hide_mode != AutoHideMode::Hover || !self.multi_workspace_enabled(cx) {
             return;
         }
         let Some(root_bounds) = self.root_bounds else {
@@ -530,7 +529,12 @@ impl MultiWorkspace {
             || !self.sidebar_open
             || cx.has_active_drag()
             || self.sidebar_overlay.is_some()
-            || self.workspace().read(cx).modal_layer.read(cx).has_active_modal()
+            || self
+                .workspace()
+                .read(cx)
+                .modal_layer
+                .read(cx)
+                .has_active_modal()
         {
             return;
         }
@@ -2244,7 +2248,8 @@ impl Render for MultiWorkspace {
 
         let workspace = self.workspace().clone();
         let workspace_key_context = workspace.update(cx, |workspace, cx| workspace.key_context(cx));
-        let root = workspace.update(cx, |workspace, cx| workspace.actions(h_flex(), window, cx));
+        let root = workspace.update(cx, |workspace, cx| workspace.actions(v_flex(), window, cx));
+        let titlebar = workspace.update(cx, |workspace, cx| workspace.render_titlebar_region(cx));
 
         client_side_decorations(
             root.key_context(workspace_key_context)
@@ -2382,16 +2387,24 @@ impl Render for MultiWorkspace {
                     .absolute()
                     .size_full()
                 })
-                .children(left_sidebar)
+                .children(titlebar)
                 .child(
-                    div()
-                        .flex()
+                    h_flex()
+                        .relative()
+                        .w_full()
                         .flex_1()
-                        .size_full()
-                        .overflow_hidden()
-                        .child(self.workspace().clone()),
+                        .min_h_0()
+                        .children(left_sidebar)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_1()
+                                .size_full()
+                                .overflow_hidden()
+                                .child(self.workspace().clone()),
+                        )
+                        .children(right_sidebar),
                 )
-                .children(right_sidebar)
                 .child(self.workspace().read(cx).modal_layer.clone())
                 .children(self.sidebar_overlay.as_ref().map(|view| {
                     deferred(div().absolute().size_full().inset_0().occlude().child(

@@ -39,7 +39,6 @@ use menu::{
     Cancel, Confirm, SelectChild, SelectFirst, SelectLast, SelectNext, SelectParent, SelectPrevious,
 };
 use notifications::status_toast::StatusToast;
-use platform_title_bar::apply_title_bar_insets;
 use project::{
     AgentId, AgentRegistryStore, Event as ProjectEvent, WorktreeId, repo_identity_path_if_local,
 };
@@ -57,7 +56,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use theme::{ActiveTheme, CLIENT_SIDE_DECORATION_ROUNDING};
 use ui::{
-    AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, Divider, GradientFade,
+    AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, GradientFade,
     HighlightedLabel, KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes,
     Scrollbars, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar,
     prelude::*, render_modifiers, right_click_menu,
@@ -66,10 +65,9 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use util::ResultExt as _;
 use util::path_list::PathList;
 use workspace::{
-    CloseWindow, MoveProjectDown, MoveProjectUp, MultiWorkspace, MultiWorkspaceEvent, NextProject,
-    NextThread, Open, OpenMode, PreviousProject, PreviousThread, ProjectGroupKey, RemovalIntent,
-    SaveIntent, Sidebar as WorkspaceSidebar, SidebarSide, Toast, Workspace,
-    notifications::NotificationId,
+    MoveProjectDown, MoveProjectUp, MultiWorkspace, MultiWorkspaceEvent, NextProject, NextThread,
+    Open, OpenMode, PreviousProject, PreviousThread, ProjectGroupKey, RemovalIntent, SaveIntent,
+    Sidebar as WorkspaceSidebar, SidebarSide, Toast, Workspace, notifications::NotificationId,
 };
 
 use git_ui_core::worktree_service::{RemoteBranchName, worktree_create_targets};
@@ -791,15 +789,20 @@ fn add_new_thread_in_entries(
                     .w_full()
                     .gap_2()
                     .justify_between()
-                    .child(h_flex().min_w_0().gap_1().children(
-                        labels.iter().enumerate().map(|(label_ix, label)| {
-                            h_flex()
-                                .gap_1()
-                                .when(label_ix > 0, |this| this.child(Label::new("•").alpha(0.25)))
-                                .child(label.render())
-                                .into_any_element()
-                        }),
-                    ))
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .gap_1()
+                            .children(labels.iter().enumerate().map(|(label_ix, label)| {
+                                h_flex()
+                                    .gap_1()
+                                    .when(label_ix > 0, |this| {
+                                        this.child(Label::new("•").alpha(0.25))
+                                    })
+                                    .child(label.render())
+                                    .into_any_element()
+                            })),
+                    )
                     .when(is_active_workspace, |this| {
                         this.child(
                             Icon::new(IconName::Check)
@@ -2643,11 +2646,7 @@ impl Sidebar {
                                                 .color(Color::Muted),
                                         )
                                         .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.toggle_collapse(
-                                                &key_for_disclosure,
-                                                window,
-                                                cx,
-                                            );
+                                            this.toggle_collapse(&key_for_disclosure, window, cx);
                                         })),
                                 )
                                 // Stopping the mouse down keeps the header from
@@ -7392,47 +7391,15 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let has_query = self.has_filter_query(cx);
-        let sidebar_on_left = self.side(cx) == SidebarSide::Left;
-        let sidebar_on_right = self.side(cx) == SidebarSide::Right;
-        let not_fullscreen = !window.is_fullscreen() && !window.is_simple_fullscreen();
-        let traffic_lights = cfg!(target_os = "macos") && not_fullscreen && sidebar_on_left;
-        let left_window_controls = !cfg!(target_os = "macos") && not_fullscreen && sidebar_on_left;
-        let right_window_controls =
-            !cfg!(target_os = "macos") && not_fullscreen && sidebar_on_right;
         let header_height = platform_title_bar_height(window);
 
         h_flex()
             .h(header_height)
-            .map(|header| match window.window_decorations() {
-                // Without projects there's no bottom border to match the title bar's.
-                Decorations::Client { .. } => apply_title_bar_insets(
-                    header,
-                    left_window_controls,
-                    right_window_controls,
-                    no_open_projects,
-                ),
-                Decorations::Server => header.mt_px().pb_px(),
-            })
-            .when(left_window_controls, |this| {
-                this.children(Self::render_left_window_controls(window, cx))
-            })
-            .map(|this| {
-                if traffic_lights {
-                    this.pl(px(ui::utils::TRAFFIC_LIGHT_PADDING))
-                } else if !left_window_controls {
-                    this.pl_1p5()
-                } else {
-                    this
-                }
-            })
-            .when(!right_window_controls, |this| this.pr_1p5())
+            .px_1p5()
             .gap_1()
             .when(!no_open_projects, |this| {
                 this.border_b_1()
                     .border_color(cx.theme().colors().border)
-                    .when(traffic_lights, |this| {
-                        this.child(Divider::vertical().color(ui::DividerColor::Border))
-                    })
                     .child(
                         div().ml_1().child(
                             Icon::new(IconName::MagnifyingGlass)
@@ -7462,25 +7429,6 @@ impl Sidebar {
                             }),
                     )
             })
-            .when(right_window_controls, |this| {
-                this.children(Self::render_right_window_controls(window, cx))
-            })
-    }
-
-    fn render_left_window_controls(window: &Window, cx: &mut App) -> Option<AnyElement> {
-        platform_title_bar::render_left_window_controls(
-            cx.button_layout(),
-            Box::new(CloseWindow),
-            window,
-        )
-    }
-
-    fn render_right_window_controls(window: &Window, cx: &mut App) -> Option<AnyElement> {
-        platform_title_bar::render_right_window_controls(
-            cx.button_layout(),
-            Box::new(CloseWindow),
-            window,
-        )
     }
 
     fn render_sidebar_bottom_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -7779,7 +7727,8 @@ impl Sidebar {
 
         self._subscriptions.push(subscription);
         // The archive button in the bottom bar mirrors the view's own archived-only toggle.
-        self._subscriptions.push(cx.observe(&archive_view, |_, _, cx| cx.notify()));
+        self._subscriptions
+            .push(cx.observe(&archive_view, |_, _, cx| cx.notify()));
         self.view = SidebarView::Archive(archive_view.clone());
         archive_view.update(cx, |view, cx| view.focus_filter_editor(window, cx));
         self.serialize(cx);
@@ -8002,18 +7951,17 @@ impl Render for Sidebar {
                 let on_left = self.side(cx) == SidebarSide::Left;
                 match window.window_decorations() {
                     Decorations::Server => el.h_full().w(self.width),
-                    // With client-side decorations the sidebar owns the window
-                    // corners on its side, so round them like the title bar and
-                    // status bar do. The sidebar is stretched 1px outwards over
-                    // the window border on untiled edges (with compensating
-                    // padding) so its rounded background lines up exactly with
-                    // the window shape, avoiding a transparent gap in the
-                    // rounded corners.
+                    // With client-side decorations the sidebar owns the bottom
+                    // window corner on its side, so round it like the status bar
+                    // does. The sidebar is stretched 1px outwards over the window
+                    // border on untiled edges (with compensating padding) so its
+                    // rounded background lines up exactly with the window shape,
+                    // avoiding a transparent gap in the rounded corners. The top
+                    // edge sits below the title bar.
                     Decorations::Client { tiling, .. } => el
                         .absolute()
-                        .top(if tiling.top { px(0.) } else { px(-1.) })
+                        .top(px(0.))
                         .bottom(if tiling.bottom { px(0.) } else { px(-1.) })
-                        .when(!tiling.top, |el| el.pt_px())
                         .when(!tiling.bottom, |el| el.pb_px())
                         .map(|el| {
                             if on_left {
@@ -8026,14 +7974,8 @@ impl Render for Sidebar {
                                     .when(!tiling.right, |el| el.pr(px(1.)))
                             }
                         })
-                        .when(on_left && !(tiling.top || tiling.left), |el| {
-                            el.rounded_tl(CLIENT_SIDE_DECORATION_ROUNDING)
-                        })
                         .when(on_left && !(tiling.bottom || tiling.left), |el| {
                             el.rounded_bl(CLIENT_SIDE_DECORATION_ROUNDING)
-                        })
-                        .when(!on_left && !(tiling.top || tiling.right), |el| {
-                            el.rounded_tr(CLIENT_SIDE_DECORATION_ROUNDING)
                         })
                         .when(!on_left && !(tiling.bottom || tiling.right), |el| {
                             el.rounded_br(CLIENT_SIDE_DECORATION_ROUNDING)

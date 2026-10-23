@@ -3630,6 +3630,45 @@ impl Workspace {
         rx
     }
 
+    pub fn render_titlebar_region(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let item = self.titlebar_item.clone()?;
+        // Expose the title bar as an ARIA toolbar so region navigation
+        // (FocusNextPart) can reach the top bar's controls and assistive
+        // technology announces it as a toolbar. The contained controls form
+        // a tab group: region navigation lands on the first control (per
+        // the ARIA toolbar pattern), Tab steps through them, and arrow keys
+        // move between them once focus is inside.
+        Some(
+            div()
+                .id("titlebar-region")
+                .track_focus(&self.titlebar_focus_handle)
+                .tab_group()
+                .role(gpui::Role::Toolbar)
+                .aria_label("Title bar")
+                .on_key_down(
+                    cx.listener(|workspace, event: &gpui::KeyDownEvent, window, cx| {
+                        if event.keystroke.modifiers.modified() {
+                            return;
+                        }
+                        match event.keystroke.key.as_str() {
+                            "right" => {
+                                workspace.move_titlebar_item_focus(true, window, cx);
+                                cx.stop_propagation();
+                            }
+                            "left" => {
+                                workspace.move_titlebar_item_focus(false, window, cx);
+                                cx.stop_propagation();
+                            }
+                            _ => {}
+                        }
+                    }),
+                )
+                .w_full()
+                .child(item)
+                .into_any_element(),
+        )
+    }
+
     pub fn titlebar_item(&self) -> Option<AnyView> {
         self.titlebar_item.clone()
     }
@@ -9914,41 +9953,10 @@ impl Render for Workspace {
             .items_start()
             .text_color(colors.text)
             .overflow_hidden()
-            // Expose the title bar as an ARIA toolbar so region navigation
-            // (FocusNextPart) can reach the top bar's controls and assistive
-            // technology announces it as a toolbar. The contained controls form
-            // a tab group: region navigation lands on the first control (per
-            // the ARIA toolbar pattern), Tab steps through them, and arrow keys
-            // move between them once focus is inside.
-            .when_some(self.titlebar_item.clone(), |this, item| {
-                this.child(
-                    div()
-                        .id("titlebar-region")
-                        .track_focus(&self.titlebar_focus_handle)
-                        .tab_group()
-                        .role(gpui::Role::Toolbar)
-                        .aria_label("Title bar")
-                        .on_key_down(cx.listener(
-                            |workspace, event: &gpui::KeyDownEvent, window, cx| {
-                                if event.keystroke.modifiers.modified() {
-                                    return;
-                                }
-                                match event.keystroke.key.as_str() {
-                                    "right" => {
-                                        workspace.move_titlebar_item_focus(true, window, cx);
-                                        cx.stop_propagation();
-                                    }
-                                    "left" => {
-                                        workspace.move_titlebar_item_focus(false, window, cx);
-                                        cx.stop_propagation();
-                                    }
-                                    _ => {}
-                                }
-                            },
-                        ))
-                        .w_full()
-                        .child(item),
-                )
+            // Inside a multi-workspace window the title bar is rendered by the
+            // `MultiWorkspace` above the sidebar, so it spans the full window width.
+            .when(self.multi_workspace.is_none(), |this| {
+                this.children(self.render_titlebar_region(cx))
             })
             .on_modifiers_changed(move |_, _, cx| {
                 for &id in &notification_entities {
