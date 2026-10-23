@@ -1013,6 +1013,12 @@ struct GraphData {
     lines: Vec<Rc<CommitLine>>,
     active_commit_lines: HashMap<CommitLineKey, usize>,
     active_commit_lines_by_parent: HashMap<Oid, SmallVec<[usize; 1]>>,
+    /// When set, the graph starts with a row for the working tree's uncommitted
+    /// changes, drawn as a child of this commit (HEAD).
+    uncommitted_parent: Option<Oid>,
+    /// Whether that row was added. It shifts every commit one row below its
+    /// index in the repository's graph data, see `repository_offset`.
+    has_uncommitted_row: bool,
 }
 
 impl GraphData {
@@ -1029,6 +1035,8 @@ impl GraphData {
             lines: Vec::default(),
             active_commit_lines: HashMap::default(),
             active_commit_lines_by_parent: HashMap::default(),
+            uncommitted_parent: None,
+            has_uncommitted_row: false,
         }
     }
 
@@ -1043,6 +1051,7 @@ impl GraphData {
         self.next_color = BranchColor(0);
         self.max_commit_count = AllCommitCount::NotLoaded;
         self.max_lanes = 0;
+        self.has_uncommitted_row = false;
     }
 
     fn first_empty_lane_idx(&mut self) -> ActiveLaneIdx {
@@ -1065,6 +1074,29 @@ impl GraphData {
     }
 
     fn add_commits(&mut self, commits: &[Arc<InitialGraphCommitData>]) {
+        if self.commits.is_empty()
+            && !commits.is_empty()
+            && let Some(parent) = self.uncommitted_parent
+            // No commit has the all-zero id, so it can stand for the uncommitted row.
+            && let Ok(sha) = Oid::from_bytes(&[0; 20])
+        {
+            self.has_uncommitted_row = true;
+            self.add_commit_rows(&[Arc::new(InitialGraphCommitData {
+                sha,
+                parents: smallvec![parent],
+                ref_names: Vec::new(),
+            })]);
+        }
+        self.add_commit_rows(commits);
+    }
+
+    /// How many rows come before the repository's first commit, to turn the
+    /// repository's commit indices into rows and back.
+    fn repository_offset(&self) -> usize {
+        self.has_uncommitted_row as usize
+    }
+
+    fn add_commit_rows(&mut self, commits: &[Arc<InitialGraphCommitData>]) {
         self.commits.reserve(commits.len());
         self.lines.reserve(commits.len() / 2);
 
@@ -1634,10 +1666,14 @@ enum RefKind {
 struct SelectedRows {
     cursor: Option<usize>,
     rows: Rc<BTreeSet<usize>>,
+    uncommitted_row_selected: bool,
 }
 
 impl SelectedRows {
     fn contains(&self, idx: usize) -> bool {
+        if self.uncommitted_row_selected {
+            return idx == 0;
+        }
         if self.rows.is_empty() {
             self.cursor == Some(idx)
         } else {
@@ -1989,6 +2025,7 @@ impl GitGraph {
         };
 
         this.apply_saved_split_ratio(cx);
+        this.graph_data.uncommitted_parent = this.wanted_uncommitted_parent(cx);
         this.fetch_initial_graph_data(cx);
         this.refresh_operation_in_progress(cx);
         this.select_uncommitted_by_default(cx);
@@ -2221,6 +2258,7 @@ impl GitGraph {
         // status, head or branch changes; graph loading progress never does.
         if !matches!(event, RepositoryEvent::GraphEvent(..)) {
             self.refresh_operation_in_progress(cx);
+            self.sync_uncommitted_row(cx);
             self.select_uncommitted_by_default(cx);
         }
         match event {
@@ -2237,7 +2275,8 @@ impl GitGraph {
                                     .and_then(|data| data.commit_oid_to_index.get(&oid).copied())
                             })
                         {
-                            self.select_entry(pending_sha_index, ScrollStrategy::Nearest, cx);
+                            let row = pending_sha_index + self.graph_data.repository_offset();
+                            self.select_entry(row, ScrollStrategy::Nearest, cx);
                         }
                         let count = match self.graph_data.max_commit_count {
                             AllCommitCount::FullyLoaded(count) | AllCommitCount::Loading(count) => {
@@ -2252,7 +2291,12 @@ impl GitGraph {
                         cx.notify();
                     }
                     GitGraphEvent::CountUpdated(commit_count) => {
-                        let old_count = self.graph_data.commits.len();
+                        // The repository counts its own commits, without the uncommitted row.
+                        let old_count = self
+                            .graph_data
+                            .commits
+                            .len()
+                            .saturating_sub(self.graph_data.repository_offset());
 
                         if let Some(pending_selection_index) =
                             repository.update(cx, |repository, cx| {
@@ -2269,9 +2313,12 @@ impl GitGraph {
                                 self.graph_data.add_commits(commits);
 
                                 let pending_sha_index = self.pending_select_sha.and_then(|oid| {
-                                    repository.get_graph_data(source.clone(), *order).and_then(
-                                        |data| data.commit_oid_to_index.get(&oid).copied(),
-                                    )
+                                    repository
+                                        .get_graph_data(source.clone(), *order)
+                                        .and_then(|data| {
+                                            data.commit_oid_to_index.get(&oid).copied()
+                                        })
+                                        .map(|index| index + self.graph_data.repository_offset())
                                 });
 
                                 if !is_loading && pending_sha_index.is_none() {
@@ -2509,6 +2556,7 @@ impl GitGraph {
                     ..(range.end + FETCH_RANGE)
                         .min(self.graph_data.commits.len().saturating_sub(1))]
                     .iter()
+                    .filter(|commit| !commit.data.sha.is_zero())
                     .for_each(|commit| {
                         repository.fetch_commit_data(commit.data.sha, false, cx);
                     });
@@ -2524,6 +2572,10 @@ impl GitGraph {
                         .map(|_| div().h(row_height).into_any_element())
                         .collect();
                 };
+
+                if self.is_uncommitted_row(idx) {
+                    return self.render_uncommitted_row_cells(idx, row_height, cx);
+                }
 
                 let data = repository.update(cx, |repository, cx| {
                     repository
@@ -2651,6 +2703,8 @@ impl GitGraph {
         SelectedRows {
             cursor: self.selected_entry_idx,
             rows: self.multi_selected_idxs.clone(),
+            uncommitted_row_selected: self.uncommitted_selected
+                && self.graph_data.has_uncommitted_row,
         }
     }
 
@@ -2717,6 +2771,11 @@ impl GitGraph {
         scroll_strategy: ScrollStrategy,
         cx: &mut Context<Self>,
     ) {
+        // The uncommitted row is not a commit that ranges or the commit actions
+        // could include.
+        if self.is_uncommitted_row(idx) {
+            return;
+        }
         let anchor = *self
             .selection_anchor_idx
             .get_or_insert(self.selected_entry_idx.unwrap_or(idx));
@@ -2737,6 +2796,9 @@ impl GitGraph {
         scroll_strategy: ScrollStrategy,
         cx: &mut Context<Self>,
     ) {
+        if self.is_uncommitted_row(idx) {
+            return;
+        }
         let Some(cursor) = self.selected_entry_idx else {
             self.select_entry(idx, scroll_strategy, cx);
             return;
@@ -2793,6 +2855,8 @@ impl GitGraph {
                 ScrollStrategy::Nearest,
                 cx,
             );
+        } else if self.uncommitted_selected && self.graph_data.has_uncommitted_row {
+            self.select_entry(1, ScrollStrategy::Nearest, cx);
         } else {
             self.select_prev(&SelectPrevious, window, cx);
         }
@@ -2969,6 +3033,12 @@ impl GitGraph {
         scroll_strategy: ScrollStrategy,
         cx: &mut Context<Self>,
     ) {
+        // Moving onto the uncommitted row (with the arrow keys, say) shows the
+        // working tree's changes; it isn't a commit to load.
+        if self.is_uncommitted_row(idx) {
+            self.select_uncommitted(cx);
+            return;
+        }
         if self.selected_entry_idx == Some(idx) || idx >= self.graph_data.commits.len() {
             debug_assert!(
                 idx < self.graph_data.commits.len(),
@@ -3161,7 +3231,8 @@ impl GitGraph {
             };
 
             this.pending_select_sha = None;
-            this.select_entry(index, ScrollStrategy::Center, cx);
+            let row = index + this.graph_data.repository_offset();
+            this.select_entry(row, ScrollStrategy::Center, cx);
         }
 
         if let Ok(oid) = sha.try_into() {
@@ -3652,6 +3723,7 @@ impl GitGraph {
             return;
         }
         self.log_source = log_source;
+        self.graph_data.uncommitted_parent = self.wanted_uncommitted_parent(cx);
         self.pending_select_sha = None;
         // The selection is kept as row indices, which mean other commits once
         // the graph is reloaded for a different source.
@@ -3918,6 +3990,48 @@ impl GitGraph {
             .collect()
     }
 
+    fn is_uncommitted_row(&self, idx: usize) -> bool {
+        self.graph_data.has_uncommitted_row && idx == 0
+    }
+
+    /// The commit the uncommitted row hangs off, or `None` when there should be
+    /// no row. Only the all-branches graph gets one, because a single branch's
+    /// history may not contain HEAD, and the row would then have a line running
+    /// to the bottom of the graph without ever reaching its parent.
+    fn wanted_uncommitted_parent(&self, cx: &App) -> Option<Oid> {
+        if self.log_source != LogSource::All || self.uncommitted_entries(cx).is_empty() {
+            return None;
+        }
+        let repository = self.get_repository(cx)?;
+        let head = repository.read(cx).head_commit.as_ref()?;
+        head.sha.parse::<Oid>().ok()
+    }
+
+    /// Adds or removes the uncommitted row when the tree becomes dirty or clean,
+    /// or moves it when HEAD moves. The lanes are laid out once as commits
+    /// arrive, so the graph is rebuilt rather than patched.
+    fn sync_uncommitted_row(&mut self, cx: &mut Context<Self>) {
+        let wanted = self.wanted_uncommitted_parent(cx);
+        if wanted == self.graph_data.uncommitted_parent {
+            return;
+        }
+        let had_row = self.graph_data.uncommitted_parent.is_some();
+        self.graph_data.uncommitted_parent = wanted;
+        self.invalidate_state(cx);
+
+        // The selection is kept as a row index, so it moves with the row.
+        if let Some(idx) = self.selected_entry_idx {
+            self.selected_entry_idx = match (had_row, wanted.is_some()) {
+                (false, true) => Some(idx + 1),
+                (true, false) => idx.checked_sub(1),
+                _ => Some(idx),
+            };
+        }
+        if wanted.is_none() && self.uncommitted_selected {
+            self.clear_selection(cx);
+        }
+    }
+
     /// Selects the "Uncommitted Changes" row the first time there are any, so
     /// a graph opened on a dirty tree starts by showing what isn't committed.
     /// Statuses arrive after the graph is created, so this is retried on
@@ -3926,8 +4040,7 @@ impl GitGraph {
         if self.uncommitted_default_applied
             || self.pending_select_sha.is_some()
             || self.selected_entry_idx.is_some()
-            || matches!(self.log_source, LogSource::Path(_))
-            || self.uncommitted_entries(cx).is_empty()
+            || self.wanted_uncommitted_parent(cx).is_none()
         {
             return;
         }
@@ -3941,6 +4054,12 @@ impl GitGraph {
         self.uncommitted_selected = true;
         self.uncommitted_scroll_handle
             .scroll_to_item(0, ScrollStrategy::Top);
+        self.table_interaction_state.update(cx, |state, cx| {
+            state
+                .scroll_handle
+                .scroll_to_item(0, ScrollStrategy::Nearest);
+            cx.notify();
+        });
         cx.notify();
     }
 
@@ -3972,17 +4091,16 @@ impl GitGraph {
         });
     }
 
-    /// A row above the commits for the working tree's changes, like the
-    /// pseudo-commit other git graphs put at the tip. File history has its own
-    /// source and gets no row.
-    fn render_uncommitted_row(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if matches!(self.log_source, LogSource::Path(_)) {
-            return None;
-        }
+    /// The table cells for the uncommitted row: what a commit row shows, with
+    /// the file count in place of a subject and the line totals in place of
+    /// the SHA. It has no date or author.
+    fn render_uncommitted_row_cells(
+        &self,
+        idx: usize,
+        row_height: Pixels,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         let entries = self.uncommitted_entries(cx);
-        if entries.is_empty() {
-            return None;
-        }
         let (added, deleted) = entries
             .iter()
             .filter_map(|entry| entry.diff_stat)
@@ -3990,32 +4108,19 @@ impl GitGraph {
                 (added + stat.added as usize, deleted + stat.deleted as usize)
             });
         let file_count = entries.len();
-        let colors = cx.theme().colors();
-        let background = if self.uncommitted_selected {
-            colors.element_selected
-        } else {
-            colors.editor_background
-        };
+        let is_selected = self.selected_rows().contains(idx);
 
-        Some(
+        vec![
             h_flex()
-                .id("git-graph-uncommitted-row")
-                .w_full()
-                .h_7()
-                .px_3()
+                .id("uncommitted-subject")
                 .gap_2()
-                .flex_shrink_0()
-                .cursor_pointer()
-                .bg(background)
-                .hover(|style| style.bg(colors.element_hover))
-                .border_b_1()
-                .border_color(colors.border_variant)
+                .overflow_hidden()
                 .child(
-                    Icon::new(IconName::Pencil)
-                        .size(IconSize::Small)
-                        .color(Color::Modified),
+                    Label::new("Uncommitted Changes")
+                        .italic()
+                        .when(!is_selected, |label| label.color(Color::Muted))
+                        .truncate(),
                 )
-                .child(Label::new("Uncommitted Changes").size(LabelSize::Small))
                 .child(
                     Label::new(format!(
                         "{file_count} {}",
@@ -4024,16 +4129,14 @@ impl GitGraph {
                     .size(LabelSize::Small)
                     .color(Color::Muted),
                 )
-                .child(div().flex_1())
-                .child(DiffStat::new("uncommitted-diff-stat", added, deleted))
-                .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
-                    this.select_uncommitted(cx);
-                    if event.click_count() >= 2 {
-                        this.open_uncommitted_diff(None, window, cx);
-                    }
-                }))
                 .into_any_element(),
-        )
+            div().h(row_height).into_any_element(),
+            div().h(row_height).into_any_element(),
+            h_flex()
+                .h(row_height)
+                .child(DiffStat::new("uncommitted-diff-stat", added, deleted))
+                .into_any_element(),
+        ]
     }
 
     fn render_uncommitted_panel(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -5331,6 +5434,9 @@ impl GitGraph {
         let Some(dragged) = Self::ref_name_from_decoration(&decoration) else {
             return;
         };
+        if self.is_uncommitted_row(target_idx) {
+            return;
+        }
         let Some(target) = self.graph_data.commits.get(target_idx) else {
             return;
         };
@@ -6579,6 +6685,14 @@ impl GitGraph {
             focus_handle.focus(window, cx);
         }
 
+        if self.is_uncommitted_row(entry_idx) {
+            self.select_uncommitted(cx);
+            if event.click_count() >= 2 {
+                self.open_uncommitted_diff(None, window, cx);
+            }
+            return;
+        }
+
         if event.modifiers().shift {
             self.extend_selection(entry_idx, scroll_strategy, cx);
             return;
@@ -6613,7 +6727,9 @@ impl GitGraph {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.deploy_entry_context_menu(event.position, entry_idx, None, window, cx);
+        if !self.is_uncommitted_row(entry_idx) {
+            self.deploy_entry_context_menu(event.position, entry_idx, None, window, cx);
+        }
         cx.stop_propagation();
     }
 
@@ -7299,7 +7415,6 @@ impl Render for GitGraph {
                     .size_full()
                     .child(self.render_search_bar(cx))
                     .children(self.render_operation_in_progress_banner(cx))
-                    .children(self.render_uncommitted_row(cx))
                     .child(div().flex_1().child(content)),
             )
             .children(self.context_menu.as_ref().map(|context_menu| {
@@ -10356,12 +10471,39 @@ mod tests {
 
         git_graph.update(cx, |graph, cx| {
             assert_eq!(graph.uncommitted_entries(cx).len(), 1);
+            assert!(graph.graph_data.has_uncommitted_row);
+            assert_eq!(
+                graph.graph_data.commits.len(),
+                2,
+                "the uncommitted row sits above the one commit"
+            );
+            assert_eq!(
+                graph
+                    .graph_data
+                    .commits
+                    .first()
+                    .map(|row| row.data.parents.to_vec()),
+                Some(vec![sha]),
+                "the uncommitted row is drawn as a child of HEAD"
+            );
             assert!(
                 graph.uncommitted_selected,
                 "a dirty tree is shown when the graph opens"
             );
+            assert!(graph.selected_rows().contains(0));
+
+            graph.select_entry(1, ScrollStrategy::Nearest, cx);
+            assert!(!graph.uncommitted_selected);
+            assert_eq!(graph.selected_entry_idx, Some(1));
 
             graph.select_entry(0, ScrollStrategy::Nearest, cx);
+            assert!(
+                graph.uncommitted_selected,
+                "moving onto the row selects the uncommitted changes, not a commit"
+            );
+            assert_eq!(graph.selected_entry_idx, None);
+
+            graph.select_entry(1, ScrollStrategy::Nearest, cx);
             assert!(!graph.uncommitted_selected);
 
             graph.clear_selection(cx);
@@ -10444,14 +10586,15 @@ mod tests {
         cx.run_until_parked();
 
         git_graph.update(cx, |graph, cx| {
-            assert_eq!(graph.graph_data.commits.len(), 3);
-            graph.select_entry(0, ScrollStrategy::Nearest, cx);
-            graph.extend_selection(1, ScrollStrategy::Nearest, cx);
+            // The staged change also puts the uncommitted row at the top.
+            assert_eq!(graph.graph_data.commits.len(), 4);
+            graph.select_entry(1, ScrollStrategy::Nearest, cx);
+            graph.extend_selection(2, ScrollStrategy::Nearest, cx);
             assert!(
                 graph.squash_base(cx).is_err(),
                 "staged changes would end up in the squashed commit"
             );
-            assert!(graph.reword_blocker(0, cx).is_some());
+            assert!(graph.reword_blocker(1, cx).is_some());
         });
     }
 
