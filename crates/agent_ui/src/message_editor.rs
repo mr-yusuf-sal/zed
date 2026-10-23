@@ -1369,17 +1369,9 @@ impl MessageEditor {
         cx.emit(MessageEditorEvent::SendImmediately)
     }
 
-    fn chat_with_follow(
-        &mut self,
-        _: &ChatWithFollow,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.workspace
-            .update(cx, |this, cx| {
-                this.follow(CollaboratorId::Agent, window, cx)
-            })
-            .log_err();
+    fn chat_with_follow(&mut self, _: &ChatWithFollow, _: &mut Window, cx: &mut Context<Self>) {
+        // Each session already follows itself in its own tab, and switching to
+        // it is left to the follow button.
 
         self.send(cx);
     }

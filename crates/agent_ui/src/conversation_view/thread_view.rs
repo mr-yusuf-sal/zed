@@ -1,5 +1,6 @@
 use crate::{
     DEFAULT_THREAD_TITLE, SelectPermissionGranularity,
+    agent_follow_tab::AgentFollowTab,
     conversation_view::thread_search_bar::{ThreadSearchBar, ThreadSearchBarEvent},
     open_abs_path_at_point, project_path_for_file_link,
     thread_metadata_store::{ThreadId, ThreadMetadataStore},
@@ -50,7 +51,7 @@ use ui::{
 };
 use url::Url;
 use util::markdown::source_position_from_fragment;
-use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
+use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME, WeakItemHandle};
 
 use super::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
@@ -664,7 +665,12 @@ pub struct ThreadView {
     pub plan_expanded: bool,
     pub queue_expanded: bool,
     pub editor_expanded: bool,
-    pub should_be_following: bool,
+    /// The session's center tab. `None` until one is opened, and a dead
+    /// handle once the user closed it, so it is not opened again on its own.
+    follow_tab: Option<WeakEntity<AgentFollowTab>>,
+    /// The tab that was active before following switched to this session's
+    /// tab, to go back to when following stops.
+    tab_before_following: Option<Box<dyn WeakItemHandle>>,
     pub editing_message: Option<usize>,
     pub message_queue: MessageQueue,
     pub turn_fields: TurnFields,
@@ -983,6 +989,17 @@ impl ThreadView {
             Self::handle_message_editor_event,
         ));
 
+        // Following shows as on while this session's tab is the active one.
+        if let Some(workspace) = workspace.upgrade() {
+            subscriptions.push(
+                cx.subscribe(&workspace, |_, _, event: &workspace::Event, cx| {
+                    if matches!(event, workspace::Event::ActiveItemChanged) {
+                        cx.notify();
+                    }
+                }),
+            );
+        }
+
         // If this thread is backed by a NativeAgent, listen for skill loading
         // issues so we can surface them as banners. The agent emits a single
         // replacement-style event per project refresh, so we overwrite our
@@ -1108,7 +1125,8 @@ impl ThreadView {
             plan_expanded: false,
             queue_expanded: true,
             editor_expanded: false,
-            should_be_following: false,
+            follow_tab: None,
+            tab_before_following: None,
             editing_message: None,
             message_queue: MessageQueue::default(),
             turn_fields: TurnFields::default(),
@@ -2007,14 +2025,6 @@ impl ThreadView {
         // was paused by a manual stop.
         self.message_queue.resume();
 
-        if self.should_be_following {
-            self.workspace
-                .update(cx, |workspace, cx| {
-                    workspace.follow(CollaboratorId::Agent, window, cx);
-                })
-                .ok();
-        }
-
         let contents_task = cx.spawn_in(window, async move |_this, cx| {
             let (contents, tracked_buffers) = contents.await?;
 
@@ -2182,12 +2192,6 @@ impl ThreadView {
                 match res {
                     Ok(Some(SubmissionResponse::LegacyCompleted(_))) => {
                         this.current_submission.take();
-                        this.should_be_following = this
-                            .workspace
-                            .update(cx, |workspace, _| {
-                                workspace.is_being_followed(CollaboratorId::Agent)
-                            })
-                            .unwrap_or_default();
                     }
                     Ok(Some(SubmissionResponse::Accepted(_))) => {}
                     Ok(None) => {}
@@ -2770,18 +2774,8 @@ impl ThreadView {
 
         let cancelled = self.thread.update(cx, |thread, cx| thread.cancel(cx));
 
-        let workspace = self.workspace.clone();
-
-        let should_be_following = self.should_be_following;
-        let contents_task = cx.spawn_in(window, async move |_this, cx| {
+        let contents_task = cx.spawn_in(window, async move |_this, _cx| {
             cancelled.await;
-            if should_be_following {
-                workspace
-                    .update_in(cx, |workspace, window, cx| {
-                        workspace.follow(CollaboratorId::Agent, window, cx);
-                    })
-                    .ok();
-            }
 
             Ok(Some((content, tracked_buffers)))
         });
@@ -3011,19 +3005,12 @@ impl ThreadView {
         session_id: acp_v1::SessionId,
         request_id: PermissionRequestId,
         outcome: SelectedPermissionOutcome,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.conversation.update(cx, |conversation, cx| {
             conversation.authorize_permission_request(session_id, request_id, outcome, cx);
         });
-        if self.should_be_following {
-            self.workspace
-                .update(cx, |workspace, cx| {
-                    workspace.follow(CollaboratorId::Agent, window, cx);
-                })
-                .ok();
-        }
         cx.notify();
     }
 
@@ -3069,20 +3056,13 @@ impl ThreadView {
     pub fn authorize_pending_tool_call(
         &mut self,
         kind: acp_v1::PermissionOptionKind,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<()> {
         let session_id = self.thread.read(cx).session_id().clone();
         self.conversation.update(cx, |conversation, cx| {
             conversation.authorize_pending_tool_call(&session_id, kind, cx)
         })?;
-        if self.should_be_following {
-            self.workspace
-                .update(cx, |workspace, cx| {
-                    workspace.follow(CollaboratorId::Agent, window, cx);
-                })
-                .ok();
-        }
         cx.notify();
         Some(())
     }
@@ -3408,19 +3388,12 @@ impl ThreadView {
         session_id: acp_v1::SessionId,
         request_id: PermissionRequestId,
         is_allow: bool,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<()> {
         self.conversation.update(cx, |conversation, cx| {
             conversation.authorize_with_granularity(session_id, request_id, is_allow, cx)
         })?;
-        if self.should_be_following {
-            self.workspace
-                .update(cx, |workspace, cx| {
-                    workspace.follow(CollaboratorId::Agent, window, cx);
-                })
-                .ok();
-        }
         cx.notify();
         Some(())
     }
@@ -3511,33 +3484,78 @@ impl ThreadView {
         cx.notify();
     }
 
-    fn is_following(&self, cx: &App) -> bool {
-        match self.thread.read(cx).status() {
-            ThreadStatus::Generating => self
-                .workspace
-                .read_with(cx, |workspace, _| {
-                    workspace.is_being_followed(CollaboratorId::Agent)
-                })
-                .unwrap_or(false),
-            _ => self.should_be_following,
+    /// Every session follows itself in its own tab; this opens that tab the
+    /// first time the session moves, without switching to it.
+    pub(crate) fn open_follow_tab_once(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.follow_tab.is_none() {
+            self.open_follow_tab(false, window, cx);
         }
     }
 
-    fn toggle_following(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let following = self.is_following(cx);
-
-        self.should_be_following = !following;
-        if self.thread.read(cx).status() == ThreadStatus::Generating {
-            self.workspace
-                .update(cx, |workspace, cx| {
-                    if following {
-                        workspace.unfollow(CollaboratorId::Agent, window, cx);
-                    } else {
-                        workspace.follow(CollaboratorId::Agent, window, cx);
-                    }
-                })
-                .ok();
+    fn open_follow_tab(&mut self, activate: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let thread = self.thread.clone();
+        let agent_name = SharedString::from(self.agent_id.to_string());
+        let icon = self.agent_icon;
+        let icon_from_external_svg = self.agent_icon_from_external_svg.clone();
+        let tab = self
+            .workspace
+            .update(cx, |workspace, cx| {
+                AgentFollowTab::deploy(
+                    thread,
+                    agent_name,
+                    icon,
+                    icon_from_external_svg,
+                    activate,
+                    workspace,
+                    window,
+                    cx,
+                )
+            })
+            .ok();
+        if let Some(tab) = tab {
+            self.follow_tab = Some(tab.downgrade());
         }
+    }
+
+    /// Whether this session's tab is the one on screen.
+    fn is_following(&self, cx: &App) -> bool {
+        let Some(tab) = self.follow_tab.as_ref().and_then(|tab| tab.upgrade()) else {
+            return false;
+        };
+        self.workspace
+            .read_with(cx, |workspace, cx| {
+                workspace
+                    .active_item(cx)
+                    .is_some_and(|item| item.item_id() == tab.entity_id())
+            })
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn toggle_following(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let following = self.is_following(cx);
+        if following {
+            let previous_tab = self
+                .tab_before_following
+                .take()
+                .and_then(|previous_tab| previous_tab.upgrade());
+            if let Some(previous_tab) = previous_tab {
+                self.workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.activate_item(previous_tab.as_ref(), true, false, window, cx);
+                    })
+                    .ok();
+            }
+        } else {
+            self.tab_before_following = self
+                .workspace
+                .read_with(cx, |workspace, cx| {
+                    workspace.active_item(cx).map(|item| item.downgrade_item())
+                })
+                .ok()
+                .flatten();
+            self.open_follow_tab(true, window, cx);
+        }
+        cx.notify();
 
         telemetry::event!("Follow Agent Selected", following = !following);
     }
@@ -6603,7 +6621,7 @@ impl ThreadView {
                     Tooltip::with_meta(
                         tooltip_label.clone(),
                         Some(&Follow),
-                        "Track the agent's location as it reads and edits files.",
+                        "Go to the tab that shows the file the agent reads or edits.",
                         cx,
                     )
                 }

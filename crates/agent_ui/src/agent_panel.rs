@@ -98,7 +98,7 @@ use ui::{
 };
 use util::ResultExt as _;
 use workspace::{
-    CollaboratorId, DraggedSelection, DraggedTab, MultiWorkspace, PathList, SerializedPathList,
+    DraggedSelection, DraggedTab, MultiWorkspace, PathList, SerializedPathList,
     ToggleWorkspaceSidebar, ToggleZoom, ToolbarItemView, Workspace, WorkspaceId,
     dock::{DockPosition, Panel, PanelEvent},
     item::{ItemEvent, ItemHandle},
@@ -435,7 +435,15 @@ pub fn init(cx: &mut App) {
                     open_project_rules(workspace, window, cx);
                 })
                 .register_action(|workspace, _: &Follow, window, cx| {
-                    workspace.follow(CollaboratorId::Agent, window, cx);
+                    let thread_view = workspace
+                        .panel::<AgentPanel>(cx)
+                        .and_then(|panel| panel.read(cx).active_conversation_view().cloned())
+                        .and_then(|conversation| conversation.read(cx).root_thread_view());
+                    if let Some(thread_view) = thread_view {
+                        thread_view.update(cx, |thread_view, cx| {
+                            thread_view.toggle_following(window, cx)
+                        });
+                    }
                 })
                 .register_action(|workspace, _: &OpenAgentDiff, window, cx| {
                     let thread = workspace
