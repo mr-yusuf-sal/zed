@@ -4,7 +4,7 @@ use project::DisableAiSettings;
 use release_channel::ReleaseChannel;
 use settings::Settings;
 use terminal_view::terminal_panel;
-use zed_actions::{Quit, assistant, debug_panel, dev, project_panel};
+use zed_actions::{Quit, assistant, debug_panel, dev, git_panel, project_panel};
 
 pub fn app_menus(cx: &mut App) -> Vec<Menu> {
     let mut view_items = vec![
@@ -50,6 +50,7 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
     }
 
     view_items.extend([
+        MenuItem::action("Git Panel", git_panel::ToggleFocus),
         MenuItem::separator(),
         MenuItem::action("Diagnostics", diagnostics::Deploy),
         MenuItem::separator(),
