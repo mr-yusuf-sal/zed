@@ -54,7 +54,7 @@ parking_lot.workspace = true
 percent-encoding.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows.workspace = true
+windows = { workspace = true, features = ["Win32_System_Console"] }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
