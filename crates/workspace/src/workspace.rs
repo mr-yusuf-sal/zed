@@ -4605,6 +4605,42 @@ impl Workspace {
         self.serialize_workspace(window, cx);
     }
 
+    /// For docks that support auto-hide, toggling steps through hidden, show-on-hover and pinned
+    /// instead of just opening and closing.
+    fn cycle_dock_auto_hide_mode(
+        &mut self,
+        dock_side: DockPosition,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dock = self.dock_at_position(dock_side).clone();
+        if !dock.read(cx).supports_auto_hide() {
+            self.toggle_dock(dock_side, window, cx);
+            return;
+        }
+
+        let (closed_with_focus, panel_focus_handle) = dock.update(cx, |dock, cx| {
+            let closed_with_focus = dock.cycle_auto_hide_mode(window, cx);
+            let panel_focus_handle = dock
+                .is_open()
+                .then(|| dock.active_panel())
+                .flatten()
+                .map(|panel| panel.activation_focus_handle(cx));
+            (closed_with_focus, panel_focus_handle)
+        });
+
+        if let Some(focus_handle) = panel_focus_handle {
+            window.focus(&focus_handle, cx);
+            self.dismiss_zoomed_items_to_reveal(Some(dock_side), window, cx);
+        } else if closed_with_focus {
+            self.active_pane
+                .update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
+        }
+
+        cx.notify();
+        self.serialize_workspace(window, cx);
+    }
+
     fn active_dock(&self, window: &Window, cx: &Context<Self>) -> Option<&Entity<Dock>> {
         self.all_docks().into_iter().find(|&dock| {
             dock.read(cx).is_open() && dock.focus_handle(cx).contains_focused(window, cx)
@@ -8220,7 +8256,7 @@ impl Workspace {
                 workspace.move_pane_to_border(SplitDirection::Down, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleLeftDock, window, cx| {
-                this.toggle_dock(DockPosition::Left, window, cx);
+                this.cycle_dock_auto_hide_mode(DockPosition::Left, window, cx);
             }))
             .on_action(cx.listener(
                 |workspace: &mut Workspace, _: &ToggleRightDock, window, cx| {

@@ -435,9 +435,13 @@ impl MultiWorkspace {
         if self.multi_workspace_enabled(cx) {
             match self.sidebar_auto_hide_mode {
                 AutoHideMode::Hidden if self.sidebar_open => self.close_sidebar(window, cx),
-                AutoHideMode::Pinned if !self.sidebar_open => {
+                AutoHideMode::Hover | AutoHideMode::Pinned if !self.sidebar_open => {
                     self.previous_focus_handle = window.focused(cx);
                     self.apply_open_sidebar(cx);
+                    if let Some(sidebar) = &self.sidebar {
+                        sidebar.prepare_for_focus(window, cx);
+                        sidebar.focus(window, cx);
+                    }
                 }
                 _ => {}
             }
@@ -2239,7 +2243,7 @@ impl Render for MultiWorkspace {
                 .when(self.multi_workspace_enabled(cx), |this| {
                     this.on_action(cx.listener(
                         |this: &mut Self, _: &ToggleWorkspaceSidebar, window, cx| {
-                            this.toggle_sidebar(window, cx);
+                            this.cycle_sidebar_auto_hide_mode(window, cx);
                         },
                     ))
                     .on_action(cx.listener(

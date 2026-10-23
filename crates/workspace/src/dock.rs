@@ -698,20 +698,29 @@ impl Dock {
         self.supports_auto_hide() && self.auto_hide_mode == AutoHideMode::Hover
     }
 
-    pub fn cycle_auto_hide_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Returns whether the dock was closed while it held focus. Moving focus elsewhere is left to
+    /// the caller because the `ToggleLeftDock` handler calls this while the workspace is already
+    /// being updated.
+    pub fn cycle_auto_hide_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if !self.supports_auto_hide() {
-            return;
+            return false;
         }
         self.auto_hide_mode = self.auto_hide_mode.next();
         self.auto_hide_task = None;
         self.auto_hide_mode
             .store(Self::auto_hide_mode_key(self.position), cx);
+        let mut closed_with_focus = false;
         match self.auto_hide_mode {
-            AutoHideMode::Hidden => self.close_and_return_focus(window, cx),
-            AutoHideMode::Pinned => self.open_with_active_panel(window, cx),
-            AutoHideMode::Hover => {}
+            AutoHideMode::Hidden => {
+                if self.is_open {
+                    closed_with_focus = self.focus_handle.contains_focused(window, cx);
+                    self.set_open(false, window, cx);
+                }
+            }
+            AutoHideMode::Hover | AutoHideMode::Pinned => self.open_with_active_panel(window, cx),
         }
         cx.notify();
+        closed_with_focus
     }
 
     fn auto_hide_mode_key(position: DockPosition) -> String {
@@ -1806,13 +1815,23 @@ impl Render for PanelButtons {
             )
             .into();
             let dock_entity = self.dock.clone();
+            let workspace = workspace.clone();
             IconButton::new(("dock-auto-hide-mode", mode as u64), mode.icon())
                 .icon_size(IconSize::Small)
                 .toggle_state(mode == AutoHideMode::Pinned)
                 .aria_label(tooltip.clone())
                 .tooltip(Tooltip::text(tooltip))
                 .on_click(move |_, window, cx| {
-                    dock_entity.update(cx, |dock, cx| dock.cycle_auto_hide_mode(window, cx));
+                    let closed_with_focus = dock_entity
+                        .update(cx, |dock, cx| dock.cycle_auto_hide_mode(window, cx));
+                    if closed_with_focus {
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                let pane = workspace.active_pane().clone();
+                                window.focus(&pane.read(cx).focus_handle(cx), cx);
+                            })
+                            .log_err();
+                    }
                 })
         });
 
