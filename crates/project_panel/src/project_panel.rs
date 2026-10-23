@@ -1031,7 +1031,8 @@ impl ProjectPanel {
     ) -> Option<Entity<Self>> {
         let project_panel = workspace.panel::<ProjectPanel>(cx)?;
         workspace.activate_permanent_item(window, cx);
-        window.focus(&project_panel.read(cx).focus_handle, cx);
+        let focus_handle = project_panel.read(cx).focus_handle.clone();
+        window.focus(&focus_handle, cx);
         Some(project_panel)
     }
 
