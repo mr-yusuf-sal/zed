@@ -301,6 +301,7 @@ impl TerminalPanel {
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<WeakEntity<Terminal>>>> {
         self.restoring = false;
+        self.take_terminals_from_other_workspaces(window, cx);
         let has_terminals = self
             .center
             .panes()
@@ -1232,6 +1233,12 @@ impl TerminalPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Restoration rebuilds the panel's tree and re-adds panes that already
+        // hold terminals as a flat row, which would undo the moved splits.
+        // `finish_restoration` gathers the terminals once it is done instead.
+        if self.restoring {
+            return;
+        }
         let Ok(project) = self
             .workspace
             .read_with(cx, |workspace, _| workspace.project().clone())
@@ -1279,6 +1286,43 @@ impl TerminalPanel {
         }
         self.serialize(cx);
         cx.notify();
+    }
+
+    /// Pulls in the terminals of every other workspace in this window when this
+    /// panel's workspace is the one on screen.
+    ///
+    /// The sidebar creates a project's workspace the first time it is switched
+    /// to, and its terminal panel finishes loading after the switch has been
+    /// announced, so the hand-over on `ActiveWorkspaceChanged` has no panel to
+    /// move the terminals into. Must not be called while the multi-workspace
+    /// or this panel's workspace is being updated.
+    fn take_terminals_from_other_workspaces(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let Some(multi_workspace) = workspace
+            .read(cx)
+            .multi_workspace()
+            .and_then(|multi_workspace| multi_workspace.upgrade())
+        else {
+            return;
+        };
+        let multi_workspace = multi_workspace.read(cx);
+        if multi_workspace.workspace() != &workspace {
+            return;
+        }
+        let other_terminal_panels = multi_workspace
+            .workspaces()
+            .filter(|other_workspace| *other_workspace != &workspace)
+            .filter_map(|other_workspace| other_workspace.read(cx).panel::<TerminalPanel>(cx))
+            .collect::<Vec<_>>();
+        for other_terminal_panel in &other_terminal_panels {
+            self.take_terminals_from(other_terminal_panel, window, cx);
+        }
     }
 
     fn build_terminal_layout(
@@ -1944,10 +1988,16 @@ impl Panel for TerminalPanel {
     fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
         let old_active = self.active;
         self.active = active;
-        if !active || old_active == active || self.restoring || !self.has_no_terminals(cx) {
+        if !active || old_active == active {
             return;
         }
+        // Deferred because the dock calls this while the workspace is being
+        // updated, and gathering terminals reads the workspace.
         cx.defer_in(window, |this, window, cx| {
+            this.take_terminals_from_other_workspaces(window, cx);
+            if this.restoring || !this.has_no_terminals(cx) {
+                return;
+            }
             let Ok(kind) = this
                 .workspace
                 .update(cx, |workspace, cx| default_working_directory(workspace, cx))
