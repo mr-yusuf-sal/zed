@@ -1436,3 +1436,125 @@ fn sqlserver_explain_leaves_the_session_as_it_was() {
         assert_eq!(cell(&after, 0, 0).as_deref(), Some("1"));
     });
 }
+
+fn key(column: &str, value: &str) -> Vec<(SharedString, Option<SharedString>)> {
+    vec![(
+        SharedString::from(column.to_string()),
+        Some(SharedString::from(value.to_string())),
+    )]
+}
+
+fn values(pairs: &[(&str, &str)]) -> Vec<(SharedString, String)> {
+    pairs
+        .iter()
+        .map(|(column, value)| (SharedString::from(column.to_string()), value.to_string()))
+        .collect()
+}
+
+#[test]
+#[ignore = "needs a live postgres"]
+fn postgres_insert_and_delete_rows() {
+    runtime().block_on(async {
+        let driver = postgres().await;
+        driver
+            .query(
+                "DROP TABLE IF EXISTS public.quarry_live_rows;
+                 CREATE TABLE public.quarry_live_rows (
+                     id serial PRIMARY KEY, name text NOT NULL, note text DEFAULT 'x',
+                     doubled int GENERATED ALWAYS AS (length(name) * 2) STORED)",
+                Some("app"),
+                10,
+            )
+            .await
+            .expect("creating the scratch table");
+        let table = path(&["app", "public", "quarry_live_rows"]);
+        let empty = driver.preview(&table, 10).await.expect("preview");
+        let target = empty.edit_target.expect("an edit target");
+        let insertable: Vec<&str> = target
+            .insert_columns
+            .iter()
+            .map(|&index| empty.columns[index].as_ref())
+            .collect();
+        assert_eq!(insertable, ["id", "name", "note"]);
+
+        assert_eq!(
+            driver
+                .insert_row(&table, &values(&[("name", "ayşe")]))
+                .await
+                .expect("inserting"),
+            1
+        );
+        let rows = driver.preview(&table, 10).await.expect("preview");
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows[0][2].as_deref(), Some("x"));
+        assert_eq!(rows.rows[0][3].as_deref(), Some("8"));
+        let id = rows.rows[0][0].clone().expect("an id").to_string();
+        assert_eq!(
+            driver
+                .delete_row(&table, &key("id", &id))
+                .await
+                .expect("deleting"),
+            1
+        );
+        assert!(driver.delete_row(&table, &key("id", &id)).await.is_err());
+
+        driver
+            .query("DROP TABLE public.quarry_live_rows", Some("app"), 10)
+            .await
+            .expect("dropping the scratch table");
+    });
+}
+
+#[test]
+#[ignore = "needs a live sql server"]
+fn sqlserver_insert_and_delete_rows() {
+    runtime().block_on(async {
+        let driver = sqlserver().await;
+        driver
+            .query(
+                "DROP TABLE IF EXISTS dbo.quarry_live_rows;
+                 CREATE TABLE dbo.quarry_live_rows (
+                     id int IDENTITY PRIMARY KEY, name nvarchar(50) NOT NULL,
+                     note nvarchar(50) DEFAULT N'x')",
+                Some("app"),
+                10,
+            )
+            .await
+            .expect("creating the scratch table");
+        let table = path(&["app", "dbo", "quarry_live_rows"]);
+        let empty = driver.preview(&table, 10).await.expect("preview");
+        let target = empty.edit_target.expect("an edit target");
+        let insertable: Vec<&str> = target
+            .insert_columns
+            .iter()
+            .map(|&index| empty.columns[index].as_ref())
+            .collect();
+        assert_eq!(insertable, ["name", "note"]);
+
+        assert_eq!(
+            driver
+                .insert_row(&table, &values(&[("name", "Ayşe")]))
+                .await
+                .expect("inserting"),
+            1
+        );
+        let rows = driver.preview(&table, 10).await.expect("preview");
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows[0][1].as_deref(), Some("Ayşe"));
+        assert_eq!(rows.rows[0][2].as_deref(), Some("x"));
+        let id = rows.rows[0][0].clone().expect("an id").to_string();
+        assert_eq!(
+            driver
+                .delete_row(&table, &key("id", &id))
+                .await
+                .expect("deleting"),
+            1
+        );
+        assert!(driver.delete_row(&table, &key("id", &id)).await.is_err());
+
+        driver
+            .query("DROP TABLE dbo.quarry_live_rows", Some("app"), 10)
+            .await
+            .expect("dropping the scratch table");
+    });
+}

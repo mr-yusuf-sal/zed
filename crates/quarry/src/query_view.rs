@@ -88,6 +88,14 @@ struct PendingEdit {
     saving: bool,
 }
 
+/// The form under the grid for adding a row to the object the active result came from.
+struct PendingInsert {
+    path: Vec<SharedString>,
+    /// Each column the new row is given a value for, with the editor it is typed in.
+    fields: Vec<(SharedString, Entity<Editor>)>,
+    saving: bool,
+}
+
 /// The table, collection or key a preview tab was opened on, kept while its rows are on screen
 /// so that "Load More" can read the rows after them. They come from `QueryView::driver`, which
 /// is the driver the panel read the first page with.
@@ -118,6 +126,7 @@ pub struct QueryView {
     visible_rows: Vec<usize>,
     status: Status,
     pending_edit: Option<PendingEdit>,
+    pending_insert: Option<PendingInsert>,
     /// Set while the grid shows a preview from the tree; it is the only result then. Any other
     /// result replacing it clears this.
     preview: Option<PreviewSource>,
@@ -213,6 +222,7 @@ impl QueryView {
             visible_rows: Vec::new(),
             status: Status::Idle,
             pending_edit: None,
+            pending_insert: None,
             preview: None,
             record: None,
             selected_row: None,
@@ -660,6 +670,7 @@ impl QueryView {
     fn set_results(&mut self, results: Vec<ResultSet>, cx: &mut Context<Self>) {
         self.results = results;
         self.pending_edit = None;
+        self.pending_insert = None;
         self.preview = None;
         self.selected_row = None;
         self.select_result(0, cx);
@@ -853,6 +864,221 @@ impl QueryView {
         cx.notify();
     }
 
+    /// Opens the form for a new row, with one field per column the driver lets a new row set.
+    fn start_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(result) = self.active() else {
+            return;
+        };
+        let Some(target) = result.edit_target.clone() else {
+            return;
+        };
+        let columns: Vec<SharedString> = target
+            .insert_columns
+            .iter()
+            .filter_map(|&index| result.columns.get(index).cloned())
+            .collect();
+        let fields: Vec<(SharedString, Entity<Editor>)> = columns
+            .into_iter()
+            .map(|column| {
+                let editor = cx.new(|cx| {
+                    let mut editor = Editor::single_line(window, cx);
+                    editor.set_placeholder_text("default", window, cx);
+                    editor
+                });
+                (column, editor)
+            })
+            .collect();
+        if let Some((_, first)) = fields.first() {
+            first.focus_handle(cx).focus(window, cx);
+        }
+        self.pending_edit = None;
+        self.pending_insert = Some(PendingInsert {
+            path: target.path,
+            fields,
+            saving: false,
+        });
+        cx.notify();
+    }
+
+    /// Adds the row the form describes, asking first on a production connection. A field left
+    /// blank is left out, so the column gets its default.
+    fn save_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_insert.as_ref() else {
+            return;
+        };
+        if pending.saving {
+            return;
+        }
+        let values: Vec<(SharedString, String)> = pending
+            .fields
+            .iter()
+            .map(|(column, editor)| (column.clone(), editor.read(cx).text(cx)))
+            .filter(|(_, text)| !text.is_empty())
+            .collect();
+        let path = pending.path.clone();
+        if self.environment(cx) != Some(Environment::Production) {
+            self.insert_row(path, values, cx);
+            return;
+        }
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Add a row on production ({})?", self.config.name),
+            Some(&format!("A new row is added to {}.", path.join("."))),
+            &["Add", "Cancel"],
+            cx,
+        );
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            if answer.await == Ok(0) {
+                this.update(cx, |this, cx| this.insert_row(path, values, cx))
+                    .ok();
+            }
+        }));
+    }
+
+    fn insert_row(
+        &mut self,
+        path: Vec<SharedString>,
+        values: Vec<(SharedString, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(driver), Some(runtime)) = (self.driver.clone(), QuarryRuntime::global(cx)) else {
+            return;
+        };
+        if let Some(pending) = self.pending_insert.as_mut() {
+            pending.saving = true;
+        }
+        let inserted = {
+            let path = path.clone();
+            runtime.spawn(async move { driver.insert_row(&path, &values).await })
+        };
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let inserted = inserted.await;
+            this.update(cx, |this, cx| {
+                match inserted {
+                    Ok(rows) => {
+                        this.pending_insert = None;
+                        this.reload_after_change(path, format!("{rows} row(s) added"), cx);
+                    }
+                    Err(error) => {
+                        if let Some(pending) = this.pending_insert.as_mut() {
+                            pending.saving = false;
+                        }
+                        this.status = Status::Failed(format!("{error:#}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Deletes the row selected in the grid, after asking.
+    fn confirm_delete_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(row) = self.selected_row else {
+            self.status = Status::Failed("select a cell in the row to delete first".into());
+            cx.notify();
+            return;
+        };
+        let Some(result) = self.active() else {
+            return;
+        };
+        let Some(target) = result.edit_target.clone() else {
+            return;
+        };
+        let Some(cells) = result.rows.get(row) else {
+            return;
+        };
+        let key: Vec<(SharedString, Option<SharedString>)> = target
+            .key_columns
+            .iter()
+            .filter_map(|&index| {
+                Some((
+                    result.columns.get(index)?.clone(),
+                    cells.get(index).cloned().flatten(),
+                ))
+            })
+            .collect();
+        if key.is_empty() {
+            return;
+        }
+        let description = key
+            .iter()
+            .map(|(column, value)| format!("{column} = {}", value.as_deref().unwrap_or("NULL")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Delete the row {description}?"),
+            Some(&format!(
+                "It is removed from {} on {}.",
+                target.path.join("."),
+                self.config.name
+            )),
+            &["Delete", "Cancel"],
+            cx,
+        );
+        let (Some(driver), Some(runtime)) = (self.driver.clone(), QuarryRuntime::global(cx)) else {
+            return;
+        };
+        let path = target.path;
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            let deleted = {
+                let path = path.clone();
+                runtime.spawn(async move { driver.delete_row(&path, &key).await })
+            }
+            .await;
+            this.update(cx, |this, cx| {
+                match deleted {
+                    Ok(rows) => {
+                        this.reload_after_change(path, format!("{rows} row(s) deleted"), cx)
+                    }
+                    Err(error) => this.status = Status::Failed(format!("{error:#}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Reads the first page of `path` again after a row was added or deleted there, so the grid
+    /// shows the object as it now is, and says what changed.
+    fn reload_after_change(
+        &mut self,
+        path: Vec<SharedString>,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(driver), Some(runtime)) = (self.driver.clone(), QuarryRuntime::global(cx)) else {
+            return;
+        };
+        let page = {
+            let path = path.clone();
+            runtime.spawn(async move { driver.preview(&path, PREVIEW_ROW_LIMIT).await })
+        };
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let page = page.await;
+            this.update(cx, |this, cx| {
+                match page {
+                    Ok(page) => {
+                        this.show_preview(path, page, cx);
+                        this.status = Status::Updated(message.into());
+                    }
+                    Err(error) => {
+                        this.status = Status::Failed(
+                            format!("{message}, but reading it again failed: {error:#}").into(),
+                        )
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     fn cell_edit(
         &self,
         result_index: usize,
@@ -953,6 +1179,9 @@ impl QueryView {
         let has_result = self
             .active()
             .is_some_and(|result| !result.columns.is_empty());
+        let target = self.active().and_then(|result| result.edit_target.as_ref());
+        let can_insert = target.is_some_and(|target| !target.insert_columns.is_empty());
+        let can_delete = target.is_some_and(|target| !target.key_columns.is_empty());
         let this = cx.entity().downgrade();
 
         h_flex()
@@ -1048,6 +1277,26 @@ impl QueryView {
                 )
             })
             .child(div().flex_1())
+            .when(can_insert, |toolbar| {
+                toolbar.child(
+                    IconButton::new("quarry-add-row", IconName::Plus)
+                        .icon_size(IconSize::Small)
+                        .disabled(running || self.pending_insert.is_some())
+                        .tooltip(Tooltip::text("Add Row"))
+                        .on_click(cx.listener(|this, _, window, cx| this.start_insert(window, cx))),
+                )
+            })
+            .when(can_delete, |toolbar| {
+                toolbar.child(
+                    IconButton::new("quarry-delete-row", IconName::Trash)
+                        .icon_size(IconSize::Small)
+                        .disabled(running || self.selected_row.is_none())
+                        .tooltip(Tooltip::text("Delete the Selected Row"))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.confirm_delete_row(window, cx)),
+                        ),
+                )
+            })
             .when(has_result, |toolbar| {
                 toolbar.child(div().w_48().child(self.search.clone()))
             })
@@ -1258,6 +1507,71 @@ impl QueryView {
                 }))
                 .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
                     this.pending_edit = None;
+                    this.table.focus_handle(cx).focus(window, cx);
+                    cx.notify();
+                }))
+                .into_any_element(),
+        )
+    }
+
+    fn render_insert_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let pending = self.pending_insert.as_ref()?;
+        Some(
+            v_flex()
+                .w_full()
+                .gap_0p5()
+                .px_2()
+                .py_1()
+                .border_t_1()
+                .border_color(cx.theme().colors().border)
+                .child(
+                    Label::new(SharedString::from(format!(
+                        "New row in {} · blank fields get their default",
+                        pending.path.join(".")
+                    )))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                )
+                .child(
+                    v_flex()
+                        .id("quarry-insert-fields")
+                        .max_h(px(200.))
+                        .overflow_y_scroll()
+                        .gap_0p5()
+                        .children(pending.fields.iter().map(|(column, editor)| {
+                            h_flex()
+                                .gap_1()
+                                .child(div().w_32().flex_none().child(
+                                    Label::new(column.clone()).size(LabelSize::Small).truncate(),
+                                ))
+                                .child(div().flex_1().child(editor.clone()))
+                        })),
+                )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Button::new("quarry-insert-save", "Add Row")
+                                .label_size(LabelSize::Small)
+                                .disabled(pending.saving)
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.save_insert(window, cx)),
+                                ),
+                        )
+                        .child(
+                            Button::new("quarry-insert-cancel", "Cancel")
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.pending_insert = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                    this.save_insert(window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
+                    this.pending_insert = None;
                     this.table.focus_handle(cx).focus(window, cx);
                     cx.notify();
                 }))
@@ -1557,6 +1871,7 @@ impl Render for QueryView {
                     })),
             )
             .children(self.render_edit_bar(cx))
+            .children(self.render_insert_bar(cx))
             .child(self.render_status(cx))
     }
 }
@@ -1739,6 +2054,7 @@ mod tests {
                     path: path.to_vec(),
                     key_columns: vec![id_column],
                     read_only_columns: vec![id_column],
+                    insert_columns: Vec::new(),
                 }),
                 ..ResultSet::default()
             }

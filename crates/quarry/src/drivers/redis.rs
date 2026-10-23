@@ -1,5 +1,6 @@
 use crate::driver::{
     CatalogEntry, CellEdit, Driver, EditTarget, KeyAction, ObjectKind, ObjectNode, ResultSet,
+    RowKey,
 };
 use anyhow::{Context as _, Result, anyhow, bail};
 use collections::{BTreeMap, HashMap, HashSet};
@@ -633,13 +634,15 @@ impl Driver for RedisDriver {
         // The last index of a ranged read, one past the page to learn whether it was cut short.
         let last = (offset + row_limit) as isize;
 
-        let edit_target = |key_columns: Vec<usize>| {
-            Some(EditTarget {
-                path: path.to_vec(),
-                read_only_columns: key_columns.clone(),
-                key_columns,
-            })
-        };
+        let edit_target =
+            |key_columns: Vec<usize>, read_only_columns: Vec<usize>, insert_columns: Vec<usize>| {
+                Some(EditTarget {
+                    path: path.to_vec(),
+                    key_columns,
+                    read_only_columns,
+                    insert_columns,
+                })
+            };
 
         // Each type needs its own read command; there is no generic "get whatever this is".
         // Ranged reads ask for one more item than shown to learn whether the page was cut short.
@@ -673,7 +676,7 @@ impl Driver for RedisDriver {
                     ResultSet {
                         columns: columns(&["value"]),
                         rows: string_rows([vec![text(&value)]]),
-                        edit_target: edit_target(Vec::new()),
+                        edit_target: edit_target(Vec::new(), Vec::new(), Vec::new()),
                         ..ResultSet::default()
                     }
                 }
@@ -694,7 +697,8 @@ impl Driver for RedisDriver {
                             vec![SharedString::from((offset + index).to_string()), text(item)]
                         },
                     )),
-                    edit_target: edit_target(vec![0]),
+                    // A new item is pushed onto the end; its index is the list's to give.
+                    edit_target: edit_target(vec![0], vec![0], vec![1]),
                     ..ResultSet::default()
                 }
             }
@@ -709,7 +713,7 @@ impl Driver for RedisDriver {
                     .skip(offset)
                     .collect();
                 // Members are their own identity: changing one is a remove plus an add, not an
-                // edit, so the set is shown read-only.
+                // edit, so a member can be added or deleted but not edited.
                 ResultSet {
                     columns: columns(&["member"]),
                     truncated: more || members.len() > row_limit,
@@ -719,6 +723,7 @@ impl Driver for RedisDriver {
                             .take(row_limit)
                             .map(|member| vec![text(member)]),
                     ),
+                    edit_target: edit_target(vec![0], vec![0], vec![0]),
                     ..ResultSet::default()
                 }
             }
@@ -737,7 +742,7 @@ impl Driver for RedisDriver {
                     rows: string_rows(items.iter().take(row_limit).map(|(member, score)| {
                         vec![text(member), SharedString::from(score.clone())]
                     })),
-                    edit_target: edit_target(vec![0]),
+                    edit_target: edit_target(vec![0], vec![0], vec![0, 1]),
                     ..ResultSet::default()
                 }
             }
@@ -764,7 +769,7 @@ impl Driver for RedisDriver {
                             .take(row_limit)
                             .map(|(field, value)| vec![text(field), text(value)]),
                     ),
-                    edit_target: edit_target(vec![0]),
+                    edit_target: edit_target(vec![0], vec![0], vec![0, 1]),
                     ..ResultSet::default()
                 }
             }
@@ -797,11 +802,13 @@ impl Driver for RedisDriver {
                         SharedString::from(serde_json::Value::Object(object).to_string()),
                     ]
                 });
-                // Stream entries are append-only by design; there is no command to change one.
+                // Stream entries are append-only by design; there is no command to change one,
+                // only to add one (with an id the server picks) or delete one.
                 ResultSet {
                     columns: columns(&["id", "fields"]),
                     truncated: entries.len() > row_limit,
                     rows: string_rows(rows),
+                    edit_target: edit_target(vec![0], vec![0, 1], vec![1]),
                     ..ResultSet::default()
                 }
             }
@@ -928,6 +935,159 @@ impl Driver for RedisDriver {
             }
         }
         Ok(())
+    }
+
+    async fn insert_row(
+        &self,
+        path: &[SharedString],
+        values: &[(SharedString, String)],
+    ) -> Result<u64> {
+        let (database, key) = Self::locate(path)?;
+        if path.len() < 2 {
+            bail!("expected a key, got a database");
+        }
+        let value = |column: &str| {
+            values
+                .iter()
+                .find(|(name, _)| name.as_ref() == column)
+                .map(|(_, value)| value.as_str())
+                .with_context(|| format!("a new item needs a {column}"))
+        };
+        let mut connection = self.connection(database).await?;
+        let kind: String = redis::cmd("TYPE")
+            .arg(&key)
+            .query_async(&mut connection)
+            .await
+            .context("reading the key's type")?;
+        // Each add refuses to replace an existing item: changing one is what editing a cell is
+        // for, and a new row that silently overwrote one would lose its old value.
+        let added: u64 = match kind.as_str() {
+            "list" => {
+                redis::cmd("RPUSH")
+                    .arg(&key)
+                    .arg(value("value")?)
+                    .exec_async(&mut connection)
+                    .await
+                    .with_context(|| format!("pushing onto {key}"))?;
+                1
+            }
+            "hash" => redis::cmd("HSETNX")
+                .arg(&key)
+                .arg(value("field")?)
+                .arg(value("value")?)
+                .query_async(&mut connection)
+                .await
+                .with_context(|| format!("adding a field to {key}"))?,
+            "set" => redis::cmd("SADD")
+                .arg(&key)
+                .arg(value("member")?)
+                .query_async(&mut connection)
+                .await
+                .with_context(|| format!("adding a member to {key}"))?,
+            "zset" => {
+                let score: f64 = value("score")?
+                    .trim()
+                    .parse()
+                    .context("the score is not a number")?;
+                redis::cmd("ZADD")
+                    .arg(&key)
+                    .arg("NX")
+                    .arg(score)
+                    .arg(value("member")?)
+                    .query_async(&mut connection)
+                    .await
+                    .with_context(|| format!("adding a member to {key}"))?
+            }
+            "stream" => {
+                let fields: serde_json::Map<String, serde_json::Value> =
+                    serde_json::from_str(value("fields")?)
+                        .context("the fields must be a JSON object, e.g. {\"name\": \"value\"}")?;
+                if fields.is_empty() {
+                    bail!("a stream entry needs at least one field");
+                }
+                let mut command = redis::cmd("XADD");
+                command.arg(&key).arg("*");
+                for (field, value) in fields {
+                    let value = match value {
+                        serde_json::Value::String(text) => text,
+                        other => other.to_string(),
+                    };
+                    command.arg(field).arg(value);
+                }
+                command
+                    .exec_async(&mut connection)
+                    .await
+                    .with_context(|| format!("adding an entry to {key}"))?;
+                1
+            }
+            "none" => bail!("{key} no longer exists"),
+            other => bail!("rows cannot be added to a Redis {other}"),
+        };
+        if added == 0 {
+            bail!("{key} already has that item; nothing was added");
+        }
+        Ok(added)
+    }
+
+    async fn delete_row(&self, path: &[SharedString], row_key: &RowKey) -> Result<u64> {
+        let (database, key) = Self::locate(path)?;
+        if path.len() < 2 {
+            bail!("expected a key, got a database");
+        }
+        let (_, item) = row_key
+            .first()
+            .context("the row does not say which item it is")?;
+        let item = item.as_deref().context("the row's key is empty")?;
+        let mut connection = self.connection(database).await?;
+        let kind: String = redis::cmd("TYPE")
+            .arg(&key)
+            .query_async(&mut connection)
+            .await
+            .context("reading the key's type")?;
+        let command = match kind.as_str() {
+            "hash" => "HDEL",
+            "set" => "SREM",
+            "zset" => "ZREM",
+            "stream" => "XDEL",
+            "list" => {
+                // A list item has only its position, and LREM removes by value, so the item is
+                // first overwritten with a value nothing else holds and that value removed.
+                let index: i64 = item.parse().context("the list index is not a number")?;
+                let marker = format!(
+                    "\u{0}quarry-deleted-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|elapsed| elapsed.as_nanos())
+                        .unwrap_or_default()
+                );
+                let (_, removed): ((), u64) = redis::pipe()
+                    .atomic()
+                    .cmd("LSET")
+                    .arg(&key)
+                    .arg(index)
+                    .arg(&marker)
+                    .cmd("LREM")
+                    .arg(&key)
+                    .arg(1)
+                    .arg(&marker)
+                    .query_async(&mut connection)
+                    .await
+                    .with_context(|| format!("deleting {key}[{index}]"))?;
+                return Ok(removed);
+            }
+            "none" => bail!("{key} no longer exists"),
+            other => bail!("rows cannot be deleted from a Redis {other}"),
+        };
+        let removed: u64 = redis::cmd(command)
+            .arg(&key)
+            .arg(item)
+            .query_async(&mut connection)
+            .await
+            .with_context(|| format!("deleting {item} from {key}"))?;
+        if removed == 0 {
+            bail!("{key} no longer has {item:?}; nothing was deleted");
+        }
+        Ok(removed)
     }
 
     async fn update_cell(&self, edit: &CellEdit) -> Result<u64> {

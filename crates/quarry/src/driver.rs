@@ -135,7 +135,13 @@ pub struct EditTarget {
     pub key_columns: Vec<usize>,
     /// Indexes into `ResultSet::columns` that can be shown but not changed.
     pub read_only_columns: Vec<usize>,
+    /// Indexes into `ResultSet::columns` that a new row is given values for, in the order the
+    /// form asks for them. Empty when rows cannot be added this way.
+    pub insert_columns: Vec<usize>,
 }
+
+/// A row's key, as `CellEdit::key`: each key column's name and its value as displayed.
+pub type RowKey = [(SharedString, Option<SharedString>)];
 
 /// One cell change, built by the UI from an [`EditTarget`] and handed back to the driver that
 /// produced it.
@@ -355,6 +361,22 @@ pub trait Driver: Send + Sync {
 
     async fn key_action(&self, path: &[SharedString], _action: &KeyAction) -> Result<()> {
         anyhow::bail!("{} is not a key", path.join("."))
+    }
+
+    /// Adds one row to the object at `path`. `values` holds the text typed for each column
+    /// given one; a column left out gets its default. Returns how many rows were added.
+    async fn insert_row(
+        &self,
+        path: &[SharedString],
+        _values: &[(SharedString, String)],
+    ) -> Result<u64> {
+        anyhow::bail!("adding rows to {} is not supported", path.join("."))
+    }
+
+    /// Deletes the one row `key` identifies. Implementations must refuse rather than delete
+    /// anything else when the key matches no row or several.
+    async fn delete_row(&self, path: &[SharedString], _key: &RowKey) -> Result<u64> {
+        anyhow::bail!("deleting rows from {} is not supported", path.join("."))
     }
 
     /// Applies one cell change and returns how many rows it touched. Implementations must
