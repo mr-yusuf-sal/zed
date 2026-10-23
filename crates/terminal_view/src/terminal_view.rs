@@ -3,6 +3,7 @@ pub mod terminal_element;
 pub mod terminal_panel;
 mod terminal_path_like_target;
 pub mod terminal_scrollbar;
+mod working_directory_picker;
 
 use editor::{
     Editor, EditorSettings, actions::SelectAll, blink_manager::BlinkManager,

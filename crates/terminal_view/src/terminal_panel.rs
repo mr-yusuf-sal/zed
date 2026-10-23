@@ -6,6 +6,7 @@ use crate::{
         SerializedItems, SerializedTerminalPanel, deserialize_terminal_panel, end_hosted_sessions,
         serialize_pane_group,
     },
+    working_directory_picker::{pick_working_directory, working_directory_choices},
 };
 use breadcrumbs::Breadcrumbs;
 use collections::HashMap;
@@ -785,10 +786,46 @@ impl TerminalPanel {
             .read(cx)
             .active_item()
             .is_some_and(|item| item.downcast::<TerminalView>().is_some());
+        // Decided before asking for a directory, which moves focus to the picker.
+        let in_center = center_pane_has_focus && active_center_item_is_terminal;
+        let local = action.local;
 
-        if center_pane_has_focus && active_center_item_is_terminal {
+        let directories = working_directory_choices(workspace, cx);
+        if directories.len() <= 1 {
             let working_directory = default_working_directory(workspace, cx);
-            let local = action.local;
+            Self::open_new_terminal(workspace, local, working_directory, in_center, window, cx);
+            return;
+        }
+        let picked = pick_working_directory(directories, workspace.weak_handle(), window, cx);
+        cx.spawn_in(window, async move |workspace, cx| {
+            let Some(working_directory) = picked.await else {
+                return;
+            };
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    Self::open_new_terminal(
+                        workspace,
+                        local,
+                        Some(working_directory),
+                        in_center,
+                        window,
+                        cx,
+                    );
+                })
+                .log_err();
+        })
+        .detach();
+    }
+
+    fn open_new_terminal(
+        workspace: &mut Workspace,
+        local: bool,
+        working_directory: Option<PathBuf>,
+        in_center: bool,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        if in_center {
             Self::add_center_terminal(workspace, window, cx, move |project, cx| {
                 if local {
                     project.create_local_terminal(cx)
@@ -807,8 +844,8 @@ impl TerminalPanel {
         terminal_panel
             .update(cx, |this, cx| {
                 this.add_terminal_shell(
-                    action.local,
-                    default_working_directory(workspace, cx),
+                    local,
+                    working_directory,
                     RevealStrategy::Always,
                     window,
                     cx,
