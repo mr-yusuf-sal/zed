@@ -78,6 +78,65 @@ impl ProcessIdGetter {
     }
 }
 
+/// Windows has no foreground process group, so the PTY's process is always the shell itself.
+/// Approximate the foreground process by walking down from the shell to the first descendant
+/// that isn't another shell or launcher (e.g. `claude.cmd` runs through `cmd.exe`).
+#[cfg(windows)]
+fn foreground_descendant(shell_pid: Pid) -> Pid {
+    use windows::Win32::{
+        Foundation::CloseHandle,
+        System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            TH32CS_SNAPPROCESS,
+        },
+    };
+
+    const MAX_DEPTH: usize = 8;
+
+    let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
+        return shell_pid;
+    };
+    let mut processes = Vec::new();
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok();
+    while has_entry {
+        let name_len = entry
+            .szExeFile
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(entry.szExeFile.len());
+        let name = String::from_utf16_lossy(&entry.szExeFile[..name_len]).to_ascii_lowercase();
+        processes.push((entry.th32ProcessID, entry.th32ParentProcessID, name));
+        has_entry = unsafe { Process32NextW(snapshot, &mut entry) }.is_ok();
+    }
+    unsafe { CloseHandle(snapshot) }.ok();
+
+    let mut current = shell_pid.as_u32();
+    for _ in 0..MAX_DEPTH {
+        // The snapshot lists processes roughly in creation order, so the last child is the
+        // most recently started one.
+        let Some((child_pid, _, name)) = processes.iter().rev().find(|(pid, parent, name)| {
+            *parent == current
+                && *pid != current
+                && !matches!(name.as_str(), "conhost.exe" | "openconsole.exe")
+        }) else {
+            break;
+        };
+        current = *child_pid;
+        let name = name.strip_suffix(".exe").unwrap_or(name);
+        if !matches!(
+            name,
+            "pwsh" | "powershell" | "cmd" | "bash" | "zsh" | "fish" | "sh" | "nu" | "elvish"
+        ) {
+            break;
+        }
+    }
+    Pid::from_u32(current)
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ProcessInfo {
     pub(crate) name: String,
@@ -133,6 +192,8 @@ impl PtyProcessInfo {
 
     fn refresh(&self) -> Option<MappedRwLockReadGuard<'_, Process>> {
         let pid = self.pid_getter.pid()?;
+        #[cfg(windows)]
+        let pid = foreground_descendant(pid);
         let fallback_pid = self.pid_getter.fallback_pid();
         let mut system = self.system.write();
         // sysinfo never evicts processes that are absent from the refreshed pid
