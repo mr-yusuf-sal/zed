@@ -1053,8 +1053,10 @@ impl Client {
         let mut is_staff_tx = Some(is_staff_tx);
         cx.update(|cx| {
             cx.on_flags_ready(move |state, _cx| {
+                // The receiver is gone when this sign-in attempt failed, and
+                // the startup sign-in retries offline, so that is expected.
                 if let Some(is_staff_tx) = is_staff_tx.take() {
-                    is_staff_tx.send(state.is_staff).log_err();
+                    is_staff_tx.send(state.is_staff).ok();
                 }
             })
             .detach();
