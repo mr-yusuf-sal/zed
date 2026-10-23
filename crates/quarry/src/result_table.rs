@@ -305,6 +305,7 @@ mod tests {
             path: vec![SharedString::from("app"), SharedString::from("users")],
             key_columns: vec![0],
             read_only_columns: vec![0],
+            insert_columns: Vec::new(),
         };
         let mut result = ResultSet {
             columns: vec![SharedString::from("_id"), SharedString::from("name")],

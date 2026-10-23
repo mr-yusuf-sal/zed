@@ -556,8 +556,15 @@ fn redis_preview_every_type() {
             let names: Vec<&str> = result.columns.iter().map(|name| name.as_ref()).collect();
             assert_eq!(names, columns);
             assert!(result.rows.len() <= 5);
+            // Every type takes new rows or deletes them, but a set member and a stream entry
+            // cannot be edited in place: every one of their columns is a key or read-only.
+            let target = result.edit_target.as_ref().expect("an edit target");
+            let editable = (0..result.columns.len()).any(|column| {
+                !target.key_columns.contains(&column)
+                    && !target.read_only_columns.contains(&column)
+            });
             assert_eq!(
-                result.edit_target.is_some(),
+                editable,
                 !matches!(kind, "set" | "stream"),
                 "{kind} editability"
             );
@@ -1372,5 +1379,163 @@ fn mongodb_rows_keep_their_documents() {
         let first = preview.documents[0].as_deref().expect("a document");
         let json: serde_json::Value = serde_json::from_str(first).expect("indented JSON");
         assert!(json.get("_id").is_some());
+    });
+}
+
+fn row_values(pairs: &[(&str, &str)]) -> Vec<(SharedString, String)> {
+    pairs
+        .iter()
+        .map(|(column, value)| (SharedString::from(column.to_string()), value.to_string()))
+        .collect()
+}
+
+fn row_key(column: &str, value: &str) -> Vec<(SharedString, Option<SharedString>)> {
+    vec![(
+        SharedString::from(column.to_string()),
+        Some(SharedString::from(value.to_string())),
+    )]
+}
+
+#[test]
+#[ignore = "needs the quarry mongodb on :27018"]
+fn mongodb_insert_and_delete_documents() {
+    runtime().block_on(async {
+        let driver = mongo_driver().await;
+        let collection = path(&["app", "quarry_live_rows"]);
+        driver
+            .query("{\"drop\": \"quarry_live_rows\"}", Some("app"), 10)
+            .await
+            .ok();
+        driver
+            .insert_row(&collection, &row_values(&[("name", "ayşe"), ("n", "42")]))
+            .await
+            .expect("inserting");
+        let rows = driver.preview(&collection, 10).await.expect("preview");
+        assert_eq!(rows.rows.len(), 1);
+        let document: serde_json::Value =
+            serde_json::from_str(rows.documents[0].as_deref().expect("a document")).unwrap();
+        assert_eq!(document["n"], 42, "a number stays a number: {document}");
+        let id = cell(&rows, 0, "_id").expect("an _id").to_string();
+        assert_eq!(
+            driver
+                .delete_row(&collection, &row_key("_id", &id))
+                .await
+                .expect("deleting"),
+            1
+        );
+        assert!(
+            driver
+                .delete_row(&collection, &row_key("_id", &id))
+                .await
+                .is_err()
+        );
+        driver
+            .query("{\"drop\": \"quarry_live_rows\"}", Some("app"), 10)
+            .await
+            .expect("dropping the scratch collection");
+    });
+}
+
+#[test]
+#[ignore = "needs the quarry redis on :6380"]
+fn redis_insert_and_delete_items() {
+    runtime().block_on(async {
+        let driver = redis_driver().await;
+        let keys = "quarry_live_rows:list quarry_live_rows:hash quarry_live_rows:set \
+                    quarry_live_rows:zset quarry_live_rows:stream";
+        driver
+            .query(&format!("DEL {keys}"), Some("db0"), 10)
+            .await
+            .unwrap();
+        for statement in [
+            "RPUSH quarry_live_rows:list a b c",
+            "HSET quarry_live_rows:hash f1 v1",
+            "SADD quarry_live_rows:set m1",
+            "ZADD quarry_live_rows:zset 1 m1",
+            "XADD quarry_live_rows:stream * f v",
+        ] {
+            driver
+                .query(statement, Some("db0"), 10)
+                .await
+                .expect(statement);
+        }
+
+        let list = path(&["db0", "quarry_live_rows", "list"]);
+        driver
+            .insert_row(&list, &row_values(&[("value", "d")]))
+            .await
+            .expect("rpush");
+        driver
+            .delete_row(&list, &row_key("index", "1"))
+            .await
+            .expect("delete b");
+        let items = driver.preview(&list, 10).await.unwrap();
+        let values: Vec<&str> = items
+            .rows
+            .iter()
+            .filter_map(|row| row[1].as_deref())
+            .collect();
+        assert_eq!(values, ["a", "c", "d"]);
+
+        let hash = path(&["db0", "quarry_live_rows", "hash"]);
+        assert!(
+            driver
+                .insert_row(&hash, &row_values(&[("field", "f1"), ("value", "x")]))
+                .await
+                .is_err(),
+            "an existing field is not overwritten"
+        );
+        driver
+            .insert_row(&hash, &row_values(&[("field", "f2"), ("value", "v2")]))
+            .await
+            .expect("hsetnx");
+        driver
+            .delete_row(&hash, &row_key("field", "f1"))
+            .await
+            .expect("hdel");
+        assert_eq!(driver.preview(&hash, 10).await.unwrap().rows.len(), 1);
+
+        let set = path(&["db0", "quarry_live_rows", "set"]);
+        driver
+            .insert_row(&set, &row_values(&[("member", "m2")]))
+            .await
+            .expect("sadd");
+        driver
+            .delete_row(&set, &row_key("member", "m1"))
+            .await
+            .expect("srem");
+        assert_eq!(driver.preview(&set, 10).await.unwrap().rows.len(), 1);
+
+        let zset = path(&["db0", "quarry_live_rows", "zset"]);
+        driver
+            .insert_row(&zset, &row_values(&[("member", "m2"), ("score", "2.5")]))
+            .await
+            .expect("zadd");
+        driver
+            .delete_row(&zset, &row_key("member", "m1"))
+            .await
+            .expect("zrem");
+        let members = driver.preview(&zset, 10).await.unwrap();
+        assert_eq!(members.rows.len(), 1);
+        assert_eq!(members.rows[0][1].as_deref(), Some("2.5"));
+
+        let stream = path(&["db0", "quarry_live_rows", "stream"]);
+        driver
+            .insert_row(&stream, &row_values(&[("fields", "{\"name\": \"x\"}")]))
+            .await
+            .expect("xadd");
+        let entries = driver.preview(&stream, 10).await.unwrap();
+        assert_eq!(entries.rows.len(), 2);
+        let first = entries.rows[0][0].clone().unwrap().to_string();
+        driver
+            .delete_row(&stream, &row_key("id", &first))
+            .await
+            .expect("xdel");
+        assert_eq!(driver.preview(&stream, 10).await.unwrap().rows.len(), 1);
+
+        driver
+            .query(&format!("DEL {keys}"), Some("db0"), 10)
+            .await
+            .unwrap();
     });
 }

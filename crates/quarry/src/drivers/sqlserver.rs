@@ -1,5 +1,5 @@
 use crate::driver::{
-    CatalogEntry, CellEdit, Driver, EditTarget, ObjectKind, ObjectNode, ResultSet,
+    CatalogEntry, CellEdit, Driver, EditTarget, ObjectKind, ObjectNode, ResultSet, RowKey,
 };
 use anyhow::{Context as _, Result, bail};
 use futures::TryStreamExt as _;
@@ -177,6 +177,7 @@ impl SqlServerDriver {
         );
         let mut key_columns = Vec::new();
         let mut read_only_columns = Vec::new();
+        let mut insert_columns = Vec::new();
         for row in self.rows(&sql).await? {
             let mut values = row.into_iter();
             let Some(name) = values.next().flatten() else {
@@ -195,15 +196,19 @@ impl SqlServerDriver {
             }
             if is_read_only {
                 read_only_columns.push(index);
+            } else {
+                insert_columns.push(index);
             }
         }
         if key_columns.is_empty() {
             return Ok(None);
         }
+        insert_columns.sort_unstable();
         Ok(Some(EditTarget {
             path: path.to_vec(),
             key_columns,
             read_only_columns,
+            insert_columns,
         }))
     }
 }
@@ -1084,6 +1089,68 @@ impl Driver for SqlServerDriver {
         Some(format!("SELECT COUNT_BIG(*) FROM {table};"))
     }
 
+    async fn insert_row(
+        &self,
+        path: &[SharedString],
+        values: &[(SharedString, String)],
+    ) -> Result<u64> {
+        let [database, schema, table] = path else {
+            bail!("expected database, schema and table, got {path:?}");
+        };
+        let table_name = three_part_name(database, schema, table);
+        let insert = if values.is_empty() {
+            format!("INSERT INTO {table_name} DEFAULT VALUES;")
+        } else {
+            format!(
+                "INSERT INTO {table_name} ({}) VALUES ({});",
+                values
+                    .iter()
+                    .map(|(column, _)| quote_ident(column))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                values
+                    .iter()
+                    .map(|(_, value)| quote_literal(value))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let sql = format!("{insert}\nSELECT CAST(@@ROWCOUNT AS bigint);");
+        first_column(self.rows(&sql).await?)
+            .into_iter()
+            .next()
+            .and_then(|count| count.parse::<u64>().ok())
+            .context("the server did not report how many rows were added")
+    }
+
+    async fn delete_row(&self, path: &[SharedString], key: &RowKey) -> Result<u64> {
+        let [database, schema, table] = path else {
+            bail!("expected database, schema and table, got {path:?}");
+        };
+        if key.is_empty() {
+            bail!("refusing to delete from {table} without a key");
+        }
+        let sql = format!(
+            "SET XACT_ABORT ON;
+             BEGIN TRANSACTION;
+             DELETE FROM {} WHERE {};
+             DECLARE @affected bigint = @@ROWCOUNT;
+             IF @affected = 1 COMMIT TRANSACTION; ELSE ROLLBACK TRANSACTION;
+             SELECT @affected;",
+            three_part_name(database, schema, table),
+            key_condition(key)
+        );
+        let deleted = first_column(self.rows(&sql).await?)
+            .into_iter()
+            .next()
+            .and_then(|count| count.parse::<u64>().ok())
+            .context("the server did not report how many rows the delete touched")?;
+        if deleted != 1 {
+            bail!("the key matched {deleted} rows instead of one; nothing was deleted");
+        }
+        Ok(deleted)
+    }
+
     async fn update_cell(&self, edit: &CellEdit) -> Result<u64> {
         let [database, schema, table] = edit.path.as_slice() else {
             bail!("expected database, schema and table, got {:?}", edit.path);
@@ -1150,6 +1217,16 @@ fn column_type(type_name: &str, numbers: &[Option<i64>]) -> String {
         },
         _ => type_name.to_string(),
     }
+}
+
+fn key_condition(key: &RowKey) -> String {
+    key.iter()
+        .map(|(column, value)| match value {
+            Some(value) => format!("{} = {}", quote_ident(column), quote_literal(value)),
+            None => format!("{} IS NULL", quote_ident(column)),
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ")
 }
 
 fn three_part_name(database: &str, schema: &str, name: &str) -> String {
