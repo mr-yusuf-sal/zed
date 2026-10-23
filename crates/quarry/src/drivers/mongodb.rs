@@ -252,6 +252,10 @@ fn to_result_set(documents: Vec<Document>, truncated: bool) -> ResultSet {
         columns,
         rows,
         truncated,
+        documents: documents
+            .into_iter()
+            .map(|document| Some(SharedString::from(to_json(document))))
+            .collect(),
         ..ResultSet::default()
     }
 }

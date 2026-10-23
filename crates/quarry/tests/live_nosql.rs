@@ -1361,3 +1361,16 @@ fn redis_find_and_change_keys() {
             .expect("cleaning up");
     });
 }
+
+#[test]
+#[ignore = "needs the quarry mongodb on :27018"]
+fn mongodb_rows_keep_their_documents() {
+    runtime().block_on(async {
+        let driver = mongo_driver().await;
+        let preview = driver.preview(&path(&["app", "orders"]), 5).await.expect("preview");
+        assert_eq!(preview.documents.len(), preview.rows.len());
+        let first = preview.documents[0].as_deref().expect("a document");
+        let json: serde_json::Value = serde_json::from_str(first).expect("indented JSON");
+        assert!(json.get("_id").is_some());
+    });
+}
