@@ -14,7 +14,7 @@ use ui::{
     prelude::*,
     utils::{TRAFFIC_LIGHT_PADDING, platform_title_bar_height},
 };
-use workspace::{MultiWorkspace, SidebarRenderState, SidebarSide};
+use workspace::MultiWorkspace;
 
 use crate::{
     platforms::{platform_linux, platform_windows},
@@ -124,14 +124,6 @@ impl PlatformTitleBar {
         SystemWindowTabs::init(cx);
     }
 
-    fn sidebar_render_state(&self, cx: &App) -> SidebarRenderState {
-        self.multi_workspace
-            .as_ref()
-            .and_then(|mw| mw.upgrade())
-            .map(|mw| mw.read(cx).sidebar_render_state(cx))
-            .unwrap_or_default()
-    }
-
     pub fn is_multi_workspace_enabled(cx: &App) -> bool {
         !DisableAiSettings::get_global(cx).disable_ai
     }
@@ -213,7 +205,6 @@ impl Render for PlatformTitleBar {
         let children = mem::take(&mut self.children);
 
         let button_layout = self.effective_button_layout(&decorations, cx);
-        let sidebar = self.sidebar_render_state(cx);
 
         let title_bar = h_flex()
             .window_control_area(WindowControlArea::Drag)
@@ -266,22 +257,15 @@ impl Render for PlatformTitleBar {
                     )
             })
             .map(|this| {
-                let show_left_controls = !(sidebar.open && sidebar.side == SidebarSide::Left);
-
                 if window.is_fullscreen() || window.is_simple_fullscreen() {
                     this.pl_2()
-                } else if self.platform_style == PlatformStyle::Mac && show_left_controls {
+                } else if self.platform_style == PlatformStyle::Mac {
                     this.pl(px(TRAFFIC_LIGHT_PADDING))
-                } else if let Some(controls) = show_left_controls
-                    .then(|| {
-                        render_left_window_controls(
-                            button_layout,
-                            close_action.as_ref().boxed_clone(),
-                            window,
-                        )
-                    })
-                    .flatten()
-                {
+                } else if let Some(controls) = render_left_window_controls(
+                    button_layout,
+                    close_action.as_ref().boxed_clone(),
+                    window,
+                ) {
                     this.child(controls)
                 } else {
                     this.pl_2()
@@ -290,16 +274,12 @@ impl Render for PlatformTitleBar {
             .map(|el| match decorations {
                 Decorations::Server => el,
                 Decorations::Client { tiling, .. } => el
-                    .when(
-                        !(tiling.top || tiling.right)
-                            && !(sidebar.open && sidebar.side == SidebarSide::Right),
-                        |el| el.rounded_tr(theme::CLIENT_SIDE_DECORATION_ROUNDING),
-                    )
-                    .when(
-                        !(tiling.top || tiling.left)
-                            && !(sidebar.open && sidebar.side == SidebarSide::Left),
-                        |el| el.rounded_tl(theme::CLIENT_SIDE_DECORATION_ROUNDING),
-                    )
+                    .when(!(tiling.top || tiling.right), |el| {
+                        el.rounded_tr(theme::CLIENT_SIDE_DECORATION_ROUNDING)
+                    })
+                    .when(!(tiling.top || tiling.left), |el| {
+                        el.rounded_tl(theme::CLIENT_SIDE_DECORATION_ROUNDING)
+                    })
                     // Keep in sync with `apply_title_bar_insets`.
                     .mt(-theme::CLIENT_SIDE_DECORATION_BORDER)
                     .mb(-theme::CLIENT_SIDE_DECORATION_BORDER)
@@ -322,19 +302,11 @@ impl Render for PlatformTitleBar {
             .when(
                 !window.is_fullscreen() && !window.is_simple_fullscreen(),
                 |title_bar| {
-                    let show_right_controls = !(sidebar.open && sidebar.side == SidebarSide::Right);
-
-                    let title_bar = title_bar.children(
-                        show_right_controls
-                            .then(|| {
-                                render_right_window_controls(
-                                    button_layout,
-                                    close_action.as_ref().boxed_clone(),
-                                    window,
-                                )
-                            })
-                            .flatten(),
-                    );
+                    let title_bar = title_bar.children(render_right_window_controls(
+                        button_layout,
+                        close_action.as_ref().boxed_clone(),
+                        window,
+                    ));
 
                     if self.platform_style == PlatformStyle::Linux
                         && matches!(decorations, Decorations::Client { .. })
