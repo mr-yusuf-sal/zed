@@ -1558,3 +1558,105 @@ fn sqlserver_insert_and_delete_rows() {
             .expect("dropping the scratch table");
     });
 }
+
+/// The bastion the tunnel test goes through: `QUARRY_LIVE_SSH` as `user@host:port` and
+/// `QUARRY_LIVE_SSH_KEY` as the path of a key it accepts. It must be able to reach the
+/// Postgres container as `quarry-postgres:5432`, as an sshd on the compose network can.
+fn live_ssh() -> quarry::driver::SshTunnel {
+    let (Ok(destination), Ok(key)) = (
+        std::env::var("QUARRY_LIVE_SSH"),
+        std::env::var("QUARRY_LIVE_SSH_KEY"),
+    ) else {
+        panic!("set QUARRY_LIVE_SSH=user@host:port and QUARRY_LIVE_SSH_KEY=path to run this");
+    };
+    let mut ssh = quarry::driver::SshTunnel::parse(&destination).expect("QUARRY_LIVE_SSH");
+    ssh.identity_file = Some(key);
+    ssh
+}
+
+#[test]
+#[ignore = "needs a live postgres and an sshd that can reach it"]
+fn postgres_through_an_ssh_tunnel() {
+    runtime().block_on(async {
+        let ssh = live_ssh();
+        let tunnel = quarry::tunnel::open(&ssh, "quarry-postgres", 5432)
+            .await
+            .expect("opening the tunnel");
+        let local_port = tunnel.local_port;
+        let driver = PostgresDriver::connect(
+            "127.0.0.1",
+            local_port,
+            Some("app"),
+            Some("app"),
+            Some("app"),
+        )
+        .await
+        .expect("connecting through the tunnel");
+        let driver: Arc<dyn Driver> = Arc::new(quarry::tunnel::TunneledDriver::new(
+            Arc::new(driver),
+            tunnel,
+        ));
+        let one = only(
+            driver
+                .query("SELECT 1 AS one", None, 10)
+                .await
+                .expect("querying through the tunnel"),
+        );
+        assert_eq!(cell(&one, 0, 0).as_deref(), Some("1"));
+
+        // Dropping the driver ends ssh, and the local port with it.
+        drop(driver);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", local_port))
+                .await
+                .is_err()
+        );
+
+        let stranger = quarry::driver::SshTunnel {
+            user: Some("nobody-here".to_string()),
+            ..ssh
+        };
+        let error = quarry::tunnel::open(&stranger, "quarry-postgres", 5432)
+            .await
+            .err()
+            .expect("a user the bastion does not know is refused");
+        println!("{error:#}");
+        assert!(format!("{error:#}").contains("Permission denied"));
+    });
+}
+
+/// The test servers have no TLS set up, so this checks that each mode reaches the driver rather
+/// than that encryption works: a mode that needs TLS fails against them, the others connect.
+#[test]
+#[ignore = "needs a live postgres and sql server"]
+fn tls_modes_reach_the_drivers() {
+    use quarry::driver::TlsMode;
+    runtime().block_on(async {
+        let postgres = |tls| {
+            PostgresDriver::connect_with("localhost", 55432, Some("app"), Some("app"), Some("app"), tls)
+        };
+        postgres(TlsMode::Disable).await.expect("postgres without TLS");
+        let refused = postgres(TlsMode::Require).await.err().expect("TLS is required");
+        println!("postgres require: {refused:#}");
+
+        let sqlserver = |tls| {
+            SqlServerDriver::connect_with(
+                "localhost",
+                1433,
+                Some("app"),
+                Some("sa"),
+                Some("Quarry_Pass123!"),
+                tls,
+            )
+        };
+        sqlserver(TlsMode::Default).await.expect("sql server trusting its certificate");
+        sqlserver(TlsMode::Disable).await.expect("sql server without TLS");
+        // The container's certificate is self-signed, so checking it has to fail.
+        let refused = sqlserver(TlsMode::Verify)
+            .await
+            .err()
+            .expect("a self-signed certificate is not trusted");
+        println!("sql server verify: {refused:#}");
+    });
+}

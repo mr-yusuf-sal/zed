@@ -40,11 +40,11 @@ workspace.workspace = true
 # Every driver here is written against tokio, while gpui runs on smol. They are confined to the
 # runtime owned by `runtime.rs` and must never be awaited on a gpui executor.
 mongodb.workspace = true
-redis.workspace = true
+redis = { workspace = true, features = ["tokio-rustls-comp", "tls-rustls-insecure"] }
 reqwest.workspace = true
 sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls", "json"] }
 tiberius.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "time"] }
 tokio-util.workspace = true
 
 [dev-dependencies]

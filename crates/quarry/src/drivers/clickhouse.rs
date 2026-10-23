@@ -1,4 +1,4 @@
-use crate::driver::{CatalogEntry, Driver, ObjectKind, ObjectNode, ResultSet};
+use crate::driver::{CatalogEntry, Driver, ObjectKind, ObjectNode, ResultSet, TlsMode};
 use anyhow::{Context as _, Result, bail};
 use parking_lot::Mutex;
 use std::{
@@ -38,9 +38,32 @@ impl ClickHouseDriver {
         username: Option<&str>,
         password: Option<&str>,
     ) -> Result<Self> {
+        Self::connect_with(host, port, database, username, password, TlsMode::Default).await
+    }
+
+    pub async fn connect_with(
+        host: &str,
+        port: u16,
+        database: Option<&str>,
+        username: Option<&str>,
+        password: Option<&str>,
+        tls: TlsMode,
+    ) -> Result<Self> {
+        let (scheme, client) = match tls {
+            TlsMode::Default | TlsMode::Disable => ("http", reqwest::Client::new()),
+            TlsMode::Verify => ("https", reqwest::Client::new()),
+            // A self-signed development server's certificate is accepted, as the mode says.
+            TlsMode::Require => (
+                "https",
+                reqwest::Client::builder()
+                    .danger_accept_invalid_certs(true)
+                    .build()
+                    .context("building the HTTPS client")?,
+            ),
+        };
         let mut driver = Self {
-            client: reqwest::Client::new(),
-            endpoint: format!("http://{host}:{port}/"),
+            client,
+            endpoint: format!("{scheme}://{host}:{port}/"),
             database: database.unwrap_or_default().to_string(),
             username: username.map(str::to_string),
             password: password.map(str::to_string),

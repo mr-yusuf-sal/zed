@@ -1,5 +1,5 @@
-use crate::driver::{ConnectionConfig, Engine, Environment};
-use anyhow::{Result, anyhow, bail};
+use crate::driver::{ConnectionConfig, Engine, Environment, SshTunnel, TlsMode};
+use anyhow::{Context as _, Result, anyhow, bail};
 use db::kvp::KeyValueStore;
 use gpui::{App, AppContext as _, Context, Entity, Global};
 use util::ResultExt as _;
@@ -158,7 +158,8 @@ fn history_key(config: &ConnectionConfig) -> String {
 }
 
 /// Parses the single line a user types when adding a connection, e.g.
-/// `postgres://scott@localhost:5432/store`.
+/// `postgres://scott@localhost:5432/store`, or with options,
+/// `postgres://scott@db.internal/store?ssh=me@bastion:22&tls=verify`.
 ///
 /// A URL is asked for instead of a six-field form because it is both far less UI and the form
 /// developers already have in their heads — it is what every one of these engines prints in its
@@ -182,9 +183,26 @@ pub fn parse_connection_url(input: &str) -> Result<ConnectionConfig> {
         ),
     };
 
-    // Options such as MongoDB's `?authSource=admin` are not part of the database name. None of
-    // them are read yet; the drivers' defaults already match the common ones.
-    let rest = rest.split_once('?').map_or(rest, |(rest, _options)| rest);
+    // Options are not part of the database name. Quarry reads `ssh` and `tls`; others, such as
+    // MongoDB's `authSource=admin`, are ignored, as the drivers' defaults already match them.
+    let (rest, options) = rest.split_once('?').unwrap_or((rest, ""));
+    let mut ssh = None;
+    let mut ssh_key = None;
+    let mut tls = TlsMode::Default;
+    for option in options.split('&').filter(|option| !option.is_empty()) {
+        let (name, value) = option.split_once('=').unwrap_or((option, ""));
+        match name.to_ascii_lowercase().as_str() {
+            "ssh" => ssh = Some(SshTunnel::parse(value)?),
+            "ssh_key" => ssh_key = Some(value.to_string()).filter(|path| !path.is_empty()),
+            "tls" | "ssl" | "sslmode" => tls = TlsMode::parse(value)?,
+            _ => {}
+        }
+    }
+    if let Some(identity_file) = ssh_key {
+        ssh.as_mut()
+            .context("ssh_key needs ssh=user@bastion as well")?
+            .identity_file = Some(identity_file);
+    }
     let (authority, database) = match rest.split_once('/') {
         Some((authority, database)) if !database.is_empty() => (authority, Some(database)),
         Some((authority, _)) => (authority, None),
@@ -229,6 +247,8 @@ pub fn parse_connection_url(input: &str) -> Result<ConnectionConfig> {
         username,
         environment: None,
         folder: None,
+        ssh,
+        tls,
     })
 }
 
@@ -252,7 +272,25 @@ pub fn connection_url(config: &ConnectionConfig) -> String {
         .as_deref()
         .map(|database| format!("/{database}"))
         .unwrap_or_default();
-    format!("{scheme}://{user}{}:{}{database}", config.host, config.port)
+    let mut options = Vec::new();
+    if let Some(ssh) = &config.ssh {
+        options.push(format!("ssh={ssh}"));
+        if let Some(identity_file) = &ssh.identity_file {
+            options.push(format!("ssh_key={identity_file}"));
+        }
+    }
+    if !config.tls.is_default() {
+        options.push(format!("tls={}", config.tls.label()));
+    }
+    let options = if options.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", options.join("&"))
+    };
+    format!(
+        "{scheme}://{user}{}:{}{database}{options}",
+        config.host, config.port
+    )
 }
 
 #[cfg(test)]
@@ -320,6 +358,8 @@ mod tests {
             username: Some("app".to_string()),
             environment: None,
             folder: None,
+            ssh: None,
+            tls: TlsMode::Default,
         };
         let repaired = repair_url_options(saved.clone());
         assert_eq!(repaired.database.as_deref(), Some("app"));
@@ -330,6 +370,60 @@ mod tests {
             ..saved
         };
         assert_eq!(repair_url_options(renamed).name, "orders");
+    }
+
+    #[test]
+    fn reads_the_tunnel_and_tls_options() {
+        let config = parse_connection_url(
+            "postgres://app@db.internal:5432/app?ssh=me@bastion:2222&tls=verify",
+        )
+        .unwrap();
+        assert_eq!(config.database.as_deref(), Some("app"));
+        assert_eq!(
+            config.ssh,
+            Some(SshTunnel {
+                user: Some("me".to_string()),
+                host: "bastion".to_string(),
+                port: 2222,
+                identity_file: None,
+            })
+        );
+        assert_eq!(config.tls, TlsMode::Verify);
+        assert_eq!(
+            connection_url(&config),
+            "postgres://app@db.internal:5432/app?ssh=me@bastion:2222&tls=verify"
+        );
+
+        let config = parse_connection_url("redis://cache:6379?ssh=bastion&tls=require").unwrap();
+        assert_eq!(config.ssh.as_ref().map(|ssh| ssh.port), Some(22));
+        assert_eq!(
+            connection_url(&config),
+            "redis://cache:6379?ssh=bastion&tls=require"
+        );
+
+        let config =
+            parse_connection_url("postgres://db?ssh=me@bastion&ssh_key=C:/keys/id_ed25519")
+                .unwrap();
+        assert_eq!(
+            config
+                .ssh
+                .as_ref()
+                .and_then(|ssh| ssh.identity_file.as_deref()),
+            Some("C:/keys/id_ed25519")
+        );
+        assert_eq!(
+            connection_url(&config),
+            "postgres://db:5432?ssh=me@bastion&ssh_key=C:/keys/id_ed25519"
+        );
+        assert!(parse_connection_url("postgres://db?ssh_key=C:/keys/id").is_err());
+        assert!(parse_connection_url("postgres://db?tls=sometimes").is_err());
+        assert!(parse_connection_url("postgres://db?ssh=bastion:twentytwo").is_err());
+
+        // A config saved before these options existed reads as having none.
+        let saved = r#"{"name":"a","engine":"postgres","host":"h","port":1,"database":null,"username":null}"#;
+        let config: ConnectionConfig = serde_json::from_str(saved).unwrap();
+        assert_eq!((&config.ssh, config.tls), (&None, TlsMode::Default));
+        assert_eq!(serde_json::to_string(&config).unwrap(), saved);
     }
 
     #[test]
