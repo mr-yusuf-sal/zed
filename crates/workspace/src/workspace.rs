@@ -1993,7 +1993,6 @@ impl Workspace {
         let bottom_dock = Dock::new(DockPosition::Bottom, modal_layer.clone(), window, cx);
         let right_dock = Dock::new(DockPosition::Right, modal_layer.clone(), window, cx);
         let bottom_dock_buttons = cx.new(|cx| PanelButtons::new(bottom_dock.clone(), cx));
-        let right_dock_buttons = cx.new(|cx| PanelButtons::new(right_dock.clone(), cx));
         let multi_workspace = window
             .root::<MultiWorkspace>()
             .flatten()
@@ -2001,7 +2000,6 @@ impl Workspace {
         let status_bar = cx.new(|cx| {
             let mut status_bar =
                 StatusBar::new(&center_pane.clone(), multi_workspace.clone(), window, cx);
-            status_bar.add_right_item(right_dock_buttons, window, cx);
             status_bar.add_right_item(bottom_dock_buttons, window, cx);
             status_bar
         });
@@ -2981,6 +2979,23 @@ impl Workspace {
         self.center.first_pane().update(cx, |pane, cx| {
             pane.add_permanent_item(item, window, cx);
         });
+    }
+
+    /// Shows the first permanent item in the center without moving focus to it.
+    pub fn activate_permanent_item(&mut self, window: &mut Window, cx: &mut App) -> bool {
+        let found = self.panes.iter().find_map(|pane| {
+            pane.read(cx)
+                .items()
+                .position(|item| item.is_permanent(cx))
+                .map(|index| (pane.clone(), index))
+        });
+        let Some((pane, index)) = found else {
+            return false;
+        };
+        pane.update(cx, |pane, cx| {
+            pane.activate_item(index, true, false, window, cx);
+        });
+        true
     }
 
     pub fn remove_panel<T: Panel>(

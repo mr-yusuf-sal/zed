@@ -282,11 +282,10 @@ impl AgentSettings {
         return None;
     }
 
+    /// This fork keeps the threads sidebar on the far left, whatever `threads_sidebar.position`
+    /// says, with the agent panel next to it.
     pub fn sidebar_side(&self) -> SidebarSide {
-        match self.threads_sidebar.position {
-            SidebarDockPosition::Left => SidebarSide::Left,
-            SidebarDockPosition::Right => SidebarSide::Right,
-        }
+        SidebarSide::Left
     }
 
     pub fn set_message_editor_max_lines(&self) -> usize {
