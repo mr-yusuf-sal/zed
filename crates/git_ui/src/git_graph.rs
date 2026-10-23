@@ -7,7 +7,11 @@ use crate::{
     },
     commit_tooltip::CommitAvatar,
     commit_view::CommitView,
-    create_branch_at_commit, git_status_icon, rename_branch_modal,
+    create_branch_at_commit,
+    git_panel::GitPanel,
+    git_status_icon,
+    project_diff::ProjectDiff,
+    rename_branch_modal,
 };
 use anyhow::Context as _;
 use askpass::AskPassDelegate;
@@ -40,7 +44,7 @@ use project::{
     Fs, ProjectPath, TaskSourceKind,
     git_store::{
         CommitDataState, CommitDiff, CommitFile, GitGraphEvent, GitStore, GitStoreEvent,
-        GraphDataResponse, Repository, RepositoryEvent, RepositoryId,
+        GraphDataResponse, Repository, RepositoryEvent, RepositoryId, StatusEntry,
     },
 };
 use smallvec::{SmallVec, smallvec};
@@ -1670,6 +1674,12 @@ pub struct GitGraph {
     repo_id: RepositoryId,
     changed_files_scroll_handle: UniformListScrollHandle,
     selected_commits_scroll_handle: UniformListScrollHandle,
+    /// Whether the "Uncommitted Changes" row is selected instead of a commit.
+    uncommitted_selected: bool,
+    /// Set once the uncommitted row was selected on opening or the user picked
+    /// something, so it is not selected again behind their back on a later edit.
+    uncommitted_default_applied: bool,
+    uncommitted_scroll_handle: UniformListScrollHandle,
     operation_in_progress: Option<OperationInProgress>,
     auto_fetch_enabled: bool,
     _auto_fetch_task: Option<Task<()>>,
@@ -1942,6 +1952,9 @@ impl GitGraph {
             repo_id,
             changed_files_scroll_handle: UniformListScrollHandle::new(),
             selected_commits_scroll_handle: UniformListScrollHandle::new(),
+            uncommitted_selected: false,
+            uncommitted_default_applied: false,
+            uncommitted_scroll_handle: UniformListScrollHandle::new(),
             operation_in_progress: None,
             auto_fetch_enabled: Self::restore_auto_fetch(cx),
             _auto_fetch_task: None,
@@ -1959,6 +1972,7 @@ impl GitGraph {
         this.apply_saved_split_ratio(cx);
         this.fetch_initial_graph_data(cx);
         this.refresh_operation_in_progress(cx);
+        this.select_uncommitted_by_default(cx);
         if this.auto_fetch_enabled {
             this.start_auto_fetch(cx);
         }
@@ -2180,6 +2194,7 @@ impl GitGraph {
         // status, head or branch changes; graph loading progress never does.
         if !matches!(event, RepositoryEvent::GraphEvent(..)) {
             self.refresh_operation_in_progress(cx);
+            self.select_uncommitted_by_default(cx);
         }
         match event {
             RepositoryEvent::GraphEvent((source, order), event)
@@ -2590,6 +2605,8 @@ impl GitGraph {
 
     fn clear_selection(&mut self, cx: &mut Context<Self>) {
         self.selected_entry_idx = None;
+        self.uncommitted_selected = false;
+        self.uncommitted_default_applied = true;
         self.selection_anchor_idx = None;
         self.multi_selected_idxs = Rc::default();
         self.selected_commit_diff = None;
@@ -2933,6 +2950,8 @@ impl GitGraph {
             return;
         }
 
+        self.uncommitted_selected = false;
+        self.uncommitted_default_applied = true;
         self.selected_entry_idx = Some(idx);
         self.selected_commit_diff = None;
         self.selected_commit_diff_stats = None;
@@ -3861,6 +3880,291 @@ impl GitGraph {
             .into_any_element()
     }
 
+    fn uncommitted_entries(&self, cx: &App) -> Vec<StatusEntry> {
+        let Some(repository) = self.get_repository(cx) else {
+            return Vec::new();
+        };
+        repository
+            .read(cx)
+            .cached_status()
+            .filter(|entry| entry.status.has_changes())
+            .collect()
+    }
+
+    /// Selects the "Uncommitted Changes" row the first time there are any, so
+    /// a graph opened on a dirty tree starts by showing what isn't committed.
+    /// Statuses arrive after the graph is created, so this is retried on
+    /// repository events until it applies or the user selects something.
+    fn select_uncommitted_by_default(&mut self, cx: &mut Context<Self>) {
+        if self.uncommitted_default_applied
+            || self.pending_select_sha.is_some()
+            || self.selected_entry_idx.is_some()
+            || matches!(self.log_source, LogSource::Path(_))
+            || self.uncommitted_entries(cx).is_empty()
+        {
+            return;
+        }
+        self.uncommitted_default_applied = true;
+        self.uncommitted_selected = true;
+        cx.notify();
+    }
+
+    fn select_uncommitted(&mut self, cx: &mut Context<Self>) {
+        self.clear_selection(cx);
+        self.uncommitted_selected = true;
+        self.uncommitted_scroll_handle
+            .scroll_to_item(0, ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    fn open_uncommitted_diff(
+        &self,
+        repo_path: Option<RepoPath>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let project_path = repo_path.and_then(|repo_path| {
+            self.get_repository(cx)?
+                .read(cx)
+                .repo_path_to_project_path(&repo_path, cx)
+        });
+        self.workspace
+            .update(cx, |workspace, cx| match project_path {
+                Some(project_path) => {
+                    ProjectDiff::deploy_at_project_path(workspace, project_path, window, cx)
+                }
+                None => ProjectDiff::deploy_at(workspace, None, window, cx),
+            })
+            .log_err();
+    }
+
+    /// A row above the commits for the working tree's changes, like the
+    /// pseudo-commit other git graphs put at the tip. File history has its own
+    /// source and gets no row.
+    fn render_uncommitted_row(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if matches!(self.log_source, LogSource::Path(_)) {
+            return None;
+        }
+        let entries = self.uncommitted_entries(cx);
+        if entries.is_empty() {
+            return None;
+        }
+        let (added, deleted) = entries
+            .iter()
+            .filter_map(|entry| entry.diff_stat)
+            .fold((0, 0), |(added, deleted), stat| {
+                (added + stat.added as usize, deleted + stat.deleted as usize)
+            });
+        let file_count = entries.len();
+        let colors = cx.theme().colors();
+        let background = if self.uncommitted_selected {
+            colors.element_selected
+        } else {
+            colors.editor_background
+        };
+
+        Some(
+            h_flex()
+                .id("git-graph-uncommitted-row")
+                .w_full()
+                .h_7()
+                .px_3()
+                .gap_2()
+                .flex_shrink_0()
+                .cursor_pointer()
+                .bg(background)
+                .hover(|style| style.bg(colors.element_hover))
+                .border_b_1()
+                .border_color(colors.border_variant)
+                .child(
+                    Icon::new(IconName::Pencil)
+                        .size(IconSize::Small)
+                        .color(Color::Modified),
+                )
+                .child(Label::new("Uncommitted Changes").size(LabelSize::Small))
+                .child(
+                    Label::new(format!(
+                        "{file_count} {}",
+                        if file_count == 1 { "file" } else { "files" }
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                )
+                .child(div().flex_1())
+                .child(DiffStat::new("uncommitted-diff-stat", added, deleted))
+                .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                    this.select_uncommitted(cx);
+                    if event.click_count() >= 2 {
+                        this.open_uncommitted_diff(None, window, cx);
+                    }
+                }))
+                .into_any_element(),
+        )
+    }
+
+    fn render_uncommitted_panel(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let entries = Rc::new(self.uncommitted_entries(cx));
+        let file_count = entries.len();
+        let graph_repository_is_active = self
+            .git_store
+            .read(cx)
+            .active_repository()
+            .is_some_and(|active| active.read(cx).id == self.repo_id);
+
+        let header = h_flex()
+            .w_full()
+            .p_2()
+            .gap_2()
+            .child(
+                Icon::new(IconName::Pencil)
+                    .size(IconSize::Small)
+                    .color(Color::Modified),
+            )
+            .child(
+                div().flex_1().min_w_0().child(
+                    Label::new(format!(
+                        "Uncommitted Changes ({file_count} {})",
+                        if file_count == 1 { "file" } else { "files" }
+                    ))
+                    .truncate(),
+                ),
+            )
+            .child(self.render_detail_panel_controls(cx));
+
+        let actions = h_flex()
+            .w_full()
+            .px_2()
+            .pb_2()
+            .gap_1()
+            .flex_wrap()
+            .child(
+                Button::new("uncommitted-open-diff", "Open Diff")
+                    .start_icon(
+                        Icon::new(IconName::Diff)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .style(ButtonStyle::OutlinedGhost)
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_uncommitted_diff(None, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("uncommitted-commit", "Commit…")
+                    .start_icon(
+                        Icon::new(IconName::GitCommit)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .style(ButtonStyle::OutlinedGhost)
+                    .label_size(LabelSize::Small)
+                    .tooltip(Tooltip::text("Stage and commit in the git panel"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.focus_panel::<GitPanel>(window, cx);
+                            })
+                            .log_err();
+                    })),
+            )
+            .child(
+                Button::new("uncommitted-stash", "Stash All")
+                    .start_icon(
+                        Icon::new(IconName::Archive)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .style(ButtonStyle::OutlinedGhost)
+                    .label_size(LabelSize::Small)
+                    // `git::StashAll` acts on the git panel's active repository.
+                    .disabled(!graph_repository_is_active)
+                    .when(!graph_repository_is_active, |button| {
+                        button.tooltip(Tooltip::text(
+                            "Switch the active repository to this one to stash it",
+                        ))
+                    })
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(git::StashAll.boxed_clone(), cx);
+                    }),
+            );
+
+        let git_graph = cx.weak_entity();
+        let file_list = uniform_list("uncommitted-files-list", file_count, move |range, _, cx| {
+            range
+                .filter_map(|ix| {
+                    let entry = entries.get(ix)?;
+                    let file_name = entry
+                        .repo_path
+                        .file_name()
+                        .map(|name| name.to_string())
+                        .unwrap_or_else(|| entry.repo_path.as_unix_str().to_string());
+                    let directory = entry
+                        .repo_path
+                        .parent()
+                        .map(|parent| parent.as_unix_str().to_string())
+                        .filter(|parent| !parent.is_empty());
+                    let repo_path = entry.repo_path.clone();
+                    let git_graph = git_graph.clone();
+                    Some(
+                        ListItem::new(("uncommitted-file", ix))
+                            .spacing(ListItemSpacing::Dense)
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .min_w_0()
+                                    .gap_1p5()
+                                    .child(git_status_icon(entry.status))
+                                    .child(Label::new(file_name).size(LabelSize::Small))
+                                    .children(directory.map(|directory| {
+                                        Label::new(directory)
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .truncate()
+                                    }))
+                                    .child(div().flex_1())
+                                    .children(entry.diff_stat.map(|stat| {
+                                        DiffStat::new(
+                                            ("uncommitted-file-stat", ix),
+                                            stat.added as usize,
+                                            stat.deleted as usize,
+                                        )
+                                    })),
+                            )
+                            .on_click(move |_, window, cx| {
+                                git_graph
+                                    .update(cx, |this, cx| {
+                                        this.open_uncommitted_diff(
+                                            Some(repo_path.clone()),
+                                            window,
+                                            cx,
+                                        );
+                                    })
+                                    .log_err();
+                            })
+                            .into_any_element(),
+                    )
+                })
+                .collect()
+        })
+        .size_full()
+        .track_scroll(&self.uncommitted_scroll_handle);
+
+        self.detail_panel_container(cx)
+            .child(header)
+            .child(actions)
+            .child(Divider::horizontal())
+            .child(
+                div()
+                    .id("uncommitted-files-container")
+                    .flex_1()
+                    .min_h_0()
+                    .px_1()
+                    .child(file_list)
+                    .vertical_scrollbar_for(&self.uncommitted_scroll_handle, window, cx),
+            )
+            .into_any_element()
+    }
     fn detail_panel_container(&self, cx: &App) -> Div {
         v_flex()
             .map(|this| match self.commit_details_position {
@@ -3887,9 +4191,9 @@ impl GitGraph {
             // The graph is created inside a workspace update, so the workspace
             // can only be read once that update is over, which a spawned task
             // guarantees.
-            let Ok(fs) =
-                workspace.read_with(cx, |workspace, cx| workspace.project().read(cx).fs().clone())
-            else {
+            let Ok(fs) = workspace.read_with(cx, |workspace, cx| {
+                workspace.project().read(cx).fs().clone()
+            }) else {
                 return;
             };
             let operation = OperationInProgress::detect(fs.as_ref(), &git_dir).await;
@@ -5150,6 +5454,9 @@ impl GitGraph {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        if self.uncommitted_selected {
+            return self.render_uncommitted_panel(window, cx);
+        }
         if self.selected_commit_count() > 1 {
             return self.render_multi_selection_panel(window, cx);
         }
@@ -6895,7 +7202,7 @@ impl Render for GitGraph {
                     });
                     this.persist_split_ratio(cx);
                 }))
-                .when(self.selected_entry_idx.is_some(), |this| {
+                .when(self.selected_entry_idx.is_some() || self.uncommitted_selected, |this| {
                     this.child(self.render_commit_view_resize_handle(window, cx))
                         .child(self.render_commit_detail_panel(window, cx))
                 })
@@ -6948,6 +7255,7 @@ impl Render for GitGraph {
                     .size_full()
                     .child(self.render_search_bar(cx))
                     .children(self.render_operation_in_progress_banner(cx))
+                    .children(self.render_uncommitted_row(cx))
                     .child(div().flex_1().child(content)),
             )
             .children(self.context_menu.as_ref().map(|context_menu| {
@@ -9794,6 +10102,84 @@ mod tests {
                 graph.squash_base(cx).is_err(),
                 "the root commit has no parent to reset to"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_uncommitted_changes_are_selected_when_the_graph_opens(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            serde_json::json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        let sha = Oid::from_bytes(&[1; 20]).unwrap();
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![Arc::new(InitialGraphCommitData {
+                sha,
+                parents: smallvec![],
+                ref_names: Vec::new(),
+            })],
+        );
+        fs.set_head_for_repo(Path::new("/project/.git"), &[], sha.to_string());
+        fs.set_status_for_repo(
+            Path::new("/project/.git"),
+            &[("file.txt", StatusCode::Modified.worktree())],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        git_graph.update(cx, |graph, cx| {
+            assert_eq!(graph.uncommitted_entries(cx).len(), 1);
+            assert!(
+                graph.uncommitted_selected,
+                "a dirty tree is shown when the graph opens"
+            );
+
+            graph.select_entry(0, ScrollStrategy::Nearest, cx);
+            assert!(!graph.uncommitted_selected);
+
+            graph.clear_selection(cx);
+            graph.select_uncommitted_by_default(cx);
+            assert!(
+                !graph.uncommitted_selected,
+                "once the user has picked something, the row is not selected for them again"
+            );
+
+            graph.select_uncommitted(cx);
+            assert!(graph.uncommitted_selected);
+            assert_eq!(graph.selected_entry_idx, None);
         });
     }
 

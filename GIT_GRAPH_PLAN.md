@@ -51,6 +51,13 @@ Bilinen sınırlamalar:
 - Remote bir projede durum şeridi yerel `Fs` ile bakamayacağı için çıkmayabilir.
 - Otomatik fetch her graph sekmesi için ayrı çalışıyor; aynı repoya iki graph açıksa iki kat fetch olur.
 
+## Uncommitted Changes satırı
+
+- Çalışma ağacında değişiklik varsa graph'ın en üstünde (arama çubuğu ve durum şeridinin altında, commit listesinin üstünde) "Uncommitted Changes · N files · +/-" satırı çıkıyor (`render_uncommitted_row`). Dosyalar `cached_status()` içinden `has_changes()` olanlar. File history modunda satır yok.
+- Tıklayınca detay paneli değişen dosyaları listeliyor (`render_uncommitted_panel`): dosyaya tıklayınca proje diff'i o dosyada açılıyor; "Open Diff" tüm diff'i, "Commit…" git panelini, "Stash All" `git::StashAll`'ı açıyor. Stash aktif repo üzerinde çalıştığı için graph başka bir repoyu gösteriyorsa pasif. Satıra çift tıklamak da tüm diff'i açıyor.
+- Varsayılan açık: Graph açıldığında değişiklik varsa satır seçili geliyor (`select_uncommitted_by_default`). Status'lar graph'tan sonra geldiği için bu, repository olaylarında, kullanıcı bir şey seçene kadar yeniden deneniyor. Kullanıcı bir commit seçtikten veya paneli kapattıktan sonra, sonraki bir düzenlemede satır kendiliğinden yeniden seçilmiyor. Graph belirli bir commit'te açıldıysa (`OpenAtCommit`) da seçilmiyor.
+- Satır gerçek bir graph satırı değil, commit listesinin üstünde ayrı bir satır. Graph çizgisi ona bağlanmıyor ve klavyeyle (yukarı/aşağı) üstüne gelinemiyor. Gerçek bir sahte satır, tüm satır indekslerini ve graph çizimini kaydırmayı gerektirirdi.
+
 ## Kontrol listesi
 - `README.md` başındaki `[!IMPORTANT]` satırları zaten var, dokunma.
 - `cargo fmt -p git_ui -p git`, `cargo clippy -p git_ui --all-targets`, `cargo test -p git_ui --lib`, `cargo test -p git --lib commit_search`.
