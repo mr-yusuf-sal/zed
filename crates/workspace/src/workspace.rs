@@ -1893,6 +1893,12 @@ impl Workspace {
         }
 
         cx.on_focus_lost(window, |this, window, cx| {
+            // Every workspace held by a multi-workspace window gets this
+            // callback. A hidden one taking focus would leave keystrokes with
+            // nothing on screen to handle them.
+            if !this.owns_window_chrome() {
+                return;
+            }
             let focus_handle = window
                 .focus_lost_restore_target(cx)
                 .unwrap_or_else(|| this.fallback_focus_handle(window, cx));
