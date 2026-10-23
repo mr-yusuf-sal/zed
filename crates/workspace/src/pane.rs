@@ -1059,6 +1059,32 @@ impl Pane {
         self.pinned_tab_count
     }
 
+    fn permanent_item_count(&self, cx: &App) -> usize {
+        self.items
+            .iter()
+            .take_while(|item| item.is_permanent(cx))
+            .count()
+    }
+
+    /// Puts a permanent item first in the pane and pins it, leaving the active item as it was
+    /// unless the pane had nothing to show.
+    pub fn add_permanent_item(
+        &mut self,
+        item: Box<dyn ItemHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.index_for_item_id(item.item_id()).is_some() {
+            return;
+        }
+        let was_empty = self.items.is_empty();
+        self.add_item_inner(item, false, false, was_empty, Some(0), window, cx);
+        if !was_empty {
+            self.active_item_index += 1;
+        }
+        self.pinned_tab_count += 1;
+    }
+
     pub fn handle_item_edit(&mut self, item_id: EntityId, cx: &App) {
         if let Some(preview_item) = self.preview_item()
             && preview_item.item_id() == item_id
@@ -1272,6 +1298,9 @@ impl Pane {
                 self.items.len(),
             )
         };
+        if !item.is_permanent(cx) {
+            insertion_index = insertion_index.max(self.permanent_item_count(cx));
+        }
 
         // Does the item already exist?
         let project_entry_id = if item.buffer_kind(cx) == ItemBufferKind::Singleton {
@@ -1613,6 +1642,9 @@ impl Pane {
                 window.dispatch_action(Box::new(CloseWindow), cx);
             }
 
+            return Task::ready(Ok(()));
+        }
+        if self.active_item().is_some_and(|item| item.is_permanent(cx)) {
             return Task::ready(Ok(()));
         }
         if self.is_tab_pinned(self.active_item_index) && !action.close_pinned {
@@ -1961,7 +1993,7 @@ impl Pane {
         // Find the items to close.
         let mut items_to_close = Vec::new();
         for item in &self.items {
-            if should_close(item.item_id()) {
+            if should_close(item.item_id()) && !item.is_permanent(cx) {
                 items_to_close.push(item.boxed_clone());
             }
         }
@@ -2089,6 +2121,9 @@ impl Pane {
         cx: &mut Context<Self>,
     ) -> Option<Box<dyn ItemHandle>> {
         let item = self.active_item()?;
+        if item.is_permanent(cx) {
+            return None;
+        }
         self.remove_item(item.item_id(), false, false, window, cx);
         Some(item)
     }
@@ -2722,7 +2757,11 @@ impl Pane {
                 PinOperation::Unpin => self.pinned_tab_count.checked_sub(1)?,
             };
 
-            let id = self.item_for_index(ix)?.item_id();
+            let item = self.item_for_index(ix)?;
+            if item.is_permanent(cx) {
+                return None;
+            }
+            let id = item.item_id();
             let should_activate = ix == self.active_item_index;
 
             if matches!(operation, PinOperation::Pin) {
@@ -2874,6 +2913,7 @@ impl Pane {
         let is_first_item = ix == 0;
         let is_last_item = ix == self.items.len() - 1;
         let is_pinned = self.is_tab_pinned(ix);
+        let is_permanent = item.is_permanent(cx);
         let position_relative_to_active_item = ix.cmp(&self.active_item_index);
 
         let read_only_toggle = |toggleable: bool| {
@@ -2950,16 +2990,18 @@ impl Pane {
                     cx.stop_propagation();
                 }),
             )
-            .on_drag(
-                DraggedTab {
-                    item: item.boxed_clone(),
-                    pane: cx.entity(),
-                    detail,
-                    is_active,
-                    ix,
-                },
-                |tab, _, _, cx| cx.new(|_| tab.clone()),
-            )
+            .when(!is_permanent, |tab| {
+                tab.on_drag(
+                    DraggedTab {
+                        item: item.boxed_clone(),
+                        pane: cx.entity(),
+                        detail,
+                        is_active,
+                        ix,
+                    },
+                    |tab, _, _, cx| cx.new(|_| tab.clone()),
+                )
+            })
             .drag_over::<DraggedTab>(move |tab, dragged_tab: &DraggedTab, _, cx| {
                 let mut styled_tab = tab
                     .bg(cx.theme().colors().drop_target_background)
@@ -2997,7 +3039,7 @@ impl Pane {
                 this.handle_external_paths_drop(paths, window, cx)
             }))
             .start_slot::<Indicator>(indicator)
-            .map(|this| {
+            .when(!is_permanent, |this| {
                 let end_slot_action: &'static dyn Action;
                 let end_slot_tooltip_text: &'static str;
                 let end_slot = if is_pinned {
@@ -3228,6 +3270,9 @@ impl Pane {
                             );
 
                         let pin_tab_entries = |menu: ContextMenu| {
+                            if is_permanent {
+                                return menu;
+                            }
                             menu.separator().map(|this| {
                                 if is_pinned {
                                     this.entry(
@@ -3874,6 +3919,11 @@ impl Pane {
             return;
         }
 
+        let ix = if self.drag_split_direction.is_none() {
+            ix.max(self.permanent_item_count(cx))
+        } else {
+            ix
+        };
         let mut to_pane = cx.entity();
         let split_direction = self.drag_split_direction;
         let item_id = dragged_tab.item.item_id();

@@ -1992,7 +1992,6 @@ impl Workspace {
         let left_dock = Dock::new(DockPosition::Left, modal_layer.clone(), window, cx);
         let bottom_dock = Dock::new(DockPosition::Bottom, modal_layer.clone(), window, cx);
         let right_dock = Dock::new(DockPosition::Right, modal_layer.clone(), window, cx);
-        let left_dock_buttons = cx.new(|cx| PanelButtons::new(left_dock.clone(), cx));
         let bottom_dock_buttons = cx.new(|cx| PanelButtons::new(bottom_dock.clone(), cx));
         let right_dock_buttons = cx.new(|cx| PanelButtons::new(right_dock.clone(), cx));
         let multi_workspace = window
@@ -2002,7 +2001,6 @@ impl Workspace {
         let status_bar = cx.new(|cx| {
             let mut status_bar =
                 StatusBar::new(&center_pane.clone(), multi_workspace.clone(), window, cx);
-            status_bar.add_left_item(left_dock_buttons, window, cx);
             status_bar.add_right_item(right_dock_buttons, window, cx);
             status_bar.add_right_item(bottom_dock_buttons, window, cx);
             status_bar
@@ -2970,6 +2968,19 @@ impl Workspace {
         });
 
         cx.emit(Event::PanelAdded(any_panel));
+    }
+
+    /// Adds an item that stays first and pinned in the center, in the first pane. It survives
+    /// the center being replaced while a serialized workspace is restored.
+    pub fn add_permanent_item(
+        &mut self,
+        item: Box<dyn ItemHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.center.first_pane().update(cx, |pane, cx| {
+            pane.add_permanent_item(item, window, cx);
+        });
     }
 
     pub fn remove_panel<T: Panel>(
@@ -4638,6 +4649,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.dock_at_position(dock_side).read(cx).can_open() {
+            return;
+        }
         let mut focus_center = false;
         let mut reveal_dock = false;
 
@@ -4908,6 +4922,11 @@ impl Workspace {
         let mut serialize = false;
         for dock in self.all_docks() {
             if let Some(panel_index) = dock.read(cx).panel_index_for_type::<T>() {
+                // Focusing a panel in a dock that never shows would send keystrokes somewhere
+                // the user can't see.
+                if !dock.read(cx).can_open() {
+                    break;
+                }
                 let mut focus_center = false;
                 let panel = dock.update(cx, |dock, cx| {
                     dock.activate_panel(panel_index, window, cx);
@@ -5753,6 +5772,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .active_item(cx)
+            .is_some_and(|item| item.is_permanent(cx))
+        {
+            return;
+        }
         let panes = self.center.panes();
         let destination = match panes.get(action.destination) {
             Some(&destination) => destination.clone(),
@@ -6029,6 +6054,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .active_item(cx)
+            .is_some_and(|item| item.is_permanent(cx))
+        {
+            return;
+        }
         let destination = match self.find_pane_in_direction(action.direction, cx) {
             Some(destination) => destination,
             None => {
@@ -6769,6 +6800,15 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         cx.emit(Event::ActiveItemChanged);
+        // A permanent item shows the whole project rather than a part of it, so while it is
+        // active the project keeps pointing at whatever was open before it.
+        if self
+            .active_item(cx)
+            .is_some_and(|item| item.is_permanent(cx))
+        {
+            self.update_window_title(window, cx);
+            return;
+        }
         let active_entry = self.active_project_path(cx);
         let active_project_path_changed =
             self.last_active_project_path.as_ref() != active_entry.as_ref();
@@ -8067,6 +8107,14 @@ impl Workspace {
             // Remove old panes from workspace panes list
             workspace.update_in(cx, |workspace, window, cx| {
                 if let Some((center_group, active_pane)) = center_group {
+                    let mut permanent_items = Vec::new();
+                    for pane in workspace.center.panes() {
+                        for item in pane.read(cx).items() {
+                            if item.is_permanent(cx) {
+                                permanent_items.push(item.boxed_clone());
+                            }
+                        }
+                    }
                     workspace.remove_panes(workspace.center.root.clone(), window, cx);
 
                     // Swap workspace center group
@@ -8079,6 +8127,10 @@ impl Workspace {
                         cx.focus_self(window);
                     } else {
                         workspace.set_active_pane(&workspace.center.first_pane(), window, cx);
+                    }
+
+                    for item in permanent_items.into_iter().rev() {
+                        workspace.add_permanent_item(item, window, cx);
                     }
                 }
 
@@ -12431,6 +12483,9 @@ pub fn move_item(
         // Tab was closed during drag
         return;
     };
+    if source != destination && item_handle.is_permanent(cx) {
+        return;
+    }
 
     if source != destination {
         // Close item from previous pane
@@ -12470,6 +12525,9 @@ pub fn move_active_item(
     let Some(active_item) = source.read(cx).active_item() else {
         return;
     };
+    if active_item.is_permanent(cx) {
+        return;
+    }
     source.update(cx, |source_pane, cx| {
         let item_id = active_item.item_id();
         source_pane.remove_item(item_id, false, close_if_empty, window, cx);
