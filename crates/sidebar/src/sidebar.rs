@@ -8120,6 +8120,9 @@ fn all_thread_infos_for_workspace(
                 match thread.status() {
                     ThreadStatus::Unconfirmed => AgentThreadStatus::Unconfirmed,
                     ThreadStatus::Generating => AgentThreadStatus::Running,
+                    ThreadStatus::Idle if thread.has_background_work(cx) => {
+                        AgentThreadStatus::Running
+                    }
                     ThreadStatus::Idle => AgentThreadStatus::Completed,
                 }
             };
