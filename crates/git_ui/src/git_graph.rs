@@ -3928,14 +3928,21 @@ impl GitGraph {
                 .read(cx)
                 .repo_path_to_project_path(&repo_path, cx)
         });
-        self.workspace
-            .update(cx, |workspace, cx| match project_path {
-                Some(project_path) => {
-                    ProjectDiff::deploy_at_project_path(workspace, project_path, window, cx)
-                }
-                None => ProjectDiff::deploy_at(workspace, None, window, cx),
-            })
-            .log_err();
+        let workspace = self.workspace.clone();
+        // Opening the diff activates it in the pane, which deactivates this
+        // graph's tab and updates the graph. Callers are inside an update of
+        // the graph, so doing it right away panicked with a double lease;
+        // deferring runs it once that update is over.
+        window.defer(cx, move |window, cx| {
+            workspace
+                .update(cx, |workspace, cx| match project_path {
+                    Some(project_path) => {
+                        ProjectDiff::deploy_at_project_path(workspace, project_path, window, cx)
+                    }
+                    None => ProjectDiff::deploy_at(workspace, None, window, cx),
+                })
+                .log_err();
+        });
     }
 
     /// A row above the commits for the working tree's changes, like the
