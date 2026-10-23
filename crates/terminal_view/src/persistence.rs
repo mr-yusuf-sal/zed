@@ -349,6 +349,63 @@ pub(crate) struct SerializedTerminalPanel {
     pub active_item_id: Option<u64>,
 }
 
+impl SerializedTerminalPanel {
+    pub(crate) fn item_ids(&self) -> Vec<ItemId> {
+        fn collect(group: &SerializedPaneGroup, item_ids: &mut Vec<ItemId>) {
+            match group {
+                SerializedPaneGroup::Pane(pane) => item_ids.extend(&pane.children),
+                SerializedPaneGroup::Group { children, .. } => {
+                    for child in children {
+                        collect(child, item_ids);
+                    }
+                }
+            }
+        }
+        match &self.items {
+            SerializedItems::NoSplits(item_ids) => item_ids.clone(),
+            SerializedItems::WithSplits(group) => {
+                let mut item_ids = Vec::new();
+                collect(group, &mut item_ids);
+                item_ids
+            }
+        }
+    }
+}
+
+/// Ends the shells that terminal hosts kept running for saved terminals that
+/// are not going to be shown. A host is only reachable by attaching to it.
+pub(crate) async fn end_hosted_sessions(
+    item_ids: Vec<ItemId>,
+    workspace_id: WorkspaceId,
+    project: Entity<Project>,
+    cx: &mut AsyncWindowContext,
+) {
+    let Ok(session_ids) = cx.update(|_window, cx| {
+        let db = TerminalDb::global(cx);
+        item_ids
+            .into_iter()
+            .filter_map(|item_id| {
+                db.get_host_session(item_id, workspace_id)
+                    .log_err()
+                    .flatten()
+            })
+            .collect::<Vec<_>>()
+    }) else {
+        return;
+    };
+    for session_id in session_ids {
+        let attached = project
+            .update(cx, |project, cx| {
+                project.attach_hosted_terminal(session_id, None, cx)
+            })
+            .await;
+        match attached {
+            Ok(terminal) => terminal.read_with(cx, |terminal, _| terminal.kill_hosted_session()),
+            Err(error) => log::debug!("terminal host for a discarded terminal is gone: {error:#}"),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum SerializedItems {
