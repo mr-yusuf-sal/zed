@@ -521,6 +521,20 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
                 };
 
                 let active_workspace = this.workspace().clone();
+                if let Some(terminal_panel) = active_workspace.read(cx).panel::<TerminalPanel>(cx)
+                {
+                    let other_terminal_panels = this
+                        .workspaces()
+                        .filter(|workspace| *workspace != &active_workspace)
+                        .filter_map(|workspace| workspace.read(cx).panel::<TerminalPanel>(cx))
+                        .collect::<Vec<_>>();
+                    terminal_panel.update(cx, |terminal_panel, cx| {
+                        for other_terminal_panel in &other_terminal_panels {
+                            terminal_panel.take_terminals_from(other_terminal_panel, window, cx);
+                        }
+                    });
+                }
+
                 let source_workspace = source_workspace.clone();
                 active_workspace.update(cx, |workspace, cx| {
                     if let Some(ref source) = source_workspace {

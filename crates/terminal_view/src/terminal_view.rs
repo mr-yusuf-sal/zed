@@ -1930,9 +1930,21 @@ impl Item for TerminalView {
     fn added_to_workspace(
         &mut self,
         workspace: &mut Workspace,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A terminal can be handed over to another workspace in the same
+        // window (see `TerminalPanel::take_terminals_from`); without this,
+        // opening a path from it would act on the workspace it came from,
+        // which is no longer on screen.
+        let workspace_handle = workspace.weak_handle();
+        if self.workspace != workspace_handle {
+            self.workspace = workspace_handle;
+            self.project = workspace.project().downgrade();
+            self._terminal_subscriptions =
+                subscribe_for_terminal_events(&self.terminal, self.workspace.clone(), window, cx);
+        }
+
         if self.terminal().read(cx).task().is_none() {
             if let Some((new_id, old_id)) = workspace.database_id().zip(self.workspace_id) {
                 log::debug!(

@@ -1218,6 +1218,63 @@ impl TerminalPanel {
         })
     }
 
+    /// Moves every terminal held by `source` into this panel's active pane.
+    ///
+    /// Terminals belong to the window rather than to the project shown in it:
+    /// switching projects in the sidebar hands the open terminals over to the
+    /// newly displayed workspace instead of showing that workspace's own set.
+    /// Splits in `source` are flattened into a single pane.
+    pub fn take_terminals_from(
+        &mut self,
+        source: &Entity<TerminalPanel>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (items, active_item_id) = source.update(cx, |source, cx| {
+            let active_item_id = source
+                .active_pane
+                .read(cx)
+                .active_item()
+                .map(|item| item.item_id());
+            let panes = source.center.panes().into_iter().cloned().collect::<Vec<_>>();
+            let mut items = Vec::new();
+            for pane in &panes {
+                let pane_items = pane.read(cx).items().cloned().collect::<Vec<_>>();
+                pane.update(cx, |pane, cx| {
+                    pane.set_zoomed(false, cx);
+                    for item in &pane_items {
+                        pane.remove_item(item.item_id(), false, false, window, cx);
+                    }
+                });
+                items.extend(pane_items);
+            }
+            let first_pane = source.center.first_pane();
+            for pane in panes {
+                if pane != first_pane {
+                    source.center.remove(&pane, cx).log_err();
+                }
+            }
+            source.active_pane = first_pane;
+            cx.notify();
+            (items, active_item_id)
+        });
+        if items.is_empty() {
+            return;
+        }
+
+        self.active_pane.update(cx, |pane, cx| {
+            for item in items {
+                pane.add_item(item, false, false, None, window, cx);
+            }
+            if let Some(index) = active_item_id
+                .and_then(|id| pane.items().position(|item| item.item_id() == id))
+            {
+                pane.activate_item(index, false, false, window, cx);
+            }
+        });
+        cx.notify();
+    }
+
     fn has_no_terminals(&self, cx: &App) -> bool {
         self.active_pane.read(cx).items_len() == 0 && self.pending_terminals_to_add == 0
     }
