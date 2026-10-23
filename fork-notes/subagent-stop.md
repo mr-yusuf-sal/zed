@@ -32,8 +32,12 @@ Last updated: 2026-10-22.
     on to the agent unchanged.
   - The button is the menu entry's end slot. `ContextMenu` shows an end slot only when
     the menu has an end slot action, so the menu sets `menu::EndSlot`, which has no key
-    binding. A row with a Stop button has no thread icon, because `entry_with_end_slot`
-    takes none.
+    binding. The row is built with `ContextMenuEntry::end_slot`, so it keeps its thread
+    icon.
+  - Clicking Stop closes the menu, which an end slot does not do by itself, so the handler
+    dispatches `menu::Cancel`. `AcpThread` keeps the subagent in a "stopping" set from the
+    click until the agent reports it idle, and the running work count leaves it out
+    meanwhile. Without that set, the count kept the subagent until its stop arrived.
   - `test_stopping_a_subagent_cancels_only_its_session` checks that the fake agent gets
     a `session/cancel` for the subagent's session and none for the parent's. fmt, check,
     the tests of `agent_servers`, `acp_thread` and `agent_host`, and clippy pass on
