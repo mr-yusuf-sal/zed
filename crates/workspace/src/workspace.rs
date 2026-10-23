@@ -8542,6 +8542,21 @@ impl Workspace {
         div
     }
 
+    pub(crate) fn auto_hide_docks_on_mouse_move(
+        &mut self,
+        mouse_position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.zoomed.is_some() {
+            return;
+        }
+        let workspace_bounds = self.bounds;
+        self.left_dock.update(cx, |dock, cx| {
+            dock.auto_hide_on_mouse_move(mouse_position, workspace_bounds, window, cx);
+        });
+    }
+
     pub fn has_active_modal(&self, _: &mut Window, cx: &mut App) -> bool {
         self.modal_layer.read(cx).has_active_modal()
     }
