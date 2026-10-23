@@ -26,6 +26,12 @@ impl ConnectionStore {
         cx.set_global(GlobalConnectionStore(store));
     }
 
+    #[cfg(test)]
+    pub fn set_global_for_test(connections: Vec<ConnectionConfig>, cx: &mut App) {
+        let store = cx.new(|_| ConnectionStore { connections });
+        cx.set_global(GlobalConnectionStore(store));
+    }
+
     pub fn global(cx: &App) -> Option<Entity<Self>> {
         cx.try_global::<GlobalConnectionStore>()
             .map(|global| global.0.clone())
