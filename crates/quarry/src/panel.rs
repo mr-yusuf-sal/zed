@@ -19,8 +19,8 @@ use ui::{
 };
 use util::ResultExt as _;
 use workspace::{
-    Workspace,
-    dock::{DockPosition, Panel, PanelEvent},
+    ItemId, Workspace, WorkspaceId,
+    item::{Item, ItemEvent, SerializableItem, TabContentParams},
 };
 
 actions!(
@@ -138,12 +138,30 @@ fn connection_menu(
 }
 
 pub fn init(cx: &mut App) {
+    workspace::register_serializable_item::<QuarryPanel>(cx);
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-            workspace.toggle_panel_focus::<QuarryPanel>(window, cx);
+            open(workspace, window, cx);
         });
     })
     .detach();
+}
+
+/// Shows Quarry as a tab in the center, where there is room for its tree: the one already open
+/// in this workspace if there is one, or a new one in the active pane.
+fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    let existing = workspace.items_of_type::<QuarryPanel>(cx).next();
+    if let Some(existing) = existing {
+        workspace.activate_item(&existing, true, true, window, cx);
+        return;
+    }
+    let Some(store) = ConnectionStore::global(cx) else {
+        log::error!("the Quarry connection store is unavailable");
+        return;
+    };
+    let weak_workspace = workspace.weak_handle();
+    let quarry = cx.new(|cx| QuarryPanel::new(weak_workspace, store, window, cx));
+    workspace.add_item_to_active_pane(Box::new(quarry), None, true, window, cx);
 }
 
 /// One saved connection and, once opened, the live driver and the part of its object tree that
@@ -243,8 +261,6 @@ pub struct QuarryPanel {
     /// folder that was never expanded is not searched, because that would mean asking the
     /// server for everything.
     filter: Entity<Editor>,
-    width: Option<Pixels>,
-    position: DockPosition,
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     /// Set while `docker inspect` is running for "Add from Docker Containers".
     discovering: Option<Task<()>>,
@@ -297,8 +313,6 @@ impl QuarryPanel {
             draft: None,
             prompt: None,
             filter,
-            width: None,
-            position: DockPosition::Left,
             context_menu: None,
             collapsed_folders: HashSet::default(),
             compare_source: None,
@@ -2069,50 +2083,77 @@ impl Focusable for QuarryPanel {
     }
 }
 
-impl EventEmitter<PanelEvent> for QuarryPanel {}
+impl EventEmitter<ItemEvent> for QuarryPanel {}
 
-impl Panel for QuarryPanel {
-    fn persistent_name() -> &'static str {
+impl Item for QuarryPanel {
+    type Event = ItemEvent;
+
+    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
+        Some(Icon::new(IconName::Server))
+    }
+
+    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        "Quarry".into()
+    }
+
+    fn tab_content(&self, params: TabContentParams, _window: &Window, _cx: &App) -> AnyElement {
+        Label::new("Quarry")
+            .color(params.text_color())
+            .into_any_element()
+    }
+
+    fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
+        f(*event)
+    }
+}
+
+/// The tab has nothing of its own to save: connections live in the connection store, and what
+/// was expanded is cheap to open again. Being serializable is what brings it back after a
+/// restart.
+impl SerializableItem for QuarryPanel {
+    fn serialized_item_kind() -> &'static str {
         "QuarryPanel"
     }
 
-    fn panel_key() -> &'static str {
-        "QuarryPanel"
+    fn cleanup(
+        _workspace_id: WorkspaceId,
+        _alive_items: Vec<ItemId>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Task<Result<()>> {
+        Task::ready(Ok(()))
     }
 
-    fn position(&self, _: &Window, _: &App) -> DockPosition {
-        self.position
+    fn deserialize(
+        _project: Entity<project::Project>,
+        workspace: WeakEntity<Workspace>,
+        _workspace_id: WorkspaceId,
+        _item_id: ItemId,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Entity<Self>>> {
+        let Some(store) = ConnectionStore::global(cx) else {
+            return Task::ready(Err(anyhow::anyhow!(
+                "the Quarry connection store is unavailable"
+            )));
+        };
+        Task::ready(Ok(
+            cx.new(|cx| QuarryPanel::new(workspace, store, window, cx))
+        ))
     }
 
-    fn position_is_valid(&self, position: DockPosition) -> bool {
-        matches!(position, DockPosition::Left | DockPosition::Right)
+    fn serialize(
+        &mut self,
+        _workspace: &mut Workspace,
+        _item_id: ItemId,
+        _closing: bool,
+        _cx: &mut Context<Self>,
+    ) -> Option<Task<Result<()>>> {
+        Some(Task::ready(Ok(())))
     }
 
-    fn set_position(&mut self, position: DockPosition, _: &mut Window, cx: &mut Context<Self>) {
-        // Kept on the panel rather than written to settings.json: adding a settings key means
-        // editing the central settings crate, which this fork has to keep rebasing.
-        self.position = position;
-        cx.notify();
-    }
-
-    fn default_size(&self, _: &Window, _: &App) -> Pixels {
-        self.width.unwrap_or(px(280.))
-    }
-
-    fn icon(&self, _: &Window, _: &App) -> Option<IconName> {
-        Some(IconName::Server)
-    }
-
-    fn icon_tooltip(&self, _: &Window, _: &App) -> Option<&'static str> {
-        Some("Quarry")
-    }
-
-    fn toggle_action(&self) -> Box<dyn gpui::Action> {
-        Box::new(ToggleFocus)
-    }
-
-    fn activation_priority(&self) -> u32 {
-        6
+    fn should_serialize(&self, _event: &Self::Event) -> bool {
+        false
     }
 }
 
@@ -2376,17 +2417,4 @@ impl Render for QuarryPanel {
             .into_any_element()
             .into_any()
     }
-}
-
-/// Opens the panel for a workspace. Returns an error rather than a panel when Quarry failed to
-/// start, so the caller can leave it out of the dock instead of showing something inert.
-pub async fn load(
-    workspace: WeakEntity<Workspace>,
-    mut cx: gpui::AsyncWindowContext,
-) -> Result<Entity<QuarryPanel>> {
-    cx.update(|window, cx| {
-        let store = ConnectionStore::global(cx)
-            .ok_or_else(|| anyhow::anyhow!("the Quarry connection store is unavailable"))?;
-        anyhow::Ok(cx.new(|cx| QuarryPanel::new(workspace, store, window, cx)))
-    })?
 }
