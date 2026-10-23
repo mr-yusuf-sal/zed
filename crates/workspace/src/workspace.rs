@@ -1625,6 +1625,9 @@ pub struct Workspace {
     _schedule_serialize_ssh_paths: Option<Task<()>>,
     pane_history_timestamp: Arc<AtomicUsize>,
     bounds: Bounds<Pixels>,
+    /// Width of the whole window content, the threads sidebar included. Pushed in by the
+    /// `MultiWorkspace` each frame; see `right_dock_flex_reference_width`.
+    root_width: Option<Pixels>,
     pub centered_layout: bool,
     bounds_save_task_queued: Option<Task<()>>,
     on_prompt_for_new_path: Option<PromptForNewPath>,
@@ -2133,6 +2136,7 @@ impl Workspace {
             workspace_actions: Default::default(),
             // This data will be incorrect, but it will be overwritten by the time it needs to be used.
             bounds: Default::default(),
+            root_width: None,
             centered_layout: false,
             bounds_save_task_queued: None,
             on_prompt_for_new_path: None,
@@ -2744,6 +2748,9 @@ impl Workspace {
             && use_flex
             && let Some(flex) = size_state.flex.or_else(|| self.default_dock_flex(position))
         {
+            if position == DockPosition::Right {
+                return Some(self.flexible_right_dock_width(flex));
+            }
             let workspace_width = self.bounds.size.width;
             if workspace_width <= Pixels::ZERO {
                 return None;
@@ -2789,6 +2796,11 @@ impl Workspace {
         }
 
         let center_column_count = self.center_full_height_column_count();
+        if position == DockPosition::Right {
+            let reference_width = self.right_dock_flex_reference_width();
+            let remaining = (reference_width - size).max(px(1.));
+            return Some((size * center_column_count / remaining).max(0.0));
+        }
         let opposite = self.opposite_dock_panel_and_size_state(position, window, cx);
         if let Some(opposite_flex) = opposite.as_ref().and_then(|(_, s)| s.flex) {
             let size = size.clamp(px(0.), workspace_width - px(1.));
@@ -2823,7 +2835,34 @@ impl Workspace {
         if size_state.flex.is_none() && panel.has_flexible_size(window, cx) {
             size_state.flex = self.default_dock_flex(opposite_position);
         }
+        // A flexible right dock is laid out at a fixed width, so the left dock has to see it
+        // as one.
+        if opposite_position == DockPosition::Right
+            && let Some(flex) = size_state.flex.take()
+        {
+            size_state.size = Some(self.flexible_right_dock_width(flex));
+        }
         Some((panel.clone(), size_state))
+    }
+
+    /// A flexible right dock (usually the agent panel) is sized against the whole window instead
+    /// of what the left dock and the threads sidebar leave over, so opening or closing those only
+    /// takes width from the center.
+    fn right_dock_flex_reference_width(&self) -> Pixels {
+        self.root_width.unwrap_or(self.bounds.size.width)
+    }
+
+    fn flexible_right_dock_width(&self, flex: f32) -> Pixels {
+        let flex = flex.max(0.001);
+        let share = flex / (flex + self.center_full_height_column_count());
+        (self.right_dock_flex_reference_width() * share).max(RESIZE_HANDLE_SIZE)
+    }
+
+    pub(crate) fn set_root_width(&mut self, width: Pixels, cx: &mut Context<Self>) {
+        if self.root_width != Some(width) {
+            self.root_width = Some(width);
+            cx.notify();
+        }
     }
 
     fn center_full_height_column_count(&self) -> f32 {
@@ -8773,7 +8812,13 @@ impl Workspace {
                 } else {
                     None
                 };
-                if let Some(grow) = flex_grow {
+                if let Some(flex) = flex_grow
+                    && position == DockPosition::Right
+                {
+                    container = container.w(self.flexible_right_dock_width(flex));
+                    let style = container.style();
+                    style.flex_shrink = Some(1.0);
+                } else if let Some(grow) = flex_grow {
                     let grow = (grow / self.center_full_height_column_count()).max(0.001);
                     let style = container.style();
                     style.flex_grow = Some(grow);
