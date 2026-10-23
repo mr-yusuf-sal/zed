@@ -2340,8 +2340,13 @@ impl Render for MultiWorkspace {
                         {
                             let this = this.clone();
                             move |bounds, _, cx| {
-                                this.update(cx, |this, _| this.root_bounds = Some(bounds))
-                                    .ok();
+                                this.update(cx, |this, cx| {
+                                    this.root_bounds = Some(bounds);
+                                    this.workspace().clone().update(cx, |workspace, cx| {
+                                        workspace.set_root_width(bounds.size.width, cx);
+                                    });
+                                })
+                                .ok();
                             }
                         },
                         move |_, _, window, _| {
