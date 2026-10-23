@@ -114,6 +114,10 @@ pub struct ResultSet {
     /// Present when every row came from one table, collection or key and can be addressed for
     /// an update. `None` makes the result read-only.
     pub edit_target: Option<EditTarget>,
+    /// For engines whose rows are documents (MongoDB), each row's document as indented JSON,
+    /// with its types and nesting intact, for the record view. Empty for every other engine,
+    /// and `None` for a row edited since it was read.
+    pub documents: Vec<Option<SharedString>>,
 }
 
 impl ResultSet {
