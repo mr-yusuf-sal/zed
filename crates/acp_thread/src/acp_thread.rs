@@ -3399,6 +3399,11 @@ pub struct AcpThread {
     /// subagent launched in the background outlives its tool call, which
     /// completes as soon as the launch does.
     running_subagent_tool_calls: HashSet<acp_v1::ToolCallId>,
+    /// The tool calls whose subagent the user asked to stop and that the
+    /// agent has not yet reported as stopped. The agent sends nothing back
+    /// for the request itself, so without this the subagent would still show
+    /// as running until its stop arrives.
+    stopping_subagent_tool_calls: HashSet<acp_v1::ToolCallId>,
     had_error: bool,
     /// The user's unsent prompt text, persisted so it can be restored when reloading the thread.
     draft_prompt: Option<Vec<acp_v2::ContentBlock>>,
@@ -3719,6 +3724,7 @@ impl AcpThread {
             plans: HashMap::default(),
             visible_plan: None,
             running_subagent_tool_calls: HashSet::default(),
+            stopping_subagent_tool_calls: HashSet::default(),
             provisional_title: None,
             project,
             running_turn: None,
@@ -3834,9 +3840,19 @@ impl AcpThread {
             .can_stop_subagent(self.session_id(), tool_call_id)
     }
 
-    pub fn stop_subagent(&self, tool_call_id: &acp_v1::ToolCallId, cx: &mut App) {
+    pub fn is_subagent_stopping(&self, tool_call_id: &acp_v1::ToolCallId) -> bool {
+        self.stopping_subagent_tool_calls.contains(tool_call_id)
+    }
+
+    pub fn stop_subagent(&mut self, tool_call_id: &acp_v1::ToolCallId, cx: &mut Context<Self>) {
         self.connection
-            .stop_subagent(self.session_id(), tool_call_id, cx)
+            .stop_subagent(self.session_id(), tool_call_id, cx);
+        if self
+            .stopping_subagent_tool_calls
+            .insert(tool_call_id.clone())
+        {
+            cx.notify();
+        }
     }
 
     pub fn set_subagent_running(
@@ -3848,7 +3864,8 @@ impl AcpThread {
         let changed = if running {
             self.running_subagent_tool_calls.insert(tool_call_id)
         } else {
-            self.running_subagent_tool_calls.remove(&tool_call_id)
+            let stopped = self.stopping_subagent_tool_calls.remove(&tool_call_id);
+            self.running_subagent_tool_calls.remove(&tool_call_id) || stopped
         };
         if changed {
             cx.notify();

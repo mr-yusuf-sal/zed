@@ -4455,7 +4455,9 @@ impl ThreadView {
                             | ToolCallStatus::InProgress
                             | ToolCallStatus::WaitingForConfirmation
                     );
-                if !launch_running && !thread.is_subagent_running(&tool_call.id) {
+                if (!launch_running && !thread.is_subagent_running(&tool_call.id))
+                    || thread.is_subagent_stopping(&tool_call.id)
+                {
                     return None;
                 }
                 let label = tool_call
@@ -4558,30 +4560,28 @@ impl ThreadView {
                                     "{label} · {tool_call_count} {}",
                                     pluralize("tool call", *tool_call_count)
                                 );
-                                menu = match stoppable_tool_call_id {
-                                    Some(tool_call_id) => menu.entry_with_end_slot(
-                                        label,
-                                        None,
-                                        scroll_to(*entry_ix),
-                                        IconName::Stop,
-                                        "Stop Subagent".into(),
-                                        {
+                                let entry = ContextMenuEntry::new(label)
+                                    .icon(IconName::Thread)
+                                    .icon_color(Color::Muted)
+                                    .handler(scroll_to(*entry_ix));
+                                let entry = match stoppable_tool_call_id {
+                                    Some(tool_call_id) => {
+                                        entry.end_slot(IconName::Stop, "Stop Subagent", {
                                             let thread = thread.clone();
                                             let tool_call_id = tool_call_id.clone();
-                                            move |_, cx| {
+                                            move |window, cx| {
                                                 thread.update(cx, |thread, cx| {
                                                     thread.stop_subagent(&tool_call_id, cx)
                                                 });
+                                                // An end slot leaves the menu open,
+                                                // unlike picking the entry.
+                                                window.dispatch_action(Box::new(menu::Cancel), cx);
                                             }
-                                        },
-                                    ),
-                                    None => menu.item(
-                                        ContextMenuEntry::new(label)
-                                            .icon(IconName::Thread)
-                                            .icon_color(Color::Muted)
-                                            .handler(scroll_to(*entry_ix)),
-                                    ),
+                                        })
+                                    }
+                                    None => entry,
                                 };
+                                menu = menu.item(entry);
                             }
                         }
                         if !processes.is_empty() {

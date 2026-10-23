@@ -6152,6 +6152,12 @@ exit 7
             vec![acp::SessionId::new("child")],
             "only the subagent's session is cancelled, not its parent's"
         );
+        thread.read_with(cx, |thread, _| {
+            assert!(
+                thread.is_subagent_stopping(&launch_id),
+                "the subagent leaves the running list before the agent reports its stop"
+            );
+        });
 
         send_update(
             "parent",
@@ -6164,6 +6170,7 @@ exit 7
         cx.run_until_parked();
         thread.read_with(cx, |thread, _| {
             assert!(!thread.is_subagent_running(&launch_id));
+            assert!(!thread.is_subagent_stopping(&launch_id));
             assert!(!thread.can_stop_subagent(&launch_id));
         });
     }
