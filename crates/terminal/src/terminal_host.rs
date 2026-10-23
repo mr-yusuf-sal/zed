@@ -16,13 +16,14 @@ use std::{
     process::{ExitStatus, Stdio},
     rc::Rc,
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
+use collections::HashSet;
 use futures::{
     AsyncReadExt as _, AsyncWriteExt as _, StreamExt as _,
     channel::mpsc::{self, UnboundedReceiver, UnboundedSender},
@@ -30,6 +31,7 @@ use futures::{
 };
 use gpui::{BackgroundExecutor, Task};
 use net::async_net::{UnixListener, UnixStream};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use smol::{LocalExecutor, Timer};
 use vte::ansi::{Processor, StdSyncHandler};
@@ -65,6 +67,10 @@ const EXITED_TAG: u8 = b'x';
 const ERROR_TAG: u8 = b'e';
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Sessions this process started or attached to. A terminal's session is saved
+/// some time after its host starts, so these may not be saved yet.
+static OWN_SESSIONS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
 
 /// Lets interactive local terminals run their shells in a host process. Only
 /// the Zed binary handles `--terminal-host`, so test binaries and other
@@ -131,10 +137,12 @@ pub(crate) struct HostConnection {
     writer: WriteHalf<UnixStream>,
 }
 
+fn hosts_directory() -> PathBuf {
+    paths::temp_dir().join("terminal_hosts")
+}
+
 fn socket_path(session_id: &str) -> PathBuf {
-    paths::temp_dir()
-        .join("terminal_hosts")
-        .join(format!("{session_id}.sock"))
+    hosts_directory().join(format!("{session_id}.sock"))
 }
 
 /// Starts a host for a new shell, or connects to the host of an existing one.
@@ -142,6 +150,7 @@ pub(crate) async fn connect(session: Session) -> Result<HostConnection> {
     let (session_id, hello, stream) = match session {
         Session::Spawn(request) => {
             let session_id = uuid::Uuid::new_v4().simple().to_string();
+            OWN_SESSIONS.lock().insert(session_id.clone());
             let socket_path = socket_path(&session_id);
             spawn_host(&socket_path)?;
             let started_at = Instant::now();
@@ -158,6 +167,7 @@ pub(crate) async fn connect(session: Session) -> Result<HostConnection> {
             (session_id, Hello::Spawn(request), stream)
         }
         Session::Attach(session_id) => {
+            OWN_SESSIONS.lock().insert(session_id.clone());
             let stream = UnixStream::connect(socket_path(&session_id))
                 .await
                 .with_context(|| format!("no terminal host is running session {session_id}"))?;
@@ -183,6 +193,81 @@ pub(crate) async fn connect(session: Session) -> Result<HostConnection> {
             })
         }
         ERROR_TAG => Err(anyhow!("{}", String::from_utf8_lossy(&payload))),
+        _ => bail!("unexpected terminal host greeting {tag}"),
+    }
+}
+
+/// Ends the hosts whose sessions are neither in `saved_sessions` nor used by
+/// this process. Nothing would attach to them again, and a host only ends when
+/// its shell does, so without this they would run until the machine restarts.
+pub async fn end_unknown_sessions(saved_sessions: &HashSet<String>) {
+    let directory = hosts_directory();
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => {
+            log::error!("failed to list {}: {error}", directory.display());
+            return;
+        }
+    };
+    for entry in entries {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(error) => {
+                log::warn!("failed to list {}: {error}", directory.display());
+                continue;
+            }
+        };
+        if path.extension() != Some("sock".as_ref()) {
+            continue;
+        }
+        let Some(session_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if saved_sessions.contains(session_id) || OWN_SESSIONS.lock().contains(session_id) {
+            continue;
+        }
+        match UnixStream::connect(&path).await {
+            Ok(stream) => match end_session(stream).await {
+                Ok(()) => log::info!("ended the unused terminal host session {session_id}"),
+                Err(error) => {
+                    log::warn!("failed to end terminal host session {session_id}: {error:#}")
+                }
+            },
+            // Left behind by a host that did not get to remove it.
+            Err(_) => {
+                if let Err(error) = std::fs::remove_file(&path)
+                    && error.kind() != io::ErrorKind::NotFound
+                {
+                    log::warn!("failed to remove stale socket {}: {error}", path.display());
+                }
+            }
+        }
+    }
+}
+
+async fn end_session(stream: UnixStream) -> Result<()> {
+    let (mut reader, mut writer) = stream.split();
+    writer
+        .write_all(&frame(HELLO_TAG, &serde_json::to_vec(&Hello::Attach)?))
+        .await?;
+    let (tag, payload) = read_frame(&mut reader)
+        .await?
+        .context("terminal host closed the connection")?;
+    match tag {
+        ATTACHED_TAG => {
+            writer.write_all(&frame(KILL_TAG, &[])).await?;
+            writer.close().await?;
+            Ok(())
+        }
+        // The host's shell has already exited, and the host ends on its own.
+        ERROR_TAG => {
+            log::debug!(
+                "terminal host refused to attach: {}",
+                String::from_utf8_lossy(&payload)
+            );
+            Ok(())
+        }
         _ => bail!("unexpected terminal host greeting {tag}"),
     }
 }
