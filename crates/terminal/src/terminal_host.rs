@@ -411,6 +411,16 @@ fn spawn_host(socket_path: &Path) -> Result<()> {
 
 /// The entry point of `zed --terminal-host <socket>`.
 pub fn run(socket_path: &Path) -> Result<()> {
+    // Zed starts the host in a new process group, which on Windows also makes
+    // the process ignore Ctrl+C, and the shell inherits that: ^C from the
+    // ConPTY would reach it and do nothing. Normal handling is restored before
+    // the shell is started.
+    #[cfg(windows)]
+    if let Err(error) =
+        unsafe { windows::Win32::System::Console::SetConsoleCtrlHandler(None, false) }
+    {
+        log::error!("failed to re-enable Ctrl+C for the terminal host's shell: {error}");
+    }
     let executor = Rc::new(LocalExecutor::new());
     smol::block_on(executor.run(serve(executor.clone(), socket_path.to_path_buf())))
 }
