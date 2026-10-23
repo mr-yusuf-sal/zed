@@ -9557,6 +9557,12 @@ impl Panel for GitPanel {
         3
     }
 
+    // The right dock this panel is kept in reveals its first enabled panel on hover, which has to
+    // be the project panel.
+    fn enabled(&self, _cx: &App) -> bool {
+        false
+    }
+
     fn hide_button_setting(&self, _: &App) -> Option<workspace::HideStatusItem> {
         Some(workspace::HideStatusItem::new(|settings| {
             settings.git_panel.get_or_insert_default().button = Some(false);
