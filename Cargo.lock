@@ -14860,10 +14860,12 @@ dependencies = [
  "theme",
  "theme_settings",
  "tiberius",
+ "tiny_http",
  "tokio",
  "tokio-util",
  "ui",
  "util",
+ "uuid",
  "workspace",
  "zed-reqwest",
 ]

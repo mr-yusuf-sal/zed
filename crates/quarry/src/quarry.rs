@@ -9,6 +9,7 @@ pub mod connection_store;
 pub mod docker;
 pub mod driver;
 pub mod drivers;
+pub mod mcp;
 pub mod panel;
 pub mod query_view;
 pub mod result_table;
@@ -28,6 +29,7 @@ pub fn init(cx: &mut App) {
     QuarryRuntime::init(cx);
     connection_store::ConnectionStore::init(cx);
     panel::init(cx);
+    mcp::init(cx);
     workspace::register_serializable_item::<query_view::QueryView>(cx);
 }
 
