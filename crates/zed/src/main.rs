@@ -788,6 +788,13 @@ fn main() {
         });
         vim::init(cx);
         terminal_view::init(cx);
+        // Every Zed on the machine shares the hosts, but only a stable one has
+        // the database that says which of them its saved terminals still use.
+        if !*zed_env_vars::ZED_STATELESS
+            && *release_channel::RELEASE_CHANNEL == ReleaseChannel::Stable
+        {
+            terminal_view::end_unsaved_hosted_sessions(cx);
+        }
         journal::init(app_state.clone(), cx);
         encoding_selector::init(cx);
         language_selector::init(cx);

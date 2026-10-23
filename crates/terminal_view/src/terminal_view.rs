@@ -117,6 +117,22 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
+/// Ends the shells that terminal hosts keep running for sessions no saved
+/// terminal refers to, such as those of tabs closed or discarded by an earlier
+/// Zed.
+pub fn end_unsaved_hosted_sessions(cx: &mut App) {
+    let db = TerminalDb::global(cx);
+    cx.background_spawn(async move {
+        let saved_sessions = db
+            .get_host_sessions()?
+            .into_iter()
+            .collect::<collections::HashSet<_>>();
+        terminal::terminal_host::end_unknown_sessions(&saved_sessions).await;
+        anyhow::Ok(())
+    })
+    .detach_and_log_err(cx);
+}
+
 pub struct BlockProperties {
     pub height: u8,
     pub render: Box<dyn Send + Fn(&mut BlockContext) -> AnyElement>,
