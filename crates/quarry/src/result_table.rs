@@ -64,6 +64,12 @@ pub fn to_table_content(result: &ResultSet, rows: &[usize]) -> TableLikeContent 
 /// `result.edit_target` keep naming the same columns, and the rows already there read NULL in
 /// them. A name that appears twice is matched occurrence by occurrence.
 pub fn append_page(result: &mut ResultSet, page: ResultSet) {
+    // Documents stay only while every row has its own; otherwise they no longer line up.
+    if result.documents.len() == result.rows.len() && page.documents.len() == page.rows.len() {
+        result.documents.extend(page.documents);
+    } else {
+        result.documents.clear();
+    }
     let mut matched = vec![false; result.columns.len()];
     let mut positions = Vec::with_capacity(page.columns.len());
     for column in page.columns {
@@ -101,6 +107,32 @@ pub fn append_page(result: &mut ResultSet, page: ResultSet) {
     result.truncated = page.truncated;
     // Notices describe the object as it is now, such as a Redis key's time to live.
     result.notices = page.notices;
+}
+
+/// Row `row` as indented JSON for the record view: the document it was read as when the driver
+/// kept one, or else an object of its columns. A cell holding a JSON object or array, which is
+/// how nested values are shown, is embedded as JSON rather than as a string of it.
+pub fn row_json(result: &ResultSet, row: usize) -> Option<String> {
+    if let Some(Some(document)) = result.documents.get(row) {
+        return Some(document.to_string());
+    }
+    let cells = result.rows.get(row)?;
+    let object: serde_json::Map<String, serde_json::Value> = result
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            let value = match cells.get(index) {
+                Some(Some(text)) if text.starts_with(['{', '[']) => {
+                    serde_json::from_str(text).unwrap_or_else(|_| text.to_string().into())
+                }
+                Some(Some(text)) => serde_json::Value::String(text.to_string()),
+                _ => serde_json::Value::Null,
+            };
+            (column.to_string(), value)
+        })
+        .collect();
+    serde_json::to_string_pretty(&object).ok()
 }
 
 /// The rows with a cell containing `query`, ignoring case. NULL is matched by the word it is
@@ -354,6 +386,29 @@ mod tests {
         assert_eq!(result.columns, vec![SharedString::from("member")]);
         assert_eq!(result.rows, vec![vec![cell("a")]]);
         assert!(!result.truncated);
+    }
+
+    #[test]
+    fn shows_a_row_as_its_document_or_as_an_object() {
+        let mut result = ResultSet {
+            columns: vec![SharedString::from("name"), SharedString::from("tags")],
+            rows: vec![
+                vec![cell("Ayşe"), cell("[\"a\",\"b\"]")],
+                vec![cell("Can"), None],
+            ],
+            documents: vec![Some(SharedString::from("{\n  \"kept\": 1\n}")), None],
+            ..Default::default()
+        };
+        assert_eq!(row_json(&result, 0).unwrap(), "{\n  \"kept\": 1\n}");
+        let built: serde_json::Value =
+            serde_json::from_str(&row_json(&result, 1).unwrap()).unwrap();
+        assert_eq!(built["name"], "Can");
+        assert_eq!(built["tags"], serde_json::Value::Null);
+        result.documents.clear();
+        let built: serde_json::Value =
+            serde_json::from_str(&row_json(&result, 0).unwrap()).unwrap();
+        assert_eq!(built["tags"][1], "b");
+        assert!(row_json(&result, 5).is_none());
     }
 
     #[test]

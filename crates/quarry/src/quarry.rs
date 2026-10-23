@@ -14,6 +14,7 @@ pub mod query_view;
 pub mod result_table;
 pub mod runtime;
 pub mod statements;
+pub mod templates;
 
 use anyhow::{Context as _, Result, anyhow};
 use driver::{ConnectionConfig, Driver, Engine};

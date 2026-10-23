@@ -4,7 +4,7 @@ use crate::{
     driver::{CatalogEntry, CellEdit, ConnectionConfig, Driver, Engine, Environment, ResultSet},
     result_table,
     runtime::QuarryRuntime,
-    statements,
+    statements, templates,
 };
 use anyhow::{Context as _, Result, anyhow};
 use db::kvp::KeyValueStore;
@@ -121,6 +121,11 @@ pub struct QueryView {
     /// Set while the grid shows a preview from the tree; it is the only result then. Any other
     /// result replacing it clears this.
     preview: Option<PreviewSource>,
+    /// The read-only editor beside the grid showing the selected row as JSON, while open.
+    record: Option<Entity<Editor>>,
+    /// The result row last selected in the grid, which the record view shows.
+    selected_row: Option<usize>,
+    languages: Option<Arc<LanguageRegistry>>,
     running: Option<Task<()>>,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -172,11 +177,15 @@ impl QueryView {
                     this.refresh_table(cx);
                 }
             }),
-            cx.subscribe_in(&table, window, |this, _, event, window, cx| {
-                if let TableViewEvent::CellDoubleClicked(cell) = event
-                    && let Some(row) = this.visible_rows.get(cell.row.0).copied()
-                {
-                    this.start_edit(row, cell.col.0, window, cx);
+            cx.subscribe_in(&table, window, |this, _, event, window, cx| match event {
+                TableViewEvent::CellDoubleClicked(cell) => {
+                    if let Some(row) = this.visible_rows.get(cell.row.0).copied() {
+                        this.start_edit(row, cell.col.0, window, cx);
+                    }
+                }
+                TableViewEvent::SelectionChanged(cell) => {
+                    this.selected_row = this.visible_rows.get(cell.row.0).copied();
+                    this.refresh_record(window, cx);
                 }
             }),
             // Saving the tab's text is what makes it survive a restart; doing it on every edit
@@ -205,6 +214,9 @@ impl QueryView {
             status: Status::Idle,
             pending_edit: None,
             preview: None,
+            record: None,
+            selected_row: None,
+            languages: languages.clone(),
             running: None,
             _tasks: Vec::new(),
             _subscriptions: subscriptions,
@@ -649,6 +661,7 @@ impl QueryView {
         self.results = results;
         self.pending_edit = None;
         self.preview = None;
+        self.selected_row = None;
         self.select_result(0, cx);
     }
 
@@ -671,6 +684,59 @@ impl QueryView {
         self.table
             .update(cx, |table, cx| table.set_contents(contents, cx));
         cx.notify();
+    }
+
+    /// Opens or closes the record view beside the grid.
+    fn toggle_record(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.record.take().is_some() {
+            cx.notify();
+            return;
+        }
+        let record = cx.new(|cx| {
+            let mut editor = Editor::multi_line(window, cx);
+            editor.set_read_only(true);
+            editor.set_placeholder_text("Select a cell to see its row as JSON", window, cx);
+            editor
+        });
+        // The JSON grammar gives the record folding, which is what makes a nested document
+        // readable: each object and array folds away to one line.
+        if let Some(languages) = self.languages.clone() {
+            let language = languages.language_for_name("JSON");
+            let record = record.downgrade();
+            self._tasks.push(cx.spawn(async move |_, cx| {
+                let Ok(language) = language.await else {
+                    return;
+                };
+                record
+                    .update(cx, |editor, cx| {
+                        if let Some(buffer) = editor.buffer().read(cx).as_singleton() {
+                            buffer.update(cx, |buffer, cx| buffer.set_language(Some(language), cx));
+                        }
+                    })
+                    .ok();
+            }));
+        }
+        self.record = Some(record);
+        self.refresh_record(window, cx);
+    }
+
+    fn refresh_record(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(record) = self.record.clone() else {
+            return;
+        };
+        let text = self
+            .selected_row
+            .zip(self.active())
+            .and_then(|(row, result)| result_table::row_json(result, row))
+            .unwrap_or_default();
+        record.update(cx, |editor, cx| editor.set_text(text, window, cx));
+        cx.notify();
+    }
+
+    /// Adds a template at the end of the editor, after whatever is already there, and selects
+    /// nothing so the cursor lands in it.
+    fn insert_template(&mut self, text: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        self.insert_history(text.to_string(), window, cx);
     }
 
     fn active(&self) -> Option<&ResultSet> {
@@ -751,19 +817,26 @@ impl QueryView {
             this.update_in(cx, |this, window, cx| {
                 match updated {
                     Ok(rows) => {
-                        if let Some(cell) = this
-                            .results
-                            .get_mut(result_index)
-                            .and_then(|result| result.rows.get_mut(row))
-                            .and_then(|cells| cells.get_mut(column))
-                        {
-                            *cell = value.map(SharedString::from);
+                        if let Some(result) = this.results.get_mut(result_index) {
+                            if let Some(cell) = result
+                                .rows
+                                .get_mut(row)
+                                .and_then(|cells| cells.get_mut(column))
+                            {
+                                *cell = value.map(SharedString::from);
+                            }
+                            // The document was read before the edit; the record view builds
+                            // the row from its cells from now on.
+                            if let Some(document) = result.documents.get_mut(row) {
+                                *document = None;
+                            }
                         }
                         this.pending_edit = None;
                         this.status = Status::Updated(format!("{rows} row(s) updated").into());
                         if result_index == this.active_result {
                             this.select_result(result_index, cx);
                         }
+                        this.refresh_record(window, cx);
                         this.table.focus_handle(cx).focus(window, cx);
                     }
                     Err(error) => {
@@ -978,7 +1051,15 @@ impl QueryView {
             .when(has_result, |toolbar| {
                 toolbar.child(div().w_48().child(self.search.clone()))
             })
+            .child(self.render_templates_menu(this.clone()))
             .child(self.render_history_menu(this.clone(), cx))
+            .child(
+                IconButton::new("quarry-record", IconName::Json)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(self.record.is_some())
+                    .tooltip(Tooltip::text("Show the Selected Row as JSON"))
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_record(window, cx))),
+            )
             .child(
                 IconButton::new("quarry-copy-csv", IconName::Copy)
                     .icon_size(IconSize::Small)
@@ -1047,6 +1128,30 @@ impl QueryView {
                             },
                         )
                     })
+                }))
+            })
+            .into_any_element()
+    }
+
+    fn render_templates_menu(&self, this: WeakEntity<Self>) -> AnyElement {
+        let engine = self.config.engine;
+        PopoverMenu::new("quarry-templates")
+            .trigger(
+                IconButton::new("quarry-templates-trigger", IconName::TextSnippet)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Insert a Template")),
+            )
+            .menu(move |window, cx| {
+                let this = this.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    for (label, text) in templates::templates(engine) {
+                        let this = this.clone();
+                        menu = menu.entry(*label, None, move |window, cx| {
+                            this.update(cx, |this, cx| this.insert_template(text, window, cx))
+                                .ok();
+                        });
+                    }
+                    menu
                 }))
             })
             .into_any_element()
@@ -1436,7 +1541,21 @@ impl Render for QueryView {
                     .child(self.editor.clone()),
             )
             .children(self.render_result_tabs(cx))
-            .child(div().flex_1().min_h_0().w_full().child(self.table.clone()))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(div().flex_1().min_w_0().h_full().child(self.table.clone()))
+                    .children(self.record.clone().map(|record| {
+                        div()
+                            .w(relative(0.4))
+                            .h_full()
+                            .border_l_1()
+                            .border_color(cx.theme().colors().border)
+                            .child(record)
+                    })),
+            )
             .children(self.render_edit_bar(cx))
             .child(self.render_status(cx))
     }
