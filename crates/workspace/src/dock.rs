@@ -5,6 +5,7 @@ use crate::{DraggedDock, Event, FocusFollowsMouse, ModalLayer, Pane, WorkspaceSe
 use crate::{Workspace, status_bar::StatusItemView};
 use anyhow::Context as _;
 use client::proto;
+use collections::HashMap;
 use db::kvp::KeyValueStore;
 
 use gpui::{
@@ -1268,6 +1269,27 @@ impl Dock {
             .iter_mut()
             .find(|entry| entry.panel.panel_id() == panel.panel_id())
         {
+    pub(crate) fn panel_size_states(
+        &self,
+    ) -> impl Iterator<Item = (&'static str, PanelSizeState)> + '_ {
+        self.panel_entries
+            .iter()
+            .map(|entry| (entry.panel.panel_key(), entry.size_state))
+    }
+
+    pub(crate) fn set_panel_size_states(
+        &mut self,
+        size_states: &HashMap<&'static str, PanelSizeState>,
+        cx: &mut Context<Self>,
+    ) {
+        for entry in &mut self.panel_entries {
+            if let Some(size_state) = size_states.get(entry.panel.panel_key()) {
+                entry.size_state = *size_state;
+            }
+        }
+        cx.notify();
+    }
+
             entry.size_state = size_state;
             cx.notify();
             true

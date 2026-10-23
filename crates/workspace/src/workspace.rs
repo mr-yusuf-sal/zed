@@ -1657,6 +1657,18 @@ pub struct Workspace {
     persisted_recent_navigation_history: Vec<PathBuf>,
     last_active_project_path: Option<ProjectPath>,
     restoring_workspace: bool,
+    /// Panel sizes taken over with the dock layout of the workspace shown in
+    /// the window before this one, applied to panels as they are added ahead
+    /// of this workspace's own saved sizes. `Some` also means this workspace's
+    /// own saved dock layout is not restored.
+    inherited_panel_sizes: Option<HashMap<&'static str, dock::PanelSizeState>>,
+}
+
+/// Which docks are open, what they show and how big their panels are, carried
+/// from one workspace to the next one shown in the same window.
+pub struct DockLayout {
+    docks: DockStructure,
+    panel_sizes: HashMap<&'static str, dock::PanelSizeState>,
 }
 
 impl EventEmitter<Event> for Workspace {}
@@ -2164,6 +2176,7 @@ impl Workspace {
             _dev_container_task: None,
             deferred_save_items: Vec::new(),
             persisted_recent_navigation_history: Vec::new(),
+            inherited_panel_sizes: None,
             last_active_project_path: None,
             restoring_workspace: false,
         }
@@ -2415,6 +2428,9 @@ impl Workspace {
             if is_empty_workspace && !serialized_workspace_has_paths {
                 if let Some(default_docks) = persistence::read_default_dock_state(&kvp) {
                     window
+                                if workspace.inherited_panel_sizes.is_some() {
+                                    return;
+                                }
                         .update(cx, |_, window, cx| {
                             workspace.update(cx, |workspace, cx| {
                                 for (dock, serialized_dock) in [
@@ -2550,6 +2566,34 @@ impl Workspace {
                 zoom: bottom_dock_zoom,
             },
         }
+    pub fn dock_layout(&self, window: &Window, cx: &App) -> DockLayout {
+        let mut panel_sizes = HashMap::default();
+        for dock in [&self.left_dock, &self.bottom_dock, &self.right_dock] {
+            panel_sizes.extend(dock.read(cx).panel_size_states());
+        }
+        DockLayout {
+            docks: self.capture_dock_state(window, cx),
+            panel_sizes,
+        }
+    }
+
+    /// Takes over the dock layout of the workspace shown before this one, so
+    /// switching projects in a window leaves the docks as they were.
+    pub fn adopt_dock_layout(
+        &mut self,
+        layout: DockLayout,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for dock in [&self.left_dock, &self.bottom_dock, &self.right_dock] {
+            dock.update(cx, |dock, cx| {
+                dock.set_panel_size_states(&layout.panel_sizes, cx)
+            });
+        }
+        self.set_dock_structure(layout.docks, window, cx);
+        self.inherited_panel_sizes = Some(layout.panel_sizes);
+    }
+
     }
 
     pub fn set_dock_structure(
@@ -2900,18 +2944,22 @@ impl Workspace {
         let dock_position = panel.position(window, cx);
         let dock = self.dock_at_position(dock_position);
         let any_panel = panel.to_any();
-        let persisted_size_state =
-            self.persisted_panel_size_state(T::panel_key(), cx)
-                .or_else(|| {
-                    load_legacy_panel_size(T::panel_key(), dock_position, self, cx).map(|size| {
-                        let state = dock::PanelSizeState {
-                            size: Some(size),
-                            flex: None,
-                        };
-                        self.persist_panel_size_state(T::panel_key(), state, cx);
-                        state
-                    })
-                });
+        let inherited_size_state = self
+            .inherited_panel_sizes
+            .as_ref()
+            .and_then(|sizes| sizes.get(T::panel_key()).copied());
+        let persisted_size_state = inherited_size_state
+            .or_else(|| self.persisted_panel_size_state(T::panel_key(), cx))
+            .or_else(|| {
+                load_legacy_panel_size(T::panel_key(), dock_position, self, cx).map(|size| {
+                    let state = dock::PanelSizeState {
+                        size: Some(size),
+                        flex: None,
+                    };
+                    self.persist_panel_size_state(T::panel_key(), state, cx);
+                    state
+                })
+            });
 
         dock.update(cx, |dock, cx| {
             let index = dock.add_panel(panel.clone(), self.weak_self.clone(), window, cx);
@@ -8036,16 +8084,19 @@ impl Workspace {
 
                 let docks = serialized_workspace.docks;
 
-                for (dock, serialized_dock) in [
-                    (&mut workspace.right_dock, docks.right),
-                    (&mut workspace.left_dock, docks.left),
-                    (&mut workspace.bottom_dock, docks.bottom),
-                ]
-                .iter_mut()
-                {
-                    dock.update(cx, |dock, cx| {
-                        dock.restore_serialized_state(serialized_dock.clone(), window, cx);
-                    });
+                // A workspace shown in place of another keeps that one's docks.
+                if workspace.inherited_panel_sizes.is_none() {
+                    for (dock, serialized_dock) in [
+                        (&mut workspace.right_dock, docks.right),
+                        (&mut workspace.left_dock, docks.left),
+                        (&mut workspace.bottom_dock, docks.bottom),
+                    ]
+                    .iter_mut()
+                    {
+                        dock.update(cx, |dock, cx| {
+                            dock.restore_serialized_state(serialized_dock.clone(), window, cx);
+                        });
+                    }
                 }
 
                 workspace.restoring_workspace = false;
