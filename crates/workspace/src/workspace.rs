@@ -8958,6 +8958,16 @@ impl Workspace {
             .flex()
             .overflow_hidden()
             .flex_none()
+            // The right dock is only revealed while hovered (see `Dock::can_open`), so it is drawn
+            // over the center instead of pushing it aside.
+            .when(position == DockPosition::Right, |this| {
+                this.absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right_0()
+                    .occlude()
+                    .when(dock_is_open, |this| this.shadow_lg())
+            })
             .child(dock.clone())
             .children(leader_border);
 
