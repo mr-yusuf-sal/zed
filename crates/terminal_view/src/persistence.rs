@@ -629,4 +629,12 @@ impl TerminalDb {
             WHERE item_id = ? AND workspace_id = ?
         }
     }
+
+    query! {
+        pub fn get_host_sessions() -> Result<Vec<String>> {
+            SELECT host_session
+            FROM terminals
+            WHERE host_session IS NOT NULL
+        }
+    }
 }
