@@ -590,6 +590,47 @@ impl QuarryPanel {
             .update(cx, |store, cx| store.add(server.config, cx));
     }
 
+    /// Adds Quarry's MCP server to `context_servers` in the user's settings.json, which is how
+    /// Zed's agent and the external agents Zed starts are told about an MCP server.
+    fn offer_to_agents(&mut self, cx: &mut Context<Self>) {
+        let Some(url) = cx
+            .try_global::<crate::mcp::McpEndpoint>()
+            .map(|endpoint| endpoint.url.clone())
+        else {
+            self.notice = Some((
+                "Quarry's MCP server is not running; another Zed may hold its port (see the log)"
+                    .into(),
+                Color::Error,
+            ));
+            cx.notify();
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let fs = workspace.read(cx).app_state().fs.clone();
+        settings::update_settings_file(fs, cx, move |settings, _| {
+            settings.project.context_servers.insert(
+                "quarry".into(),
+                settings::ContextServerSettingsContent::Http {
+                    enabled: true,
+                    url,
+                    headers: Default::default(),
+                    timeout: None,
+                    oauth: None,
+                },
+            );
+        });
+        self.notice = Some((
+            "AI agents now see Quarry as the \"quarry\" MCP server: list_connections, \
+             list_objects, describe_object and read-only run_query. Start a new agent thread \
+             to pick it up."
+                .into(),
+            Color::Success,
+        ));
+        cx.notify();
+    }
+
     /// Adds a copy of the connection, for pointing the same server at another database or
     /// user. The copy shares the saved password, which is filed by engine, host and port.
     fn duplicate(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -2101,6 +2142,21 @@ impl Render for QuarryPanel {
                     .child(
                         h_flex()
                             .gap_0p5()
+                            .child(
+                                IconButton::new("quarry-agents", IconName::ToolHammer)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(|_, cx| {
+                                        Tooltip::with_meta(
+                                            "Offer Quarry to AI Agents",
+                                            None,
+                                            "Adds Quarry's read-only MCP server to settings.json",
+                                            cx,
+                                        )
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.offer_to_agents(cx);
+                                    })),
+                            )
                             .child(
                                 IconButton::new("quarry-docker", IconName::Box)
                                     .icon_size(IconSize::Small)
