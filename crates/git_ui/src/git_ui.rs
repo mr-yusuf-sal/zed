@@ -761,6 +761,129 @@ pub(crate) fn create_branch_at_commit(
     });
 }
 
+pub(crate) fn rename_branch_modal(
+    branch: String,
+    repo: Entity<Repository>,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    workspace.toggle_modal(window, cx, |window, cx| {
+        RenameBranchModal::new(branch, repo, window, cx)
+    });
+}
+
+pub(crate) type CommitMessageConfirm = Box<dyn FnOnce(String, &mut Window, &mut App)>;
+
+/// Asks for a commit message and hands the edited text to `on_confirm`. Used
+/// where rewriting the message is the point of the operation, like squashing
+/// or rewording from the git graph, so it gets a multi-line editor.
+pub(crate) struct CommitMessageModal {
+    title: SharedString,
+    confirm_label: SharedString,
+    editor: Entity<Editor>,
+    on_confirm: Option<CommitMessageConfirm>,
+}
+
+impl CommitMessageModal {
+    pub(crate) fn new(
+        title: impl Into<SharedString>,
+        confirm_label: impl Into<SharedString>,
+        message: String,
+        on_confirm: CommitMessageConfirm,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::auto_height(6, 16, window, cx);
+            editor.set_text(message, window, cx);
+            editor
+        });
+        Self {
+            title: title.into(),
+            confirm_label: confirm_label.into(),
+            editor,
+            on_confirm: Some(on_confirm),
+        }
+    }
+
+    fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let message = self.editor.read(cx).text(cx).trim().to_string();
+        if message.is_empty() {
+            return;
+        }
+        if let Some(on_confirm) = self.on_confirm.take() {
+            on_confirm(message, window, cx);
+        }
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for CommitMessageModal {}
+impl ModalView for CommitMessageModal {}
+impl Focusable for CommitMessageModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Render for CommitMessageModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let focus_handle = self.editor.focus_handle(cx);
+        v_flex()
+            .key_context("GitCommitMessageModal")
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .elevation_2(cx)
+            .w(rems(40.))
+            .child(
+                h_flex()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .w_full()
+                    .gap_1p5()
+                    .child(Icon::new(IconName::GitCommit).size(IconSize::XSmall))
+                    .child(Headline::new(self.title.clone()).size(HeadlineSize::XSmall)),
+            )
+            .child(
+                div()
+                    .mx_3()
+                    .p_1()
+                    .border_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .rounded_sm()
+                    .child(self.editor.clone()),
+            )
+            .child(
+                h_flex()
+                    .p_3()
+                    .w_full()
+                    .gap_1()
+                    .justify_end()
+                    .child(
+                        Button::new("commit-message-cancel", "Cancel")
+                            .key_binding(ui::KeyBinding::for_action_in(&Cancel, &focus_handle, cx))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.cancel(&Cancel, window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("commit-message-confirm", self.confirm_label.clone())
+                            .style(ButtonStyle::Filled)
+                            .key_binding(ui::KeyBinding::for_action_in(&Confirm, &focus_handle, cx))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm(&Confirm, window, cx);
+                            })),
+                    ),
+            )
+    }
+}
+
 fn copy_branch_name(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
     let Some(panel) = workspace.panel::<GitPanel>(cx) else {
         return;

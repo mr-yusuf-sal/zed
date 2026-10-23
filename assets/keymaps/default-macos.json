@@ -1823,4 +1823,11 @@
       "cmd-alt-c": "quarry::CancelQuery",
     },
   },
+  {
+    "context": "GitCommitMessageModal > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-enter": "menu::Confirm",
+    },
+  },
 ]

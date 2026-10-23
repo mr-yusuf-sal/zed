@@ -1,13 +1,16 @@
 pub use crate::commit_context_menu::{CopyCommitSha, CopyCommitTag, OpenCommitView};
 use crate::{
+    CommitMessageConfirm, CommitMessageModal,
     commit_context_menu::{
         CUSTOM_GIT_COMMANDS_DOCS_SLUG, CommitContextMenuData, CommitContextMenuSource,
         CommitMenuEntries, commit_context_menu, git_context_menu_tasks, git_task_context,
     },
     commit_tooltip::CommitAvatar,
     commit_view::CommitView,
-    create_branch_at_commit, git_status_icon,
+    create_branch_at_commit, git_status_icon, rename_branch_modal,
 };
+use anyhow::Context as _;
+use askpass::AskPassDelegate;
 use collections::{BTreeMap, BTreeSet, HashMap, IndexSet};
 use db::kvp::KeyValueStore;
 use editor::Editor;
@@ -15,7 +18,10 @@ use file_icons::FileIcons;
 use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
     parse_git_remote_url,
-    repository::{InitialGraphCommitData, LogOrder, LogSource, RepoPath, SearchCommitArgs},
+    repository::{
+        CommitOptions, FetchOptions, InitialGraphCommitData, LogOrder, LogSource, RepoPath,
+        ResetMode, SearchCommitArgs,
+    },
     status::{FileStatus, StatusCode, TrackedStatus},
 };
 use gpui::{
@@ -31,7 +37,7 @@ use markdown::{Markdown, MarkdownElement};
 use menu::{Cancel, SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use picker::{Picker, PickerDelegate};
 use project::{
-    ProjectPath, TaskSourceKind,
+    Fs, ProjectPath, TaskSourceKind,
     git_store::{
         CommitDataState, CommitDiff, CommitFile, GitGraphEvent, GitStore, GitStoreEvent,
         GraphDataResponse, Repository, RepositoryEvent, RepositoryId,
@@ -41,6 +47,7 @@ use smallvec::{SmallVec, smallvec};
 use std::{
     cell::Cell,
     ops::Range,
+    path::Path,
     rc::Rc,
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
@@ -56,17 +63,26 @@ use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};
 use ui::{
     Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, ContextMenuEntry, DiffStat,
     Disclosure, Divider, HeaderResizeInfo, HighlightedLabel, IndentGuideColors, ListItem,
-    ListItemSpacing, RedistributableColumnsState, ScrollableHandle, Table, TableInteractionState,
-    TableRenderContext, TableResizeBehavior, Tooltip, WithScrollbar, bind_redistributable_columns,
-    prelude::*, redistribute_hidden_fractions, redistribute_hidden_widths,
-    render_redistributable_columns_resize_handles, render_table_header, table_row::TableRow,
+    ListItemSpacing, PopoverMenu, RedistributableColumnsState, ScrollableHandle, Table,
+    TableInteractionState, TableRenderContext, TableResizeBehavior, Tooltip, WithScrollbar,
+    bind_redistributable_columns, prelude::*, redistribute_hidden_fractions,
+    redistribute_hidden_widths, render_redistributable_columns_resize_handles, render_table_header,
+    table_row::TableRow,
 };
 use util::{ResultExt, debug_panic};
 use workspace::{
     ItemNavHistory, ModalView, Workspace,
     item::{Item, ItemEvent, TabTooltipContent},
+    notifications::DetachAndPromptErr,
 };
 
+const SQUASH_COMMIT_FAILED: &str = "The branch was reset, but committing the squashed changes failed. The changes are staged, and `git reset --soft ORIG_HEAD` puts the branch back.";
+const LOCAL_TAG_DELETE_DETAIL: &str =
+    "The tag is deleted in this repository only. A copy pushed to a remote stays there.";
+const REMOTE_DELETE_DETAIL: &str =
+    "This deletes it on the remote for everyone who fetches from it.";
+const FORCE_DELETE_BRANCH_DETAIL: &str = "Commits only reachable from this branch will no longer be on any branch. They can still be found through the reflog for a while.";
+const ABORT_OPERATION_DETAIL: &str = "The repository goes back to where it was before it started, and conflict resolutions made so far are lost.";
 const HARD_RESET_WARNING: &str =
     "Uncommitted changes will be lost, and commits after this one will no longer be on the branch.";
 const COMMIT_CIRCLE_RADIUS: Pixels = px(4.5);
@@ -87,6 +103,8 @@ const COLUMN_WIDTHS_PATH_HISTORY_KEY: &str = "git_graph_path_history_column_widt
 const HIDDEN_COLUMNS_KEY: &str = "git_graph_hidden_columns";
 const HIDDEN_COLUMNS_PATH_HISTORY_KEY: &str = "git_graph_path_history_hidden_columns";
 const DETAIL_PANEL_POSITION_KEY: &str = "git_graph_detail_panel_position";
+const AUTO_FETCH_KEY: &str = "git_graph_auto_fetch";
+const AUTO_FETCH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const DETAIL_PANEL_RATIOS_KEY: &str = "git_graph_detail_panel_ratios";
 const ROW_VERTICAL_PADDING: Pixels = px(4.0);
 
@@ -1518,6 +1536,84 @@ impl RefMenuEntry {
     }
 }
 
+/// A merge, rebase, cherry-pick or revert that stopped and waits for the user.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OperationInProgress {
+    Merge,
+    Rebase,
+    CherryPick,
+    Revert,
+}
+
+impl OperationInProgress {
+    async fn detect(fs: &dyn Fs, git_dir: &Path) -> Option<Self> {
+        // A rebase that stops on a conflict can leave other state files around
+        // too, so it is checked first.
+        if fs.is_dir(&git_dir.join("rebase-merge")).await
+            || fs.is_dir(&git_dir.join("rebase-apply")).await
+        {
+            return Some(Self::Rebase);
+        }
+        for (file_name, operation) in [
+            ("MERGE_HEAD", Self::Merge),
+            ("CHERRY_PICK_HEAD", Self::CherryPick),
+            ("REVERT_HEAD", Self::Revert),
+        ] {
+            if fs.is_file(&git_dir.join(file_name)).await {
+                return Some(operation);
+            }
+        }
+        None
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Merge => "Merge",
+            Self::Rebase => "Rebase",
+            Self::CherryPick => "Cherry-pick",
+            Self::Revert => "Revert",
+        }
+    }
+
+    fn command(self) -> &'static str {
+        match self {
+            Self::Merge => "merge",
+            Self::Rebase => "rebase",
+            Self::CherryPick => "cherry-pick",
+            Self::Revert => "revert",
+        }
+    }
+
+    fn can_skip(self) -> bool {
+        self != Self::Merge
+    }
+}
+
+/// A branch chip being dragged onto another commit.
+#[derive(Clone)]
+struct DraggedRef {
+    name: SharedString,
+}
+
+impl Render for DraggedRef {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        Chip::new(self.name.clone())
+            .label_size(LabelSize::Small)
+            .icon(IconName::GitBranch)
+    }
+}
+
+enum RefKind {
+    Tag(String),
+    LocalBranch {
+        name: String,
+        upstream: Option<String>,
+    },
+    RemoteBranch {
+        remote: String,
+        name: String,
+    },
+}
 /// A cheap copy of the selection for render closures that outlive `&self`.
 #[derive(Clone)]
 struct SelectedRows {
@@ -1574,6 +1670,10 @@ pub struct GitGraph {
     repo_id: RepositoryId,
     changed_files_scroll_handle: UniformListScrollHandle,
     selected_commits_scroll_handle: UniformListScrollHandle,
+    operation_in_progress: Option<OperationInProgress>,
+    auto_fetch_enabled: bool,
+    _auto_fetch_task: Option<Task<()>>,
+    _operation_in_progress_task: Option<Task<()>>,
     changed_files_view_mode: ChangedFilesViewMode,
     commit_details_position: DetailPanelPosition,
     /// Split ratio per panel position, so the width chosen on the right and the height
@@ -1753,7 +1853,7 @@ impl GitGraph {
 
         let search_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Search commits…", window, cx);
+            editor.set_placeholder_text("Search commits… (author:, since:, until:)", window, cx);
             editor
         });
 
@@ -1842,6 +1942,10 @@ impl GitGraph {
             repo_id,
             changed_files_scroll_handle: UniformListScrollHandle::new(),
             selected_commits_scroll_handle: UniformListScrollHandle::new(),
+            operation_in_progress: None,
+            auto_fetch_enabled: Self::restore_auto_fetch(cx),
+            _auto_fetch_task: None,
+            _operation_in_progress_task: None,
             changed_files_view_mode: ChangedFilesViewMode::default(),
             commit_details_position: Self::restore_detail_panel_position(cx),
             commit_details_split_ratios: Self::restore_split_ratios(cx),
@@ -1854,6 +1958,10 @@ impl GitGraph {
 
         this.apply_saved_split_ratio(cx);
         this.fetch_initial_graph_data(cx);
+        this.refresh_operation_in_progress(cx);
+        if this.auto_fetch_enabled {
+            this.start_auto_fetch(cx);
+        }
         this
     }
 
@@ -2068,6 +2176,11 @@ impl GitGraph {
         event: &RepositoryEvent,
         cx: &mut Context<Self>,
     ) {
+        // Starting, stopping and finishing a merge or rebase all show up as
+        // status, head or branch changes; graph loading progress never does.
+        if !matches!(event, RepositoryEvent::GraphEvent(..)) {
+            self.refresh_operation_in_progress(cx);
+        }
         match event {
             RepositoryEvent::GraphEvent((source, order), event)
                 if source == &self.log_source && order == &self.log_order =>
@@ -2210,11 +2323,19 @@ impl GitGraph {
     ) -> AnyElement {
         let tooltip_text = name.clone();
         let chip_id = SharedString::from(format!("git-graph-ref-chip-{commit_idx}-{name}"));
+        let is_branch =
+            !name.starts_with("tag: ") && Self::ref_name_from_decoration(&name).is_some();
 
         div()
             .id(chip_id)
             .min_w_0()
             .overflow_hidden()
+            .when(is_branch, |chip| {
+                chip.on_drag(
+                    DraggedRef { name: name.clone() },
+                    |dragged, _offset, _window, cx| cx.new(|_| dragged.clone()),
+                )
+            })
             .child(
                 Chip::new(name.clone())
                     .label_size(LabelSize::Small)
@@ -3127,9 +3248,14 @@ impl GitGraph {
         let ref_entry = self.ref_menu_entry(commit.data.sha, &name, cx);
         let git_operations =
             self.git_operation_menu_entries(index, Self::ref_name_from_decoration(&name), cx);
+        let ref_management = self.ref_management_menu_entries(&name, cx);
         let git_graph = cx.entity();
         let context_menu = ContextMenu::build(window, cx, move |menu, window, _| {
             menu.header(format!("Ref {name}"))
+                .map(|menu| match ref_management {
+                    Some(add_entries) => add_entries(menu, window).separator(),
+                    None => menu,
+                })
                 .map(|menu| match git_operations {
                     Some(add_entries) => add_entries(menu, window).separator(),
                     None => menu,
@@ -3471,9 +3597,172 @@ impl GitGraph {
                             ),
                     ),
             )
+            .children(self.render_branch_filter(cx))
             .child(self.render_remote_buttons(cx))
     }
 
+    fn set_log_source(&mut self, log_source: LogSource, cx: &mut Context<Self>) {
+        if self.log_source == log_source {
+            return;
+        }
+        self.log_source = log_source;
+        self.pending_select_sha = None;
+        // The selection is kept as row indices, which mean other commits once
+        // the graph is reloaded for a different source.
+        self.clear_selection(cx);
+        self.invalidate_state(cx);
+        self.fetch_initial_graph_data(cx);
+    }
+
+    /// A dropdown that narrows the graph to one branch's history. File history
+    /// keeps its own source, so it gets no dropdown.
+    fn render_branch_filter(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if matches!(self.log_source, LogSource::Path(_)) {
+            return None;
+        }
+        let repository = self.get_repository(cx)?;
+        let snapshot = repository.read(cx).snapshot();
+        let mut branch_names = snapshot
+            .branch_list
+            .iter()
+            .filter(|branch| !branch.is_remote())
+            .map(|branch| SharedString::from(branch.name().to_string()))
+            .collect::<Vec<_>>();
+        branch_names.sort();
+        let current_branch = snapshot
+            .branch
+            .as_ref()
+            .map(|branch| SharedString::from(branch.name().to_string()));
+        let selected_branch = match &self.log_source {
+            LogSource::Branch(branch) => Some(branch.clone()),
+            _ => None,
+        };
+        let label: SharedString = match &self.log_source {
+            LogSource::All => "All Branches".into(),
+            LogSource::Branch(branch) => branch.clone(),
+            LogSource::Sha(sha) => sha.display_short().into(),
+            LogSource::Path(_) => return None,
+        };
+        let git_graph = cx.weak_entity();
+
+        Some(
+            PopoverMenu::new("git-graph-branch-filter")
+                .trigger_with_tooltip(
+                    Button::new("git-graph-branch-filter-button", label)
+                        .start_icon(
+                            Icon::new(IconName::GitBranch)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .end_icon(
+                            Icon::new(IconName::ChevronDown)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .label_size(LabelSize::Small),
+                    Tooltip::text("Show the history of one branch"),
+                )
+                .anchor(Anchor::TopRight)
+                .menu(move |window, cx| {
+                    let git_graph = git_graph.clone();
+                    let branch_names = branch_names.clone();
+                    let current_branch = current_branch.clone();
+                    let selected_branch = selected_branch.clone();
+                    Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                        let select = |log_source: LogSource| {
+                            let git_graph = git_graph.clone();
+                            move |_: &mut Window, cx: &mut App| {
+                                git_graph
+                                    .update(cx, |this, cx| {
+                                        this.set_log_source(log_source.clone(), cx);
+                                    })
+                                    .log_err();
+                            }
+                        };
+                        menu = menu.toggleable_entry(
+                            "All Branches",
+                            selected_branch.is_none(),
+                            IconPosition::Start,
+                            None,
+                            select(LogSource::All),
+                        );
+                        if !branch_names.is_empty() {
+                            menu = menu.separator();
+                        }
+                        for branch in &branch_names {
+                            let label = if current_branch.as_ref() == Some(branch) {
+                                format!("{branch} (current)")
+                            } else {
+                                branch.to_string()
+                            };
+                            menu = menu.toggleable_entry(
+                                label,
+                                selected_branch.as_ref() == Some(branch),
+                                IconPosition::Start,
+                                None,
+                                select(LogSource::Branch(branch.clone())),
+                            );
+                        }
+                        menu
+                    }))
+                })
+                .into_any_element(),
+        )
+    }
+
+    fn restore_auto_fetch(cx: &App) -> bool {
+        KeyValueStore::global(cx)
+            .read_kvp(AUTO_FETCH_KEY)
+            .log_err()
+            .flatten()
+            .is_some_and(|value| value == "true")
+    }
+
+    fn toggle_auto_fetch(&mut self, cx: &mut Context<Self>) {
+        self.auto_fetch_enabled = !self.auto_fetch_enabled;
+        if self.auto_fetch_enabled {
+            self.start_auto_fetch(cx);
+        } else {
+            self._auto_fetch_task = None;
+        }
+
+        let value = self.auto_fetch_enabled.to_string();
+        let kvp = KeyValueStore::global(cx);
+        cx.background_spawn(async move {
+            kvp.write_kvp(AUTO_FETCH_KEY.to_string(), value)
+                .await
+                .log_err()
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Fetches all remotes every few minutes while the graph is open. It calls
+    /// the repository directly instead of dispatching `git::Fetch`, so it works
+    /// for whichever repository the graph shows and stays quiet: no toasts, and
+    /// a remote that asks for a password just fails until the next round.
+    fn start_auto_fetch(&mut self, cx: &mut Context<Self>) {
+        self._auto_fetch_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(AUTO_FETCH_INTERVAL).await;
+                let Ok(fetch) = this.update(cx, |this, cx| {
+                    let repository = this.get_repository(cx)?;
+                    Some(repository.update(cx, |repository, cx| {
+                        let askpass = AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {});
+                        repository.fetch(FetchOptions::All, askpass, cx)
+                    }))
+                }) else {
+                    break;
+                };
+                if let Some(fetch) = fetch {
+                    match fetch.await {
+                        Ok(Ok(_)) | Err(_) => {}
+                        Ok(Err(error)) => log::debug!("git graph auto-fetch failed: {error:#}"),
+                    }
+                }
+            }
+        }));
+    }
     /// Fetch, pull and push buttons. They dispatch the workspace's git actions so
     /// they share the git panel's remote picker, progress state and output
     /// toasts, which is also why they act on the active repository and are
@@ -3519,6 +3808,19 @@ impl GitGraph {
         h_flex()
             .flex_shrink_0()
             .gap_0p5()
+            .child(
+                IconButton::new("git-graph-auto-fetch", IconName::Clock)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(self.auto_fetch_enabled)
+                    .tooltip(Tooltip::text(if self.auto_fetch_enabled {
+                        "Auto-fetch is on: all remotes are fetched every 5 minutes"
+                    } else {
+                        "Fetch all remotes every 5 minutes while the graph is open"
+                    }))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_auto_fetch(cx);
+                    })),
+            )
             .child(remote_button(
                 "git-graph-fetch",
                 "Fetch".to_string(),
@@ -3572,6 +3874,113 @@ impl GitGraph {
             ))
     }
 
+    /// Looks for the files git leaves in the repository's git directory while a
+    /// merge, rebase, cherry-pick or revert waits for the user, since the
+    /// repository snapshot only exposes the merge message and conflicts.
+    fn refresh_operation_in_progress(&mut self, cx: &mut Context<Self>) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let fs = workspace.read(cx).project().read(cx).fs().clone();
+        let git_dir = repository.read(cx).repository_dir_abs_path.clone();
+        self._operation_in_progress_task = Some(cx.spawn(async move |this, cx| {
+            let operation = OperationInProgress::detect(fs.as_ref(), &git_dir).await;
+            this.update(cx, |this, cx| {
+                if this.operation_in_progress != operation {
+                    this.operation_in_progress = operation;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn render_operation_in_progress_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let operation = self.operation_in_progress?;
+        let colors = cx.theme().status();
+        let command = operation.command();
+
+        Some(
+            h_flex()
+                .w_full()
+                .px_2()
+                .py_1()
+                .gap_2()
+                .bg(colors.warning_background)
+                .border_b_1()
+                .border_color(colors.warning_border)
+                .child(
+                    Icon::new(IconName::Warning)
+                        .size(IconSize::Small)
+                        .color(Color::Warning),
+                )
+                .child(
+                    div().flex_1().min_w_0().child(
+                        Label::new(format!(
+                            "{} in progress. Resolve any conflicts and stage the files, then continue.",
+                            operation.label()
+                        ))
+                        .size(LabelSize::Small)
+                        .truncate(),
+                    ),
+                )
+                .child(
+                    Button::new("operation-continue", "Continue")
+                        .label_size(LabelSize::Small)
+                        .style(ButtonStyle::Filled)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            // Continuing a merge, rebase or cherry-pick opens an
+                            // editor for the commit message; `core.editor=true`
+                            // accepts git's message so the task doesn't wait on an
+                            // editor inside the terminal.
+                            this.run_git_in_terminal(
+                                vec![
+                                    "-c".to_string(),
+                                    "core.editor=true".to_string(),
+                                    command.to_string(),
+                                    "--continue".to_string(),
+                                ],
+                                window,
+                                cx,
+                            );
+                        })),
+                )
+                .when(operation.can_skip(), |this| {
+                    this.child(
+                        Button::new("operation-skip", "Skip")
+                            .label_size(LabelSize::Small)
+                            .style(ButtonStyle::Subtle)
+                            .tooltip(Tooltip::text("Drop the commit that stopped and go on"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.run_git_in_terminal(
+                                    vec![command.to_string(), "--skip".to_string()],
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    )
+                })
+                .child(
+                    Button::new("operation-abort", "Abort")
+                        .label_size(LabelSize::Small)
+                        .style(ButtonStyle::Subtle)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.confirm_and_run_git_in_terminal(
+                                format!("Abort the {}?", operation.label().to_lowercase()),
+                                ABORT_OPERATION_DETAIL,
+                                "Abort",
+                                vec![command.to_string(), "--abort".to_string()],
+                                window,
+                                cx,
+                            );
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
     fn render_detail_panel_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .flex_shrink_0()
@@ -3699,6 +4108,24 @@ impl GitGraph {
                         this.compare_selected_commits(window, cx);
                     })),
             )
+            .child({
+                let squash_blocker = self.squash_base(cx).err();
+                Button::new("squash-selection", "Squash")
+                    .start_icon(
+                        Icon::new(IconName::GitCommit)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .style(ButtonStyle::OutlinedGhost)
+                    .label_size(LabelSize::Small)
+                    .disabled(squash_blocker.is_some())
+                    .tooltip(Tooltip::text(
+                        squash_blocker.unwrap_or("Combine these commits into one"),
+                    ))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.squash_selection(window, cx);
+                    }))
+            })
             .child(
                 Button::new("cherry-pick-selection", "Cherry-pick")
                     .start_icon(
@@ -3849,6 +4276,236 @@ impl GitGraph {
         self.run_git_in_terminal(args, window, cx);
     }
 
+    fn has_staged_changes(repository: &Repository) -> bool {
+        repository
+            .cached_status()
+            .any(|entry| entry.status.staging().has_staged())
+    }
+
+    fn head_sha(repository: &Repository) -> Option<SharedString> {
+        repository
+            .head_commit
+            .as_ref()
+            .map(|commit| commit.sha.clone())
+    }
+
+    /// The commit the branch is soft-reset to when squashing the selection, or
+    /// why the selection can't be squashed. Squashing is a soft reset and a new
+    /// commit rather than an interactive rebase, which only works for a
+    /// straight run of commits ending at HEAD.
+    fn squash_base(&self, cx: &App) -> Result<Oid, &'static str> {
+        let commits = self
+            .selected_indices()
+            .into_iter()
+            .filter_map(|idx| self.graph_data.commits.get(idx))
+            .map(|commit| commit.data.clone())
+            .collect::<Vec<_>>();
+        let (Some(newest), Some(oldest)) = (commits.first(), commits.last()) else {
+            return Err("Select the commits to squash");
+        };
+        if commits.len() < 2 {
+            return Err("Select at least two commits to squash");
+        }
+        let repository = self.get_repository(cx).ok_or("No repository")?;
+        let repository = repository.read(cx);
+        if Self::head_sha(repository).as_deref() != Some(newest.sha.to_string().as_str()) {
+            return Err("The newest selected commit must be the checked-out commit (HEAD)");
+        }
+        if commits
+            .windows(2)
+            .any(|pair| pair[0].parents.as_slice() != [pair[1].sha])
+        {
+            return Err(
+                "The selected commits must be one straight line of history, without gaps or merges",
+            );
+        }
+        if Self::has_staged_changes(repository) {
+            return Err(
+                "Unstage your changes first, or they would be folded into the squashed commit",
+            );
+        }
+        match oldest.parents.as_slice() {
+            [parent] => Ok(*parent),
+            [] => Err("The first commit of the repository can't be squashed this way"),
+            _ => Err("The oldest selected commit is a merge"),
+        }
+    }
+
+    /// Why the selected commit can't be reworded, if it can't. Rewording is an
+    /// amend, so it's limited to HEAD.
+    fn reword_blocker(&self, index: usize, cx: &App) -> Option<&'static str> {
+        let commit = self.graph_data.commits.get(index)?;
+        let repository = self.get_repository(cx)?;
+        let repository = repository.read(cx);
+        if Self::head_sha(repository).as_deref() != Some(commit.data.sha.to_string().as_str()) {
+            return Some("Only the checked-out commit (HEAD) can be reworded");
+        }
+        if Self::has_staged_changes(repository) {
+            return Some("Unstage your changes first, or they would be added to the commit");
+        }
+        None
+    }
+
+    fn load_commit_messages(
+        &self,
+        shas: Vec<Oid>,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<Vec<String>>> {
+        let Some(repository) = self.get_repository(cx) else {
+            return Task::ready(Err(anyhow::anyhow!("No repository")));
+        };
+        let receivers = repository.update(cx, |repository, _| {
+            shas.iter()
+                .map(|sha| repository.show(sha.to_string()))
+                .collect::<Vec<_>>()
+        });
+        cx.background_spawn(async move {
+            let mut messages = Vec::with_capacity(receivers.len());
+            for receiver in receivers {
+                messages.push(receiver.await??.message.trim().to_string());
+            }
+            Ok(messages)
+        })
+    }
+
+    fn open_commit_message_modal(
+        &self,
+        title: String,
+        confirm_label: &'static str,
+        message: String,
+        on_confirm: CommitMessageConfirm,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    CommitMessageModal::new(title, confirm_label, message, on_confirm, window, cx)
+                });
+            })
+            .log_err();
+    }
+
+    fn squash_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Ok(base) = self.squash_base(cx) else {
+            return;
+        };
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let mut shas = self.selected_commit_shas();
+        shas.reverse();
+        let commit_count = shas.len();
+        let messages = self.load_commit_messages(shas, cx);
+
+        cx.spawn_in(window, async move |this, cx| {
+            let message = messages.await?.join("\n\n");
+            this.update_in(cx, |this, window, cx| {
+                let on_confirm: CommitMessageConfirm = Box::new(move |message, window, cx| {
+                    let task = cx.spawn(async move |cx| {
+                        repository
+                            .update(cx, |repository, cx| {
+                                repository.reset(base.to_string(), ResetMode::Soft, cx)
+                            })
+                            .await??;
+                        let askpass = AskPassDelegate::new(cx, |_, _, _| {});
+                        repository
+                            .update(cx, |repository, cx| {
+                                repository.commit(
+                                    message.into(),
+                                    None,
+                                    CommitOptions::default(),
+                                    askpass,
+                                    cx,
+                                )
+                            })
+                            .await?
+                            .context(SQUASH_COMMIT_FAILED)
+                    });
+                    task.detach_and_prompt_err(
+                        "Failed to squash commits",
+                        window,
+                        cx,
+                        |error, _, _| Some(format!("{error:#}")),
+                    );
+                });
+                this.open_commit_message_modal(
+                    format!("Squash {commit_count} Commits"),
+                    "Squash",
+                    message,
+                    on_confirm,
+                    window,
+                    cx,
+                );
+            })
+        })
+        .detach_and_prompt_err(
+            "Failed to load the commit messages",
+            window,
+            cx,
+            |error, _, _| Some(format!("{error:#}")),
+        );
+    }
+
+    fn reword_commit(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.reword_blocker(index, cx).is_some() {
+            return;
+        }
+        let Some(commit) = self.graph_data.commits.get(index) else {
+            return;
+        };
+        let sha = commit.data.sha;
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let messages = self.load_commit_messages(vec![sha], cx);
+
+        cx.spawn_in(window, async move |this, cx| {
+            let message = messages.await?.join("\n\n");
+            this.update_in(cx, |this, window, cx| {
+                let on_confirm: CommitMessageConfirm = Box::new(move |message, window, cx| {
+                    let task = cx.spawn(async move |cx| {
+                        let askpass = AskPassDelegate::new(cx, |_, _, _| {});
+                        repository
+                            .update(cx, |repository, cx| {
+                                repository.commit(
+                                    message.into(),
+                                    None,
+                                    CommitOptions {
+                                        amend: true,
+                                        ..CommitOptions::default()
+                                    },
+                                    askpass,
+                                    cx,
+                                )
+                            })
+                            .await?
+                    });
+                    task.detach_and_prompt_err(
+                        "Failed to reword commit",
+                        window,
+                        cx,
+                        |error, _, _| Some(format!("{error:#}")),
+                    );
+                });
+                this.open_commit_message_modal(
+                    "Reword Commit".to_string(),
+                    "Reword",
+                    message,
+                    on_confirm,
+                    window,
+                    cx,
+                );
+            })
+        })
+        .detach_and_prompt_err(
+            "Failed to load the commit message",
+            window,
+            cx,
+            |error, _, _| Some(format!("{error:#}")),
+        );
+    }
+
     /// Runs a git command that changes the repository in a terminal task rather
     /// than through a `Repository` job: merges, rebases, cherry-picks and
     /// reverts can stop on conflicts, and the terminal keeps git's own output
@@ -3924,6 +4581,7 @@ impl GitGraph {
     ) -> Option<CommitMenuEntries> {
         let commit = self.graph_data.commits.get(index)?;
         let repository = self.get_repository(cx)?;
+        let can_reword = self.reword_blocker(index, cx).is_none();
         let snapshot = repository.read(cx).snapshot();
         let sha = commit.data.sha;
         let sha_string = sha.to_string();
@@ -4052,11 +4710,23 @@ impl GitGraph {
                             run(vec!["revert", "--no-edit", &sha_string]),
                         );
                 } else {
-                    menu = menu.separator().entry(
-                        "Revert Commit",
-                        None,
-                        run(vec!["revert", "--no-edit", &sha_string]),
-                    );
+                    menu = menu
+                        .separator()
+                        .item(
+                            ContextMenuEntry::new("Reword Commit…")
+                                .disabled(!can_reword)
+                                .handler(window.handler_for(
+                                    &git_graph,
+                                    move |this, window, cx| {
+                                        this.reword_commit(index, window, cx);
+                                    },
+                                )),
+                        )
+                        .entry(
+                            "Revert Commit",
+                            None,
+                            run(vec!["revert", "--no-edit", &sha_string]),
+                        );
                 }
 
                 if let Some(current_branch) = current_branch.clone() {
@@ -4108,6 +4778,312 @@ impl GitGraph {
         ))
     }
 
+    /// Branch and tag management for the ref chip `decoration`: rename, delete,
+    /// push and set the upstream of a branch, and push or delete a tag. Remote
+    /// branches can only be deleted on their remote.
+    fn ref_management_menu_entries(
+        &self,
+        decoration: &str,
+        cx: &Context<Self>,
+    ) -> Option<CommitMenuEntries> {
+        let repository = self.get_repository(cx)?;
+        let snapshot = repository.read(cx).snapshot();
+        let current_branch = snapshot
+            .branch
+            .as_ref()
+            .map(|branch| branch.name().to_string());
+        let remotes: Vec<String> = snapshot
+            .branch_list
+            .iter()
+            .filter_map(|branch| branch.remote_name())
+            .map(str::to_string)
+            .collect::<IndexSet<_>>()
+            .into_iter()
+            .collect();
+
+        let kind = if let Some(tag) = decoration.strip_prefix("tag: ") {
+            RefKind::Tag(tag.to_string())
+        } else {
+            let name = Self::ref_name_from_decoration(decoration)?;
+            match snapshot
+                .branch_list
+                .iter()
+                .find(|branch| branch.name() == name.as_ref())
+            {
+                Some(branch) if branch.is_remote() => {
+                    let remote = branch.remote_name()?;
+                    RefKind::RemoteBranch {
+                        remote: remote.to_string(),
+                        name: name.strip_prefix(remote)?.strip_prefix('/')?.to_string(),
+                    }
+                }
+                Some(branch) => RefKind::LocalBranch {
+                    name: name.to_string(),
+                    upstream: branch
+                        .upstream
+                        .as_ref()
+                        .map(|upstream| upstream.ref_name.to_string()),
+                },
+                None => RefKind::LocalBranch {
+                    name: name.to_string(),
+                    upstream: None,
+                },
+            }
+        };
+        let remote_branch_names: Vec<String> = snapshot
+            .branch_list
+            .iter()
+            .filter(|branch| branch.is_remote())
+            .map(|branch| branch.name().to_string())
+            .collect();
+
+        let weak_git_graph = cx.weak_entity();
+        let workspace = self.workspace.clone();
+
+        Some(Box::new(
+            move |mut menu: ContextMenu, window: &mut Window| {
+                let Some(git_graph) = weak_git_graph.upgrade() else {
+                    return menu;
+                };
+                let run = |args: Vec<String>| {
+                    window.handler_for(&git_graph, move |this, window, cx| {
+                        this.run_git_in_terminal(args.clone(), window, cx);
+                    })
+                };
+                let confirm = |message: String, detail: &'static str, args: Vec<String>| {
+                    window.handler_for(&git_graph, move |this, window, cx| {
+                        this.confirm_and_run_git_in_terminal(
+                            message.clone(),
+                            detail,
+                            "Delete",
+                            args.clone(),
+                            window,
+                            cx,
+                        );
+                    })
+                };
+                let strings = |args: &[&str]| -> Vec<String> {
+                    args.iter().map(|arg| arg.to_string()).collect()
+                };
+
+                match kind {
+                    RefKind::Tag(tag) => {
+                        let tag_ref = format!("refs/tags/{tag}");
+                        for remote in &remotes {
+                            menu = menu.entry(
+                                format!("Push Tag to {remote}"),
+                                None,
+                                run(strings(&["push", remote, &tag_ref])),
+                            );
+                        }
+                        menu = menu.entry(
+                            "Delete Tag…",
+                            None,
+                            confirm(
+                                format!("Delete tag {tag}?"),
+                                LOCAL_TAG_DELETE_DETAIL,
+                                strings(&["tag", "-d", &tag]),
+                            ),
+                        );
+                        for remote in &remotes {
+                            menu = menu.entry(
+                                format!("Delete Tag from {remote}…"),
+                                None,
+                                confirm(
+                                    format!("Delete tag {tag} from {remote}?"),
+                                    REMOTE_DELETE_DETAIL,
+                                    strings(&["push", remote, "--delete", &tag_ref]),
+                                ),
+                            );
+                        }
+                    }
+                    RefKind::LocalBranch { name, upstream } => {
+                        let is_current = current_branch.as_deref() == Some(name.as_str());
+                        menu = menu.entry("Rename Branch…", None, {
+                            let name = name.clone();
+                            move |window, cx| {
+                                workspace
+                                    .update(cx, |workspace, cx| {
+                                        rename_branch_modal(
+                                            name.clone(),
+                                            repository.clone(),
+                                            workspace,
+                                            window,
+                                            cx,
+                                        );
+                                    })
+                                    .log_err();
+                            }
+                        });
+                        for remote in &remotes {
+                            menu = menu.entry(
+                                format!("Push to {remote}"),
+                                None,
+                                run(strings(&["push", "-u", remote, &name])),
+                            );
+                        }
+                        for remote in &remotes {
+                            let remote_branch = format!("{remote}/{name}");
+                            let already_tracking = upstream.as_deref()
+                                == Some(format!("refs/remotes/{remote_branch}").as_str());
+                            if already_tracking || !remote_branch_names.contains(&remote_branch) {
+                                continue;
+                            }
+                            menu = menu.entry(
+                                format!("Set Upstream to {remote_branch}"),
+                                None,
+                                run(strings(&[
+                                    "branch",
+                                    &format!("--set-upstream-to={remote_branch}"),
+                                    &name,
+                                ])),
+                            );
+                        }
+                        // Git refuses to delete the checked-out branch, so offer it
+                        // disabled rather than let the command fail in a terminal.
+                        menu = menu
+                            .item(
+                                ContextMenuEntry::new("Delete Branch")
+                                    .disabled(is_current)
+                                    .handler(run(strings(&["branch", "-d", &name]))),
+                            )
+                            .item(
+                                ContextMenuEntry::new("Force Delete Branch…")
+                                    .disabled(is_current)
+                                    .handler(confirm(
+                                        format!("Force delete branch {name}?"),
+                                        FORCE_DELETE_BRANCH_DETAIL,
+                                        strings(&["branch", "-D", &name]),
+                                    )),
+                            );
+                    }
+                    RefKind::RemoteBranch { remote, name } => {
+                        menu = menu.entry(
+                            format!("Delete {name} from {remote}…"),
+                            None,
+                            confirm(
+                                format!("Delete branch {name} from {remote}?"),
+                                REMOTE_DELETE_DETAIL,
+                                strings(&["push", &remote, "--delete", &name]),
+                            ),
+                        );
+                    }
+                }
+                menu
+            },
+        ))
+    }
+
+    /// Opens the menu for a branch chip dropped on the commit at `target_idx`:
+    /// merge it into the current branch when dropped on HEAD, rebase it onto the
+    /// commit, or move it there.
+    fn deploy_ref_drop_menu(
+        &mut self,
+        position: Point<Pixels>,
+        target_idx: usize,
+        decoration: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(dragged) = Self::ref_name_from_decoration(&decoration) else {
+            return;
+        };
+        let Some(target) = self.graph_data.commits.get(target_idx) else {
+            return;
+        };
+        if target
+            .data
+            .ref_names
+            .iter()
+            .any(|name| Self::ref_name_from_decoration(name).as_ref() == Some(&dragged))
+        {
+            return;
+        }
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let snapshot = repository.read(cx).snapshot();
+        let sha = target.data.sha.to_string();
+        let short_sha = target.data.sha.display_short();
+        let current_branch = snapshot
+            .branch
+            .as_ref()
+            .map(|branch| branch.name().to_string());
+        let dragged_is_remote = snapshot
+            .branch_list
+            .iter()
+            .any(|branch| branch.is_remote() && branch.name() == dragged.as_ref());
+        let target_is_head = snapshot
+            .head_commit
+            .as_ref()
+            .is_some_and(|head| head.sha.as_ref() == sha);
+        let target_label: String = target
+            .data
+            .ref_names
+            .iter()
+            .filter(|name| !name.starts_with("tag: "))
+            .find_map(|name| Self::ref_name_from_decoration(name))
+            .map(|name| name.to_string())
+            .unwrap_or_else(|| short_sha.clone());
+        let dragged = dragged.to_string();
+        let is_current = current_branch.as_deref() == Some(dragged.as_str());
+
+        let git_graph = cx.entity();
+        let context_menu = ContextMenu::build(window, cx, move |mut menu, window, _| {
+            let run = |args: Vec<String>| {
+                window.handler_for(&git_graph, move |this, window, cx| {
+                    this.run_git_in_terminal(args.clone(), window, cx);
+                })
+            };
+            let strings =
+                |args: &[&str]| -> Vec<String> { args.iter().map(|arg| arg.to_string()).collect() };
+
+            menu = menu.header(format!("Drop {dragged} on {target_label}"));
+            if let Some(current_branch) = current_branch.as_deref()
+                && target_is_head
+                && !is_current
+            {
+                menu = menu.entry(
+                    format!("Merge {dragged} into {current_branch}"),
+                    None,
+                    run(strings(&["merge", "--no-edit", &dragged])),
+                );
+            }
+            if !dragged_is_remote {
+                menu = menu.entry(
+                    format!("Rebase {dragged} onto {target_label}"),
+                    None,
+                    run(strings(&["rebase", &sha, &dragged])),
+                );
+                if is_current {
+                    let message = format!("Hard reset {dragged} to {short_sha}?");
+                    let args = strings(&["reset", "--hard", &sha]);
+                    menu = menu.entry(
+                        format!("Reset {dragged} to Here…"),
+                        None,
+                        window.handler_for(&git_graph, move |this, window, cx| {
+                            this.confirm_and_run_git_in_terminal(
+                                message.clone(),
+                                HARD_RESET_WARNING,
+                                "Hard Reset",
+                                args.clone(),
+                                window,
+                                cx,
+                            );
+                        }),
+                    );
+                } else {
+                    menu = menu.entry(
+                        format!("Move {dragged} Here"),
+                        None,
+                        run(strings(&["branch", "-f", &dragged, &sha])),
+                    );
+                }
+            }
+            menu
+        });
+        self.set_context_menu(context_menu, position, Some(target_idx), window, cx);
+    }
     fn deploy_multi_selection_context_menu(
         &mut self,
         position: Point<Pixels>,
@@ -4117,6 +5093,7 @@ impl GitGraph {
     ) {
         let commit_count = self.selected_commit_count();
         let can_compare = self.selected_comparison().is_some();
+        let can_squash = self.squash_base(cx).is_ok();
         let git_graph = cx.entity();
         let context_menu = ContextMenu::build(window, cx, move |menu, window, _| {
             menu.header(format!("{commit_count} Commits"))
@@ -4130,6 +5107,13 @@ impl GitGraph {
                     )
                     .separator()
                 })
+                .item(
+                    ContextMenuEntry::new(format!("Squash {commit_count} Commits…"))
+                        .disabled(!can_squash)
+                        .handler(window.handler_for(&git_graph, |this, window, cx| {
+                            this.squash_selection(window, cx);
+                        })),
+                )
                 .entry(
                     format!("Cherry-pick {commit_count} Commits"),
                     None,
@@ -5664,6 +6648,20 @@ impl Render for GitGraph {
                                 .id("graph-canvas")
                                 .size_full()
                                 .overflow_hidden()
+                                .on_drop(cx.listener(
+                                    |this, dragged: &DraggedRef, window, cx| {
+                                        let position = window.mouse_position();
+                                        if let Some(row) = this.row_at_position(position.y, window, cx) {
+                                            this.deploy_ref_drop_menu(
+                                                position,
+                                                row,
+                                                dragged.name.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    },
+                                ))
                                 .child(
                                     div()
                                         .size_full()
@@ -5687,6 +6685,7 @@ impl Render for GitGraph {
                                     let weak = weak_self.clone();
                                     let weak_for_hover = weak.clone();
                                     let weak_for_context_menu = weak.clone();
+                                    let weak_for_drop = weak.clone();
 
                                     let hover_bg = cx.theme().colors().element_hover.opacity(0.6);
                                     let selected_bg = if is_focused {
@@ -5745,6 +6744,22 @@ impl Render for GitGraph {
                                                     .ok();
                                             },
                                         )
+                                        .drag_over::<DraggedRef>(|style, _, _, cx| {
+                                            style.bg(cx.theme().colors().drop_target_background)
+                                        })
+                                        .on_drop(move |dragged: &DraggedRef, window, cx| {
+                                            weak_for_drop
+                                                .update(cx, |this, cx| {
+                                                    this.deploy_ref_drop_menu(
+                                                        window.mouse_position(),
+                                                        index,
+                                                        dragged.name.clone(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                })
+                                                .ok();
+                                        })
                                         .into_any_element()
                                 })
                                 .uniform_list(
@@ -5927,6 +6942,7 @@ impl Render for GitGraph {
                 v_flex()
                     .size_full()
                     .child(self.render_search_bar(cx))
+                    .children(self.render_operation_in_progress_banner(cx))
                     .child(div().flex_1().child(content)),
             )
             .children(self.context_menu.as_ref().map(|context_menu| {
@@ -8675,6 +9691,121 @@ mod tests {
             cx.read_from_clipboard().and_then(|item| item.text()),
             Some("v1.0.0".to_string())
         );
+    }
+
+    #[gpui::test]
+    async fn test_squash_and_reword_are_limited_to_history_ending_at_head(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            serde_json::json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+
+        let shas = (1..=4u8)
+            .map(|byte| Oid::from_bytes(&[byte; 20]).unwrap())
+            .collect::<Vec<_>>();
+        let commits = shas
+            .iter()
+            .enumerate()
+            .map(|(index, sha)| {
+                Arc::new(InitialGraphCommitData {
+                    sha: *sha,
+                    parents: shas.get(index + 1).copied().into_iter().collect(),
+                    ref_names: Vec::new(),
+                })
+            })
+            .collect();
+        fs.set_graph_commits(Path::new("/project/.git"), commits);
+        fs.set_head_for_repo(Path::new("/project/.git"), &[], shas[0].to_string());
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        git_graph.update(cx, |graph, cx| {
+            assert_eq!(graph.graph_data.commits.len(), 4);
+
+            graph.select_entry(0, ScrollStrategy::Nearest, cx);
+            assert!(
+                graph.squash_base(cx).is_err(),
+                "a single commit has nothing to squash into"
+            );
+            assert_eq!(graph.reword_blocker(0, cx), None);
+            assert!(graph.reword_blocker(1, cx).is_some());
+
+            graph.extend_selection(2, ScrollStrategy::Nearest, cx);
+            assert_eq!(
+                graph.squash_base(cx),
+                Ok(shas[3]),
+                "the branch is reset to the parent of the oldest selected commit"
+            );
+
+            graph.select_entry(1, ScrollStrategy::Nearest, cx);
+            graph.extend_selection(2, ScrollStrategy::Nearest, cx);
+            assert!(
+                graph.squash_base(cx).is_err(),
+                "the newest selected commit has to be HEAD"
+            );
+
+            graph.select_entry(0, ScrollStrategy::Nearest, cx);
+            graph.toggle_selection(2, ScrollStrategy::Nearest, cx);
+            assert!(
+                graph.squash_base(cx).is_err(),
+                "a selection with a gap is not one line of history"
+            );
+
+            graph.select_entry(0, ScrollStrategy::Nearest, cx);
+            graph.extend_selection(3, ScrollStrategy::Nearest, cx);
+            assert!(
+                graph.squash_base(cx).is_err(),
+                "the root commit has no parent to reset to"
+            );
+        });
+
+        fs.set_status_for_repo(
+            Path::new("/project/.git"),
+            &[("file.txt", StatusCode::Modified.index())],
+        );
+        cx.run_until_parked();
+
+        git_graph.update(cx, |graph, cx| {
+            graph.select_entry(0, ScrollStrategy::Nearest, cx);
+            graph.extend_selection(1, ScrollStrategy::Nearest, cx);
+            assert!(
+                graph.squash_base(cx).is_err(),
+                "staged changes would end up in the squashed commit"
+            );
+            assert!(graph.reword_blocker(0, cx).is_some());
+        });
     }
 
     #[gpui::test]

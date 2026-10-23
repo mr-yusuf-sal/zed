@@ -1744,4 +1744,10 @@
       "ctrl-alt-c": "quarry::CancelQuery",
     },
   },
+  {
+    "context": "GitCommitMessageModal > Editor",
+    "bindings": {
+      "ctrl-enter": "menu::Confirm",
+    },
+  },
 ]

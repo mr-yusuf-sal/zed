@@ -28,41 +28,29 @@ Bilinen sınırlamalar:
 - `git diff` veya `show` başarısız olursa karşılaştırma sekmesi hiç açılmıyor ve hata sadece log'a düşüyor (tek commit açma yolu da böyle davranıyor).
 - `FakeGitRepository::load_commit` her string için boş diff döndüğünden değiştirilmedi; fake repo'da karşılaştırmanın dosya içeriği test edilemiyor.
 
-## Yapılacaklar
+## 2–7. adımlar (squash/reword, branch/tag, durum şeridi, sürükle-bırak, filtreler, otomatik fetch)
 
-### 2) Squash ve reword
-- **Squash:** Seçili commit'ler HEAD'den geriye doğru ardışık ve doğrusal olmalı (her birinin parent'ı bir sonraki). Değilse menü pasif ve tooltip'te nedeni yazsın. Akış: mesajları birleştirip önceden dolduran çok satırlı bir pencere açılır, onaylanınca `Repository::reset(<en eski>~1, Soft)` ve ardından `Repository::commit(message, None, CommitOptions::default(), askpass, cx)` çalışır.
-- **Reword:** Sadece HEAD için: mesaj penceresi açılır, onaylanınca `commit` amend ile çalışır (`CommitOptions { amend: true, .. }`). HEAD dışındaki commit'ler interactive rebase gerektirir, kapsam dışı.
-- Pencere: `CreateTagModal` benzeri, ama `Editor::multi_line` kullanan yeni bir modal.
+Tasarım kararları:
+- **Squash:** Seçim HEAD'den geriye doğru tek bir düz çizgi olmalı (her commit'in tek parent'ı bir sonraki seçili commit). Ayrıca staged değişiklik olmamalı. Kurallar `squash_base`'te; uymayan durumda panel butonu pasif ve tooltip'te nedeni yazıyor. Akış: commit mesajları eskiden yeniye birleştirilip `CommitMessageModal`'a (`git_ui.rs`, çok satırlı, ctrl/cmd+enter onaylar) dolduruluyor. Onaylanınca `Repository::reset(<en eskinin parent'ı>, Soft)` ve ardından `Repository::commit` çalışıyor. Commit adımı başarısız olursa hata mesajı değişikliklerin staged kaldığını ve `git reset --soft ORIG_HEAD` ile geri alınabileceğini söylüyor. Interactive rebase yok, o yüzden HEAD'e ulaşmayan aralıklar kapsam dışı.
+- **Reword:** Sadece HEAD için ve staged değişiklik yokken; `CommitOptions { amend: true }` ile commit. Commit menüsünde ("Reword Commit…"), sağ tıklanan commit üzerinde çalışıyor.
+- **Branch/tag yönetimi** (ref etiketine sağ tık, `ref_management_menu_entries`):
+  - Local branch: Rename…, Push to `<remote>`, Set Upstream to `<remote>/<ad>`, Delete Branch, Force Delete Branch…. Rename için mevcut `RenameBranchModal` kullanılıyor (`rename_branch_modal`). Upstream seçeneği sadece aynı adda bir remote branch varsa ve zaten o takip edilmiyorsa çıkıyor. Silme seçenekleri checked-out branch'te pasif.
+  - Remote branch: Delete from `<remote>`… (`git push <remote> --delete`).
+  - Tag: Push Tag to `<remote>`, Delete Tag…, Delete Tag from `<remote>`….
+  - Hepsi terminal task. Silmeler onay soruyor. Remote listesi `branch_list` içindeki remote branch'lerden çıkarılıyor, yani hiç branch'i olmayan bir remote listede yok.
+- **Durum şeridi:** `OperationInProgress::detect`, `repository_dir_abs_path` altında `rebase-merge/`, `rebase-apply/`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD` arıyor. Bunu projenin `Fs`'i ile yapıyor, bu yüzden testlerde FakeFs ile de çalışıyor. Graph oluşturulurken ve graph yükleme olayları dışındaki her repository olayında yeniden kontrol ediliyor. Şerit arama çubuğunun altında: Continue (`git -c core.editor=true <işlem> --continue`, mesaj editörü terminalde beklemesin diye), Skip (merge hariç), Abort (onaylı).
+- **Sürükle-bırak:** Branch etiketleri (tag ve HEAD hariç) sürüklenebiliyor. Tablo satırları ve graph sütunu bırakma hedefi. Bırakınca menü açılıyor: HEAD'e bırakıldıysa "Merge `<A>` into `<current>`"; local branch için "Rebase `<A>` onto `<hedef>`" (`git rebase <sha> <A>`); A mevcut branch değilse "Move `<A>` Here" (`git branch -f`), mevcut branch ise "Reset `<A>` to Here…" (hard, onaylı). Kendi commit'ine bırakmak bir şey yapmıyor.
+- **Branch filtresi:** Arama çubuğunda "All Branches / `<branch>`" açılır menüsü (`render_branch_filter`, `set_log_source`). Kaynak değişince seçim temizleniyor, çünkü seçim satır indeksi olarak tutuluyor. File history modunda menü gösterilmiyor.
+- **Arama niteleyicileri:** `CommitSearchFilters::parse` (`crates/git/src/repository.rs`). `author:`, `since:`, `until:` tek kelime ya da çift tırnaklı ifade alıyor ve `--author`, `--since`, `--until` olarak `git log`'a ekleniyor. Kalan metin `--grep` oluyor. Niteleyici yoksa sorgu eskisi gibi olduğu gibi aranıyor, hash araması da eskisi gibi çalışıyor. `--fixed-strings` ve büyük/küçük harf ayarı `--author`'a da uygulanıyor. Bu bir filtre değil, eşleşenleri vurgulama ve aralarında gezme.
+- **Otomatik fetch:** Fetch butonunun solundaki saat ikonu ile açılıp kapanıyor; durum KVP'de (`git_graph_auto_fetch`) saklanıyor. Açıkken graph her 5 dakikada bir `Repository::fetch(FetchOptions::All, …)` çağırıyor. Toast yok. Askpass boş, yani şifre isteyen remote sessizce başarısız olup bir sonraki tura kalıyor; hata sadece debug log'a düşüyor. Repository'yi doğrudan çağırdığı için aktif repo kısıtı yok. Graph kapanınca task da düşüyor.
 
-### 3) Branch / tag yönetimi (ref etiketine sağ tık)
-- Branch silme: `Repository::delete_branch(is_remote, name, force)`. Merge edilmemişse force için onay sorulsun.
-- Branch'i yeniden adlandırma: `RenameBranchModal` (`git_ui.rs`) şu an aktif branch adını alıyor. Herhangi bir branch için kullanılabilir mi bakılmalı, `rename_branch(branch, new_name)` zaten var.
-- Branch push etme: terminal task olarak `git push -u <remote> <branch>`. Remote listesi `get_remotes`'tan veya `branch_list` içindeki remote adlarından alınabilir.
-- Upstream ayarlama: `git branch --set-upstream-to=<remote>/<branch> <branch>`. Sadece eşleşen remote branch varsa gösterilsin.
-- Tag silme: `git tag -d <tag>` (terminal veya `Repository`'de ref silme varsa o). Tag push etme: `git push <remote> <tag>`.
+Bilinen sınırlamalar:
+- Bunların hiçbiri çalışan bir Zed'de denenmedi.
+- Squash/reword dışındaki her şey terminal task. Komut başarısız olursa terminalde açık kalıyor, ama graph bunu ayrıca bildirmiyor.
+- Arama niteleyicileri collab'da host'un da bu kodu çalıştırmasını gerektiriyor. Fake repo niteleyicileri tanımıyor, o yüzden sadece ayrıştırıcının birim testi var.
+- Remote bir projede durum şeridi yerel `Fs` ile bakamayacağı için çıkmayabilir.
+- Otomatik fetch her graph sekmesi için ayrı çalışıyor; aynı repoya iki graph açıksa iki kat fetch olur.
 
-### 4) İşlem sürerken çıkan şerit
-- `RepositorySnapshot.merge: MergeDetails` sadece merge mesajı ve conflict'li path'leri veriyor. Rebase / cherry-pick / revert tespiti için `dot_git_abs_path` altında şunlara bakılmalı: `rebase-merge/`, `rebase-apply/`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `MERGE_HEAD`. Repo değişince (repository event) yeniden kontrol edilmeli.
-- Graph'ın üstünde bir şerit: "Rebase sürüyor — Continue / Skip / Abort". Butonlar terminal task olarak `git <işlem> --continue|--skip|--abort` çalıştırsın. Merge için Skip yok, Continue ise `git merge --continue`.
-
-### 5) Sürükle-bırak
-- `render_ref_chip` içindeki etikete `.on_drag(DraggedRef { name, sha }, …)` eklenmeli. Tablo satırlarına (`map_row`) ve graph canvas'ına `.on_drop` eklenmeli.
-- Bırakınca açılan menü:
-  - "Rebase `<A>` onto `<hedef>`" → `git rebase <hedef> <A>`
-  - "Merge `<A>` into `<current>`" (hedef mevcut branch ise)
-  - "Move `<A>` here" → `git branch -f <A> <sha>` (A mevcut branch değilse; mevcut branch ise hard reset onayı)
-
-### 6) Filtreler
-- **Branch filtresi:** `LogSource::Branch(..)` zaten var ve proto'da destekleniyor. Toolbar'a "All branches / <branch>" seçici eklenmeli: `self.log_source` değişir, ardından `invalidate_state` ve `fetch_initial_graph_data` çalışır. Graph'ın log_source değişimine doğru tepki verdiği doğrulanmalı. Seçim workspace serileştirmesine zaten giriyor (`LOG_SOURCE_BRANCH`).
-- **Yazar / tarih:** Arama şu an `git log --grep` kullanıyor (`search_commits`, `repository.rs` ~3464). Sorgu içindeki `author:<ad>`, `since:<tarih>`, `until:<tarih>` niteleyicileri ayrıştırılıp `--author`, `--since`, `--until` olarak eklenmeli. Sorgu string olarak geçtiği için proto değişikliği gerekmez. Bu bir filtre değil, eşleşenleri vurgulama/gezme olur: graph çizgileri tüm commit'lere göre hesaplandığı için gerçek gizleme mümkün değil.
-
-### 7) Otomatik fetch
-- Toolbar'da aç/kapa butonu, durumu KVP'de saklanır (`commit_details_position` gibi).
-- Açıkken graph her 5 dakikada bir `repository.fetch(FetchOptions::All, AskPassDelegate::new(cx, |_, _, _| {}), cx)` çağırır. Toast gösterilmez. Şifre istenirse askpass sessizce düşer ve fetch başarısız olur. Timer task'ı bir alanda tutulur, graph kapanınca iptal olur.
-- Fetch butonlarından farklı olarak repository'yi doğrudan çağırdığı için aktif repo kısıtı yok.
-
-## Kontrol listesi (her adım için)
+## Kontrol listesi
 - `README.md` başındaki `[!IMPORTANT]` satırları zaten var, dokunma.
-- `cargo fmt -p git_ui`, `cargo clippy -p git_ui --all-targets`, `cargo test -p git_ui --lib`.
-- Ayrı commit, mesaj formatı mevcut commit'ler gibi. Ardından `origin/custom`'a push.
+- `cargo fmt -p git_ui -p git`, `cargo clippy -p git_ui --all-targets`, `cargo test -p git_ui --lib`, `cargo test -p git --lib commit_search`.
