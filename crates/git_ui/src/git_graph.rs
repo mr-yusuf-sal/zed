@@ -3881,12 +3881,17 @@ impl GitGraph {
         let Some(repository) = self.get_repository(cx) else {
             return;
         };
-        let Some(workspace) = self.workspace.upgrade() else {
-            return;
-        };
-        let fs = workspace.read(cx).project().read(cx).fs().clone();
         let git_dir = repository.read(cx).repository_dir_abs_path.clone();
+        let workspace = self.workspace.clone();
         self._operation_in_progress_task = Some(cx.spawn(async move |this, cx| {
+            // The graph is created inside a workspace update, so the workspace
+            // can only be read once that update is over, which a spawned task
+            // guarantees.
+            let Ok(fs) =
+                workspace.read_with(cx, |workspace, cx| workspace.project().read(cx).fs().clone())
+            else {
+                return;
+            };
             let operation = OperationInProgress::detect(fs.as_ref(), &git_dir).await;
             this.update(cx, |this, cx| {
                 if this.operation_in_progress != operation {
@@ -9790,14 +9795,76 @@ mod tests {
                 "the root commit has no parent to reset to"
             );
         });
+    }
 
+    #[gpui::test]
+    async fn test_squash_and_reword_refuse_staged_changes(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            serde_json::json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+
+        let newer = Oid::from_bytes(&[1; 20]).unwrap();
+        let older = Oid::from_bytes(&[2; 20]).unwrap();
+        let base = Oid::from_bytes(&[3; 20]).unwrap();
+        let commits = [(newer, older), (older, base)]
+            .into_iter()
+            .map(|(sha, parent)| {
+                Arc::new(InitialGraphCommitData {
+                    sha,
+                    parents: smallvec![parent],
+                    ref_names: Vec::new(),
+                })
+            })
+            .chain([Arc::new(InitialGraphCommitData {
+                sha: base,
+                parents: smallvec![],
+                ref_names: Vec::new(),
+            })])
+            .collect();
+        fs.set_graph_commits(Path::new("/project/.git"), commits);
+        fs.set_head_for_repo(Path::new("/project/.git"), &[], newer.to_string());
         fs.set_status_for_repo(
             Path::new("/project/.git"),
             &[("file.txt", StatusCode::Modified.index())],
         );
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                None,
+                window,
+                cx,
+            )
+        });
         cx.run_until_parked();
 
         git_graph.update(cx, |graph, cx| {
+            assert_eq!(graph.graph_data.commits.len(), 3);
             graph.select_entry(0, ScrollStrategy::Nearest, cx);
             graph.extend_selection(1, ScrollStrategy::Nearest, cx);
             assert!(
