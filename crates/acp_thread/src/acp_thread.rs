@@ -3742,6 +3742,7 @@ pub struct AcpThread {
     parent_session_id: Option<acp_v2::SessionId>,
     /// Child sessions this session owns, such as subagents, in registration order.
     subagents: IndexMap<acp_v2::SessionId, Entity<AcpThread>>,
+    _subagent_status_subscriptions: Vec<Subscription>,
     /// Set when this session is an ACP subagent announced by its parent.
     subagent_association: Option<subagents::SubagentAssociation>,
     provisional_title: Option<SharedString>,
@@ -4121,6 +4122,7 @@ impl AcpThread {
             elicitations: ElicitationStore::default(),
             permission_requests: IndexMap::default(),
             subagents: IndexMap::default(),
+            _subagent_status_subscriptions: Vec::new(),
             subagent_association: None,
             plans: HashMap::default(),
             visible_plan: None,
@@ -4291,6 +4293,25 @@ impl AcpThread {
 
     pub fn entries(&self) -> &[AgentThreadEntry] {
         &self.entries
+    }
+
+    /// Whether work the agent started keeps running after its turn ended: work it
+    /// lists as running in the background, a subagent that is still working, or a
+    /// command that outlived its tool call (Claude Code's `run_in_background`).
+    pub fn has_background_work(&self, cx: &App) -> bool {
+        self.background_work().is_some_and(|work| !work.is_empty())
+            || self
+                .subagents()
+                .any(|subagent| subagent.read(cx).status() == ThreadStatus::Generating)
+            || self.entries.iter().any(|entry| {
+                let AgentThreadEntry::ToolCall(tool_call) = entry else {
+                    return false;
+                };
+                matches!(tool_call.status(), ToolCallStatus::Completed)
+                    && tool_call
+                        .terminals()
+                        .any(|terminal| terminal.read(cx).output().is_none())
+            })
     }
 
     pub fn notices(&self) -> &[(usize, acp_v2::Notice)] {
@@ -6245,6 +6266,14 @@ impl AcpThread {
         if self.subagents.contains_key(&session_id) {
             return;
         }
+        // A subagent still working keeps the parent busy (`has_background_work`), so its
+        // status changes are the parent's too.
+        self._subagent_status_subscriptions
+            .push(cx.subscribe(&subagent, |_, _, event, cx| {
+                if matches!(event, AcpThreadEvent::StatusChanged) {
+                    cx.emit(AcpThreadEvent::StatusChanged);
+                }
+            }));
         self.subagents.insert(session_id.clone(), subagent);
         cx.emit(AcpThreadEvent::SubagentSpawned(session_id));
     }
@@ -8509,7 +8538,8 @@ impl AcpThread {
 
         cx.spawn(async move |this, cx| {
             let terminal = terminal_task.await?;
-            this.update(cx, |this, _cx| {
+            this.update(cx, |this, cx| {
+                this.notify_when_terminal_exits(&terminal, cx);
                 this.terminals.insert(terminal_id, terminal.clone());
                 terminal
             })
@@ -8598,8 +8628,24 @@ impl AcpThread {
                 cx,
             )
         });
+        self.notify_when_terminal_exits(&entity, cx);
         self.terminals.insert(terminal_id.clone(), entity.clone());
         entity
+    }
+
+    /// A command can outlive its tool call, and nothing else about the thread
+    /// changes when it exits, so those that count it as background work would
+    /// not hear of the exit otherwise.
+    fn notify_when_terminal_exits(&self, terminal: &Entity<Terminal>, cx: &mut Context<Self>) {
+        let mut exited = terminal.read(cx).output().is_some();
+        cx.observe(terminal, move |_, terminal, cx| {
+            if !exited && terminal.read(cx).output().is_some() {
+                exited = true;
+                cx.emit(AcpThreadEvent::StatusChanged);
+                cx.notify();
+            }
+        })
+        .detach();
     }
 
     pub fn mark_as_subagent_output(&mut self, cx: &mut Context<Self>) {
