@@ -66,11 +66,10 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use util::ResultExt as _;
 use util::path_list::PathList;
 use workspace::{
-    CloseWindow, FocusWorkspaceSidebar, MoveProjectDown, MoveProjectUp, MultiWorkspace,
-    MultiWorkspaceEvent, NextProject, NextThread, Open, OpenMode, PreviousProject, PreviousThread,
-    ProjectGroupKey, RemovalIntent, SaveIntent, Sidebar as WorkspaceSidebar, SidebarSide, Toast,
-    ToggleWorkspaceSidebar, Workspace, dock::AutoHideMode, notifications::NotificationId,
-    sidebar_side_context_menu,
+    CloseWindow, MoveProjectDown, MoveProjectUp, MultiWorkspace, MultiWorkspaceEvent, NextProject,
+    NextThread, Open, OpenMode, PreviousProject, PreviousThread, ProjectGroupKey, RemovalIntent,
+    SaveIntent, Sidebar as WorkspaceSidebar, SidebarSide, Toast, Workspace,
+    notifications::NotificationId,
 };
 
 use git_ui_core::worktree_service::{RemoteBranchName, worktree_create_targets};
@@ -7484,88 +7483,6 @@ impl Sidebar {
         )
     }
 
-    fn render_sidebar_toggle_button(&self, _cx: &mut Context<Self>) -> impl IntoElement {
-        let on_right = AgentSettings::get_global(_cx).sidebar_side() == SidebarSide::Right;
-
-        sidebar_side_context_menu("sidebar-toggle-menu", _cx)
-            .anchor(if on_right {
-                gpui::Anchor::BottomRight
-            } else {
-                gpui::Anchor::BottomLeft
-            })
-            .attach(if on_right {
-                gpui::Anchor::TopRight
-            } else {
-                gpui::Anchor::TopLeft
-            })
-            .trigger(move |_is_active, _window, _cx| {
-                let icon = if on_right {
-                    IconName::ThreadsSidebarRightOpen
-                } else {
-                    IconName::ThreadsSidebarLeftOpen
-                };
-                IconButton::new("sidebar-close-toggle", icon)
-                    .icon_size(IconSize::Small)
-                    .tooltip(Tooltip::element(move |_window, cx| {
-                        v_flex()
-                            .gap_1()
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .justify_between()
-                                    .child(Label::new("Toggle Sidebar"))
-                                    .child(KeyBinding::for_action(&ToggleWorkspaceSidebar, cx)),
-                            )
-                            .child(
-                                h_flex()
-                                    .pt_1()
-                                    .gap_2()
-                                    .border_t_1()
-                                    .border_color(cx.theme().colors().border_variant)
-                                    .justify_between()
-                                    .child(Label::new("Focus Sidebar"))
-                                    .child(KeyBinding::for_action(&FocusWorkspaceSidebar, cx)),
-                            )
-                            .into_any_element()
-                    }))
-                    .on_click(|_, window, cx| {
-                        if let Some(multi_workspace) = window.root::<MultiWorkspace>().flatten() {
-                            multi_workspace.update(cx, |multi_workspace, cx| {
-                                multi_workspace.close_sidebar(window, cx);
-                            });
-                        }
-                    })
-            })
-    }
-
-    fn render_sidebar_pin_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mode = self
-            .multi_workspace
-            .upgrade()
-            .map(|multi_workspace| multi_workspace.read(cx).sidebar_auto_hide_mode())
-            .unwrap_or_default();
-        let tooltip: SharedString = format!(
-            "Sidebar: {} (click for {})",
-            mode.label(),
-            mode.next().label()
-        )
-        .into();
-
-        IconButton::new(("sidebar-auto-hide-mode", mode as u64), mode.icon())
-            .icon_size(IconSize::Small)
-            .toggle_state(mode == AutoHideMode::Pinned)
-            .aria_label(tooltip.clone())
-            .tooltip(Tooltip::text(tooltip))
-            .on_click(cx.listener(|this, _, window, cx| {
-                if let Some(multi_workspace) = this.multi_workspace.upgrade() {
-                    multi_workspace.update(cx, |multi_workspace, cx| {
-                        multi_workspace.cycle_sidebar_auto_hide_mode(window, cx);
-                    });
-                }
-                cx.notify();
-            }))
-    }
-
     fn render_sidebar_bottom_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_archive = matches!(self.view, SidebarView::Archive(..));
         let is_archived_only = matches!(
@@ -7585,8 +7502,6 @@ impl Sidebar {
             .when(on_right, |this| this.flex_row_reverse())
             .border_t_1()
             .border_color(cx.theme().colors().border)
-            .child(self.render_sidebar_toggle_button(cx))
-            .child(self.render_sidebar_pin_button(cx))
             .child(
                 IconButton::new("history", IconName::Clock)
                     .icon_size(IconSize::Small)

@@ -1,5 +1,6 @@
 mod app_menus;
 pub mod edit_prediction_registry;
+mod main_page;
 #[cfg(target_os = "macos")]
 pub(crate) mod mac_only_instance;
 mod migrate;
@@ -800,8 +801,6 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
         let project_panel = ProjectPanel::load(workspace_handle.clone(), cx.clone());
         let terminal_panel = TerminalPanel::load(workspace_handle.clone(), cx.clone());
         let git_panel = GitPanel::load(workspace_handle.clone(), cx.clone());
-        let channels_panel =
-            collab_ui::collab_panel::CollabPanel::load(workspace_handle.clone(), cx.clone());
         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
 
         async fn add_panel_when_ready(
@@ -819,11 +818,32 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             }
         }
 
+        async fn add_project_panel_when_ready(
+            panel_task: impl Future<Output = anyhow::Result<Entity<ProjectPanel>>> + 'static,
+            workspace_handle: WeakEntity<Workspace>,
+            mut cx: gpui::AsyncWindowContext,
+        ) {
+            if let Some(panel) = panel_task
+                .await
+                .context("failed to load project panel")
+                .log_err()
+            {
+                workspace_handle
+                    .update_in(&mut cx, |workspace, window, cx| {
+                        workspace.add_panel(panel.clone(), window, cx);
+                        let weak_workspace = workspace.weak_handle();
+                        let main_page =
+                            cx.new(|cx| main_page::MainPage::new(weak_workspace, panel, cx));
+                        workspace.add_permanent_item(Box::new(main_page), window, cx);
+                    })
+                    .log_err();
+            }
+        }
+
         futures::join!(
-            add_panel_when_ready(project_panel, workspace_handle.clone(), cx.clone()),
+            add_project_panel_when_ready(project_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(terminal_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
             initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
         );
@@ -1318,14 +1338,6 @@ fn register_actions(
         .register_action(open_project_tasks_file)
         .register_action(open_worktree_setup_tasks_file)
         .register_action(open_project_debug_tasks_file)
-        .register_action(
-            |workspace: &mut Workspace,
-             _: &collab_ui::collab_panel::ToggleFocus,
-             window: &mut Window,
-             cx: &mut Context<Workspace>| {
-                workspace.toggle_panel_focus::<collab_ui::collab_panel::CollabPanel>(window, cx);
-            },
-        )
         .register_action(
             |workspace: &mut Workspace,
              _: &terminal_panel::ToggleFocus,

@@ -385,7 +385,8 @@ impl MultiWorkspace {
             sidebar: None,
             sidebar_open: false,
             sidebar_overlay: None,
-            sidebar_auto_hide_mode: AutoHideMode::load(SIDEBAR_PINNED_KEY, cx),
+            // The threads sidebar is always on screen in this fork, so its stored mode is ignored.
+            sidebar_auto_hide_mode: AutoHideMode::Pinned,
             sidebar_hovered_since_open: false,
             sidebar_auto_hide_task: None,
             root_bounds: None,
@@ -408,6 +409,7 @@ impl MultiWorkspace {
                 }
             }));
         self.sidebar = Some(Box::new(sidebar));
+        self.apply_open_sidebar(cx);
     }
 
     pub fn sidebar(&self) -> Option<&dyn SidebarHandle> {
@@ -639,6 +641,11 @@ impl MultiWorkspace {
     }
 
     pub fn close_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The sidebar can't be closed in this fork. It only goes away when multi-workspace is
+        // turned off, through `collapse_to_single_workspace`.
+        if self.multi_workspace_enabled(cx) {
+            return;
+        }
         let side = match self.sidebar_side(cx) {
             SidebarSide::Left => "left",
             SidebarSide::Right => "right",
@@ -2249,7 +2256,7 @@ impl Render for MultiWorkspace {
                 .when(self.multi_workspace_enabled(cx), |this| {
                     this.on_action(cx.listener(
                         |this: &mut Self, _: &ToggleWorkspaceSidebar, window, cx| {
-                            this.cycle_sidebar_auto_hide_mode(window, cx);
+                            this.focus_sidebar(window, cx);
                         },
                     ))
                     .on_action(cx.listener(

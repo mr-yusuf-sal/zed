@@ -672,7 +672,7 @@ impl Dock {
     }
 
     fn set_open_internal(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let open = open && self.can_open();
+        let open = self.can_open() && (open || self.stays_open());
         if open != self.is_open {
             self.is_open = open;
             self.hovered_since_open = false;
@@ -688,15 +688,20 @@ impl Dock {
         }
     }
 
-    /// This fork has no left dock. The project panel is kept in it only so that `Workspace::panel`
-    /// finds it, since it is shown as a permanent tab in the center instead, and the git panel only
-    /// for the actions it backs, such as push, pull and commit.
+    /// This fork shows no right dock. The project panel is kept in it only so that
+    /// `Workspace::panel` finds it, since it is shown as a permanent tab in the center instead, and
+    /// the git panel only for the actions it backs, such as push, pull and commit.
     pub fn can_open(&self) -> bool {
-        self.position != DockPosition::Left
+        self.position != DockPosition::Right
+    }
+
+    /// The left dock holds the agent panel, which this fork keeps on screen at all times.
+    pub fn stays_open(&self) -> bool {
+        self.position == DockPosition::Left
     }
 
     pub fn supports_auto_hide(&self) -> bool {
-        self.position == DockPosition::Left && self.can_open()
+        false
     }
 
     pub fn auto_hide_mode(&self) -> AutoHideMode {
@@ -1051,7 +1056,9 @@ impl Dock {
 
         self.replay_pending_serialized_state(window, cx);
 
-        if panel.read(cx).starts_open(window, cx) {
+        if panel.read(cx).starts_open(window, cx)
+            || (self.stays_open() && self.active_panel_index.is_none())
+        {
             self.activate_panel_internal(index, window, cx);
             self.set_open_internal(true, window, cx);
         }

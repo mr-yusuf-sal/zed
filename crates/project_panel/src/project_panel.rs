@@ -76,7 +76,6 @@ use workspace::{
     SelectedEntry, SplitDirection, Workspace, WorkspaceSettings, copy_file_permalink,
     dock::{DockPosition, Panel, PanelEvent},
     focus_follows_mouse::FocusFollowsMouse as _,
-    item::Item,
     notifications::{DetachAndPromptErr, NotifyResultExt, NotifyTaskExt},
     open_file_permalink,
 };
@@ -945,8 +944,9 @@ impl ProjectPanel {
                                         path: file_path.clone(),
                                     },
                                     None,
-                                    // The opened item takes the place of the panel's tab, so
-                                    // focus has to follow it rather than stay on a hidden panel.
+                                    // The opened item takes the place of the Main tab holding the
+                                    // panel, so focus has to follow it rather than stay on a
+                                    // hidden panel.
                                     true,
                                     allow_preview,
                                     true,
@@ -1002,9 +1002,7 @@ impl ProjectPanel {
                         }
                 }
                 &Event::Activate => {
-                    if let Some(project_panel) = project_panel.upgrade() {
-                        workspace.activate_item(&project_panel, true, true, window, cx);
-                    }
+                    ProjectPanel::activate_tab(workspace, window, cx);
                 }
 
                 _ => {}
@@ -1020,20 +1018,20 @@ impl ProjectPanel {
         mut cx: AsyncWindowContext,
     ) -> Result<Entity<Self>> {
         workspace.update_in(&mut cx, |workspace, window, cx| {
-            let project_panel = ProjectPanel::new(workspace, window, cx);
-            workspace.add_permanent_item(Box::new(project_panel.clone()), window, cx);
-            project_panel
+            ProjectPanel::new(workspace, window, cx)
         })
     }
 
-    /// Shows and focuses the panel's tab in the center, where it lives instead of a dock.
-    fn activate_tab(
+    /// Shows the permanent tab in the center that holds the panel, instead of a dock, and focuses
+    /// the panel.
+    pub fn activate_tab(
         workspace: &mut Workspace,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Option<Entity<Self>> {
         let project_panel = workspace.panel::<ProjectPanel>(cx)?;
-        workspace.activate_item(&project_panel, true, true, window, cx);
+        workspace.activate_permanent_item(window, cx);
+        window.focus(&project_panel.read(cx).focus_handle, cx);
         Some(project_panel)
     }
 
@@ -8108,35 +8106,16 @@ impl EventEmitter<Event> for ProjectPanel {}
 
 impl EventEmitter<PanelEvent> for ProjectPanel {}
 
-impl Item for ProjectPanel {
-    type Event = Event;
-
-    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        "Main".into()
-    }
-
-    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
-        Some(Icon::new(IconName::FileTree))
-    }
-
-    fn show_toolbar(&self) -> bool {
-        false
-    }
-
-    fn is_permanent(&self, _cx: &App) -> bool {
-        true
-    }
-}
-
 // The panel stays registered with the workspace so that `Workspace::panel` keeps finding it, but
-// it is shown as a permanent tab in the center; the left dock it is kept in never opens.
+// it is shown inside the permanent Main tab in the center; the right dock it is kept in never
+// opens.
 impl Panel for ProjectPanel {
     fn position(&self, _: &Window, _: &App) -> DockPosition {
-        DockPosition::Left
+        DockPosition::Right
     }
 
     fn position_is_valid(&self, position: DockPosition) -> bool {
-        position == DockPosition::Left
+        position == DockPosition::Right
     }
 
     fn set_position(&mut self, position: DockPosition, _: &mut Window, cx: &mut Context<Self>) {

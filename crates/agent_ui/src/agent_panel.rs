@@ -5020,8 +5020,10 @@ impl Focusable for AgentPanel {
     }
 }
 
-fn agent_panel_dock_position(cx: &App) -> DockPosition {
-    AgentSettings::get_global(cx).dock.into()
+// This fork keeps the agent panel in the left dock, between the threads sidebar and the center,
+// whatever `agent.dock` says. That dock is never closed.
+fn agent_panel_dock_position(_cx: &App) -> DockPosition {
+    DockPosition::Left
 }
 
 pub enum AgentPanelEvent {
@@ -5059,7 +5061,7 @@ impl Panel for AgentPanel {
     }
 
     fn position_is_valid(&self, position: DockPosition) -> bool {
-        position != DockPosition::Bottom
+        position == DockPosition::Left
     }
 
     fn set_position(&mut self, position: DockPosition, _: &mut Window, cx: &mut Context<Self>) {

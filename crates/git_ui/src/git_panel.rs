@@ -9508,13 +9508,13 @@ impl Panel for GitPanel {
 
     // This fork shows no git panel: git work happens in the git graph. The panel still has to
     // exist, because fetch, pull, push, stash and the commit modal go through it, so it is kept
-    // in the left dock, which this fork never opens, whatever `git_panel.dock` says.
+    // in the right dock, which this fork never opens, whatever `git_panel.dock` says.
     fn position(&self, _: &Window, _: &App) -> DockPosition {
-        DockPosition::Left
+        DockPosition::Right
     }
 
     fn position_is_valid(&self, position: DockPosition) -> bool {
-        position == DockPosition::Left
+        position == DockPosition::Right
     }
 
     fn set_position(&mut self, position: DockPosition, _: &mut Window, cx: &mut Context<Self>) {
