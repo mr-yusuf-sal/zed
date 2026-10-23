@@ -7,13 +7,13 @@ use crate::{
     },
 };
 use breadcrumbs::Breadcrumbs;
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use db::kvp::KeyValueStore;
 use futures::{channel::oneshot, future::join_all};
 use gpui::{
     Action, Anchor, App, AsyncApp, AsyncWindowContext, Axis, Context, Entity, EntityId,
-    EventEmitter, FocusHandle, Focusable, IntoElement, ParentElement, Pixels, Render, Styled, Task,
-    TaskExt, WeakEntity, Window, actions,
+    EventEmitter, FocusHandle, Focusable, Global, IntoElement, ParentElement, Pixels, Render,
+    Styled, Task, TaskExt, WeakEntity, Window, WindowId, actions,
 };
 use itertools::Itertools;
 use project::{Fs, Project};
@@ -311,7 +311,7 @@ impl TerminalPanel {
             self.serialize(cx);
         }
         cx.notify();
-        if self.active && self.has_no_terminals(cx) {
+        if self.active && self.claim_default_shell(window, cx) {
             let working_directory = self
                 .workspace
                 .update(cx, |workspace, cx| default_working_directory(workspace, cx))
@@ -1374,6 +1374,21 @@ impl TerminalPanel {
         }
     }
 
+    /// Whether to start a shell because this panel is empty, which is only done
+    /// the first time a terminal panel is shown in a window.
+    ///
+    /// Terminals follow the project shown in the window, so after that an empty
+    /// panel means the user closed them, and a shell started here would show up
+    /// as an extra terminal on every project switch.
+    fn claim_default_shell(&self, window: &Window, cx: &mut App) -> bool {
+        let has_no_terminals = self.has_no_terminals(cx);
+        let first_in_window = cx
+            .default_global::<WindowsWithTerminalPanel>()
+            .0
+            .insert(window.window_handle().window_id());
+        first_in_window && has_no_terminals
+    }
+
     fn has_no_terminals(&self, cx: &App) -> bool {
         self.active_pane.read(cx).items_len() == 0 && self.pending_terminals_to_add == 0
     }
@@ -1479,6 +1494,11 @@ pub fn prepare_task_for_spawn(
 fn is_enabled_in_workspace(workspace: &Workspace, cx: &App) -> bool {
     workspace.project().read(cx).supports_terminal(cx)
 }
+
+#[derive(Default)]
+struct WindowsWithTerminalPanel(HashSet<WindowId>);
+
+impl Global for WindowsWithTerminalPanel {}
 
 enum TerminalLayout {
     Pane {
@@ -1995,7 +2015,7 @@ impl Panel for TerminalPanel {
         // updated, and gathering terminals reads the workspace.
         cx.defer_in(window, |this, window, cx| {
             this.take_terminals_from_other_workspaces(window, cx);
-            if this.restoring || !this.has_no_terminals(cx) {
+            if this.restoring || !this.claim_default_shell(window, cx) {
                 return;
             }
             let Ok(kind) = this
