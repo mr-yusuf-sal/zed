@@ -2133,6 +2133,8 @@ mod tests {
             username: None,
             environment: None,
             folder: None,
+            ssh: None,
+            tls: Default::default(),
         };
         let (view, cx) = cx.add_window_view({
             let driver: Arc<dyn Driver> = table.clone();

@@ -129,6 +129,8 @@ fn discovered_server(container: &Value) -> Option<DiscoveredServer> {
             username,
             environment: None,
             folder: Some("Docker".to_string()),
+            ssh: None,
+            tls: Default::default(),
         },
         password,
         container: name,

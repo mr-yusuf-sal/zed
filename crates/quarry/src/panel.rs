@@ -1811,6 +1811,18 @@ impl QuarryPanel {
                             .when_some(config.environment, |row, environment| {
                                 row.child(environment_badge(environment))
                             })
+                            .when_some(config.ssh.as_ref(), |row, ssh| {
+                                row.child(
+                                    div()
+                                        .id(("quarry-ssh", index))
+                                        .child(
+                                            Label::new("ssh")
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                        .tooltip(Tooltip::text(format!("Through {ssh}"))),
+                                )
+                            })
                             .child(
                                 Label::new(SharedString::from(config.engine.label()))
                                     .size(LabelSize::XSmall)
@@ -2052,7 +2064,9 @@ impl Render for QuarryPanel {
                             )
                             .child(match &draft.test {
                                 TestState::Untested => {
-                                    Label::new("Enter to save · a password in the URL is ignored")
+                                    Label::new(
+                                        "Enter to save · a password in the URL is ignored ·                                          options: ?ssh=user@bastion&ssh_key=path&tls=require|verify|disable",
+                                    )
                                         .size(LabelSize::XSmall)
                                         .color(Color::Muted)
                                 }

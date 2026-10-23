@@ -1,11 +1,11 @@
 use crate::driver::{
-    CatalogEntry, CellEdit, Driver, EditTarget, ObjectKind, ObjectNode, ResultSet, RowKey,
+    CatalogEntry, CellEdit, Driver, EditTarget, ObjectKind, ObjectNode, ResultSet, RowKey, TlsMode,
 };
 use anyhow::{Context as _, Result, bail};
 use futures::TryStreamExt as _;
 use sqlx::{
     Column as _, Connection as _, Either, Executor as _, Row as _, ValueRef as _,
-    postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions, PgRow},
+    postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions, PgRow, PgSslMode},
 };
 use std::{collections::HashMap, sync::Arc};
 use ui::SharedString;
@@ -58,7 +58,26 @@ impl PostgresDriver {
         username: Option<&str>,
         password: Option<&str>,
     ) -> Result<Self> {
-        let mut options = PgConnectOptions::new().host(host).port(port);
+        Self::connect_with(host, port, database, username, password, TlsMode::Default).await
+    }
+
+    pub async fn connect_with(
+        host: &str,
+        port: u16,
+        database: Option<&str>,
+        username: Option<&str>,
+        password: Option<&str>,
+        tls: TlsMode,
+    ) -> Result<Self> {
+        let mut options = PgConnectOptions::new()
+            .host(host)
+            .port(port)
+            .ssl_mode(match tls {
+                TlsMode::Default => PgSslMode::Prefer,
+                TlsMode::Disable => PgSslMode::Disable,
+                TlsMode::Require => PgSslMode::Require,
+                TlsMode::Verify => PgSslMode::VerifyFull,
+            });
         if let Some(database) = database {
             options = options.database(database);
         }

@@ -196,6 +196,107 @@ pub struct ConnectionConfig {
     /// The panel groups connections that share a folder under one heading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder: Option<String>,
+    /// A bastion the connection goes through: `host` and `port` are then as the bastion sees
+    /// them, and a local port forwarded over SSH is what the driver actually connects to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshTunnel>,
+    #[serde(default, skip_serializing_if = "TlsMode::is_default")]
+    pub tls: TlsMode,
+}
+
+/// `user@host:port` of an SSH server to tunnel through. Logging in is left to the system's
+/// `ssh`, so keys, the agent and `~/.ssh/config` all apply.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SshTunnel {
+    pub user: Option<String>,
+    pub host: String,
+    pub port: u16,
+    /// A private key to log in with instead of whatever ssh would pick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_file: Option<String>,
+}
+
+impl SshTunnel {
+    /// Reads `user@host`, `host:2222` or `user@host:2222`.
+    pub fn parse(text: &str) -> anyhow::Result<Self> {
+        let text = text.trim();
+        let (user, host_port) = match text.rsplit_once('@') {
+            Some((user, host_port)) => (Some(user.to_string()), host_port),
+            None => (None, text),
+        };
+        let (host, port) = match host_port.rsplit_once(':') {
+            Some((host, port)) => (
+                host,
+                port.parse()
+                    .map_err(|_| anyhow::anyhow!("{port:?} is not an SSH port number"))?,
+            ),
+            None => (host_port, 22),
+        };
+        if host.is_empty() {
+            anyhow::bail!("the SSH tunnel has no host; expected user@bastion:22");
+        }
+        Ok(Self {
+            user: user.filter(|user| !user.is_empty()),
+            host: host.to_string(),
+            port,
+            identity_file: None,
+        })
+    }
+}
+
+impl fmt::Display for SshTunnel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(user) = &self.user {
+            write!(f, "{user}@")?;
+        }
+        write!(f, "{}", self.host)?;
+        if self.port != 22 {
+            write!(f, ":{}", self.port)?;
+        }
+        Ok(())
+    }
+}
+
+/// Whether the connection to the server is encrypted, and whether its certificate is checked.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsMode {
+    /// What each driver did before there was a choice: Postgres encrypts when the server offers
+    /// it, SQL Server always encrypts and accepts any certificate, the others do not encrypt.
+    #[default]
+    Default,
+    Disable,
+    /// Encrypt, but accept any certificate, as a self-signed development server needs.
+    Require,
+    /// Encrypt and check the certificate against the system's trusted roots.
+    Verify,
+}
+
+impl TlsMode {
+    pub fn is_default(&self) -> bool {
+        *self == TlsMode::Default
+    }
+
+    pub fn parse(text: &str) -> anyhow::Result<Self> {
+        Ok(match text.trim().to_ascii_lowercase().as_str() {
+            "" | "default" => TlsMode::Default,
+            "disable" | "false" | "off" => TlsMode::Disable,
+            "require" | "true" | "on" => TlsMode::Require,
+            "verify" | "verify-full" => TlsMode::Verify,
+            other => {
+                anyhow::bail!("unknown tls mode {other:?}; expected disable, require or verify")
+            }
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TlsMode::Default => "default",
+            TlsMode::Disable => "disable",
+            TlsMode::Require => "require",
+            TlsMode::Verify => "verify",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
