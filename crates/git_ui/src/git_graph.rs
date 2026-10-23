@@ -1346,12 +1346,39 @@ pub fn open_or_reuse_graph(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let existing = workspace.items_of_type::<GitGraph>(cx).find(|graph| {
-        let graph = graph.read(cx);
-        graph.repo_id == repo_id && graph.log_source == log_source
-    });
+    let existing = if matches!(log_source, LogSource::Path(_)) {
+        workspace.items_of_type::<GitGraph>(cx).find(|graph| {
+            let graph = graph.read(cx);
+            graph.repo_id == repo_id && graph.log_source == log_source
+        })
+    } else {
+        // The project's graph is a single tab: narrowing it to a branch or switching its
+        // repository must not make the next open create another one.
+        let mut graphs = workspace
+            .items_of_type::<GitGraph>(cx)
+            .filter(|graph| !matches!(graph.read(cx).log_source, LogSource::Path(_)))
+            .collect::<Vec<_>>();
+        let same_repository = graphs
+            .iter()
+            .position(|graph| graph.read(cx).repo_id == repo_id);
+        match same_repository {
+            Some(index) => Some(graphs.swap_remove(index)),
+            None => graphs.into_iter().next(),
+        }
+    };
 
     let git_graph = if let Some(existing) = existing {
+        if !matches!(log_source, LogSource::Path(_)) {
+            existing.update(cx, |graph, cx| {
+                let switches_repository = graph.repo_id != repo_id;
+                graph.set_repo_id(repo_id, cx);
+                // A branch filter names a branch of the previous repository, and the commit to
+                // select may be outside the branch the graph is narrowed to.
+                if switches_repository || sha.is_some() {
+                    graph.set_log_source(log_source.clone(), cx);
+                }
+            });
+        }
         workspace.activate_item(&existing, true, true, window, cx);
         existing
     } else {
@@ -10818,6 +10845,83 @@ mod tests {
         git_graph.read_with(&*cx, |graph, _| {
             assert_eq!(graph.selected_entry_idx, Some(1));
         });
+    }
+
+    #[gpui::test]
+    async fn test_open_reuses_graph_narrowed_to_a_branch(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({ ".git": {}, "file.txt": "content" }),
+        )
+        .await;
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![Arc::new(InitialGraphCommitData {
+                sha: Oid::from_bytes(&[1; 20]).expect("valid commit SHA"),
+                parents: smallvec![],
+                ref_names: vec!["HEAD -> main".into()],
+            })],
+        );
+
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+        let repo_id = repository.read_with(&*cx, |repository, _| repository.id);
+        let git_store = project.read_with(cx, |project, _| project.git_store().clone());
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().clone());
+
+        let open = |log_source: LogSource, cx: &mut gpui::VisualTestContext| {
+            let git_store = git_store.clone();
+            workspace.update_in(cx, |workspace, window, cx| {
+                open_or_reuse_graph(workspace, repo_id, git_store, log_source, None, window, cx);
+            });
+            cx.run_until_parked();
+        };
+        let graphs = |cx: &mut gpui::VisualTestContext| {
+            workspace.read_with(&*cx, |workspace, cx| {
+                workspace.items_of_type::<GitGraph>(cx).collect::<Vec<_>>()
+            })
+        };
+
+        open(LogSource::All, cx);
+        let git_graph = graphs(cx)
+            .into_iter()
+            .next()
+            .expect("a git graph should open");
+        git_graph.update(cx, |graph, cx| {
+            graph.set_log_source(LogSource::Branch("main".into()), cx);
+        });
+        cx.run_until_parked();
+
+        open(LogSource::All, cx);
+        let open_graphs = graphs(cx);
+        assert_eq!(open_graphs.len(), 1);
+        assert_eq!(
+            open_graphs[0].read_with(&*cx, |graph, _| graph.log_source.clone()),
+            LogSource::Branch("main".into()),
+            "reopening the graph should keep its branch filter"
+        );
+
+        open(
+            LogSource::Path(RepoPath::new(&"file.txt").expect("valid repo path")),
+            cx,
+        );
+        assert_eq!(
+            graphs(cx).len(),
+            2,
+            "file history stays in a tab of its own"
+        );
     }
 
     #[gpui::test]
