@@ -833,7 +833,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
                         workspace.add_panel(panel.clone(), window, cx);
                         let weak_workspace = workspace.weak_handle();
                         let main_page =
-                            cx.new(|cx| main_page::MainPage::new(weak_workspace, panel, cx));
+                            cx.new(|cx| main_page::MainPage::new(weak_workspace, panel, window, cx));
                         workspace.add_permanent_item(Box::new(main_page), window, cx);
                     })
                     .log_err();
