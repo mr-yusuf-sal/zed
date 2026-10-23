@@ -1500,6 +1500,12 @@ impl MultiWorkspace {
         // to decide who owns the window chrome.
         self.active_workspace_id.set(workspace.entity_id());
 
+        // The docks belong to the window rather than to the project shown in it.
+        let dock_layout = old_active_workspace.read(cx).dock_layout(window, cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.adopt_dock_layout(dock_layout, window, cx);
+        });
+
         let stamp = self
             .held
             .iter()
