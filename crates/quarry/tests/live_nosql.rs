@@ -1277,3 +1277,30 @@ fn mongodb_password_with_uri_characters() {
         assert!(!collections.is_empty());
     });
 }
+
+#[test]
+#[ignore = "needs the quarry clickhouse and mongodb"]
+fn clickhouse_and_mongodb_explain() {
+    runtime().block_on(async {
+        let clickhouse = clickhouse_driver().await;
+        let plan = single(
+            clickhouse
+                .explain("SELECT count() FROM app.orders;", None, false)
+                .await
+                .expect("clickhouse explain"),
+        );
+        assert!(!plan.rows.is_empty());
+        assert!(clickhouse.explain("SELECT 1", None, true).await.is_err());
+
+        let mongo = mongo_driver().await;
+        let plan = single(
+            mongo
+                .explain("{\"find\": \"orders\", \"filter\": {\"status\": \"paid\"}}", Some("app"), true)
+                .await
+                .expect("mongodb explain"),
+        );
+        let text: Vec<&str> = plan.rows.iter().filter_map(|row| row[0].as_deref()).collect();
+        assert!(text.iter().any(|line| line.contains("queryPlanner")));
+        assert!(text.iter().any(|line| line.contains("executionStats")));
+    });
+}

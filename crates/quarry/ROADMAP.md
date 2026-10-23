@@ -1,6 +1,6 @@
 # Quarry — yapılanlar ve yapılacaklar
 
-Son güncelleme: 2026-10-22
+Son güncelleme: 2026-10-23
 
 ## Yapılanlar
 
@@ -15,18 +15,10 @@ Son güncelleme: 2026-10-22
 | `0379246180` | **Madde 4, sonuçlarda arama:** Araç çubuğundaki kutu tüm hücrelerde arıyor. Türkçe `İ`/`ı` doğru eşleşiyor. Kolon sıralama ve kolon filtresi grid'de zaten vardı. |
 | `ce8cfef` | **Madde 5'in sürücü katmanı:** `Driver::preview_page(path, limit, offset)` eklendi ve beş sürücüye uygulandı. Derleniyor, canlı testleri **çalıştırılmadı**. |
 | `5e07cac3ba` | **Hata (madde 5'in canlı testlerinde çıktı):** ClickHouse, ORDER BY olmadan tabloyu paralel okuduğu için ilk bloktan (~65.000 satır) sonra aynı OFFSET her seferinde başka satırlar döndürüyordu; önizleme artık `max_threads = 1` ile okunuyor. Postgres, shared_buffers'ın dörtte birinden büyük bir tabloyu başka bir oturum tararken onun kaldığı yerden okumaya başlıyordu; havuz bağlantıları artık `synchronize_seqscans = off` ile açılıyor. `preview_page` için beş motora canlı test eklendi. Postgres, Redis, MongoDB ve ClickHouse'ta çalıştırıldı (docker-compose seed'i elde olmadığından testlerin beklediği veri yeniden kuruldu, eski canlı testler de geçti). SQL Server testi **hiç çalıştırılmadı**. |
-| (bu commit) | **Madde 5, Load More:** Panelden açılan önizleme tablonun yolunu saklıyor. Sonuç kesildiyse durum çubuğundaki **Load More** `preview_page(path, 500, satır_sayısı)` çağırıp gelen satırları sona ekliyor. Kolonlar adla birleştiriliyor: yeni kolon sona ekleniyor, eski satırlarda NULL oluyor; `edit_target` ve düzenlenmekte olan hücre aynı hücreyi göstermeye devam ediyor. Durum çubuğu "truncated at 2000" yerine "(truncated)" yazıyor; önizleme 500'de kesildiği için bu yanlıştı. GPUI testi sahte bir sürücüyle iki sayfa ekletip doğruluyor. Uygulamanın içinde elle **denenmedi**. |
+| `ef14d14f4a` | **Madde 5, Load More:** Panelden açılan önizleme tablonun yolunu saklıyor. Sonuç kesildiyse durum çubuğundaki **Load More** `preview_page(path, 500, satır_sayısı)` çağırıp gelen satırları sona ekliyor. Kolonlar adla birleştiriliyor: yeni kolon sona ekleniyor, eski satırlarda NULL oluyor; `edit_target` ve düzenlenmekte olan hücre aynı hücreyi göstermeye devam ediyor. Durum çubuğu "truncated at 2000" yerine "(truncated)" yazıyor; önizleme 500'de kesildiği için bu yanlıştı. GPUI testi sahte bir sürücüyle iki sayfa ekletip doğruluyor. Uygulamanın içinde elle **denenmedi**. |
+| (bu commit) | **Madde 6, EXPLAIN:** Araç çubuğundaki Explain menüsü seçimin ya da imleçteki ifadenin planını grid'de gösteriyor. Postgres `EXPLAIN` / `EXPLAIN (ANALYZE, BUFFERS)`, SQL Server `SHOWPLAN_ALL` / `STATISTICS PROFILE` (ayar sonra kapatılıyor, kapatılamazsa oturum atılıyor), ClickHouse `EXPLAIN indexes = 1` (analyze yok), MongoDB `explain` komutu (girintili JSON, satır satır). Explain Analyze ifadeyi çalıştırdığı için veri değiştirebilecek ifadelerde reddediliyor. Dört motorda canlı testle doğrulandı. Redis'te menü yok. |
 
 ## Yapılacaklar
-
-### 6. EXPLAIN / sorgu planı
-- `Driver::explain(statement, database, analyze: bool) -> Result<Vec<ResultSet>>` eklenecek.
-- Postgres: `EXPLAIN` veya `EXPLAIN (ANALYZE, BUFFERS)`.
-- SQL Server: ayrı batch'lerde `SET SHOWPLAN_ALL ON` / `OFF`. Analyze için `SET STATISTICS PROFILE ON`.
-- ClickHouse: `EXPLAIN indexes = 1`.
-- MongoDB: `{"explain": <komut>, "verbosity": "queryPlanner" | "executionStats"}`.
-- Explain Analyze ifadeyi gerçekten çalıştırır. Bu yüzden yalnızca `may_write` false olduğunda sunulmalı.
-- Araç çubuğunda Explain menüsü olacak, plan grid'de satır satır gösterilecek.
 
 ### 7. Satır ekleme ve silme
 - `EditTarget`'a `insert_columns: Vec<usize>` alanı eklenecek. Yeni sürücü metotları: `insert_row(path, values)` ve `delete_row(path, key)`.

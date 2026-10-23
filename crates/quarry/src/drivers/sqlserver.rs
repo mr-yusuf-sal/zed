@@ -15,6 +15,9 @@ use ui::SharedString;
 /// The most names `catalog` hands to the editor, for the same reason as in the Postgres driver.
 const CATALOG_LIMIT: usize = 20_000;
 
+/// A plan longer than this is cut; no one reads further down one.
+const EXPLAIN_ROW_LIMIT: usize = 10_000;
+
 type TdsClient = Client<Compat<TcpStream>>;
 
 /// SQL Server is the one engine sqlx cannot reach — MSSQL support was dropped after 0.6 — so it
@@ -307,6 +310,36 @@ async fn run_batch(
     sql: &str,
     row_limit: usize,
 ) -> Result<Batch, tiberius::error::Error> {
+    let sets = read_sets(client, sql, row_limit).await?;
+
+    let row = client
+        .simple_query("SELECT CAST(@@ROWCOUNT AS bigint), DB_NAME()")
+        .await?
+        .into_row()
+        .await?;
+    let (last_row_count, database) = match &row {
+        Some(row) => (
+            row.try_get::<i64, _>(0)?
+                .and_then(|count| u64::try_from(count).ok()),
+            row.try_get::<&str, _>(1)?.map(str::to_string),
+        ),
+        None => (None, None),
+    };
+    Ok(Batch {
+        sets,
+        last_row_count,
+        database,
+    })
+}
+
+/// Every result set one batch produces, without the row count `run_batch` reads after it. A
+/// batch under `SET SHOWPLAN_ALL ON` is described rather than run, the row count query
+/// included, so that query would come back as a plan instead of a number.
+async fn read_sets(
+    client: &mut TdsClient,
+    sql: &str,
+    row_limit: usize,
+) -> Result<Vec<ResultSet>, tiberius::error::Error> {
     let mut sets: Vec<ResultSet> = Vec::new();
     let mut stream = client.simple_query(sql).await?;
     while let Some(item) = stream.try_next().await? {
@@ -330,26 +363,7 @@ async fn run_batch(
             }
         }
     }
-    drop(stream);
-
-    let row = client
-        .simple_query("SELECT CAST(@@ROWCOUNT AS bigint), DB_NAME()")
-        .await?
-        .into_row()
-        .await?;
-    let (last_row_count, database) = match &row {
-        Some(row) => (
-            row.try_get::<i64, _>(0)?
-                .and_then(|count| u64::try_from(count).ok()),
-            row.try_get::<&str, _>(1)?.map(str::to_string),
-        ),
-        None => (None, None),
-    };
-    Ok(Batch {
-        sets,
-        last_row_count,
-        database,
-    })
+    Ok(sets)
 }
 
 /// tiberius hands back a typed `ColumnData`, so unlike the Postgres and ClickHouse drivers this
@@ -624,6 +638,50 @@ impl Driver for SqlServerDriver {
             }]);
         }
         Ok(batch.sets)
+    }
+
+    /// The estimated plan comes from SHOWPLAN_ALL, which describes the batch instead of running
+    /// it; the measured one from STATISTICS PROFILE, which runs it and adds a plan with actual
+    /// row counts after its results. Either setting is session-wide and must be switched off
+    /// again, or every later query on the session would be affected, so a session that cannot
+    /// be switched back is discarded.
+    async fn explain(
+        &self,
+        statement: &str,
+        database: Option<&str>,
+        analyze: bool,
+    ) -> Result<Vec<ResultSet>> {
+        let setting = if analyze {
+            "STATISTICS PROFILE"
+        } else {
+            "SHOWPLAN_ALL"
+        };
+        let database = database.unwrap_or(&self.default_database);
+        let mut guard = self.session(&self.query, Some(database)).await?;
+        let switched_on =
+            simple_command(&mut guard.connection()?.client, format!("SET {setting} ON")).await;
+        guard.settle(&switched_on);
+        switched_on.with_context(|| format!("turning {setting} on"))?;
+
+        let sets = read_sets(
+            &mut guard.connection()?.client,
+            statement,
+            EXPLAIN_ROW_LIMIT,
+        )
+        .await;
+        let switched_off = simple_command(
+            &mut guard.connection()?.client,
+            format!("SET {setting} OFF"),
+        )
+        .await;
+        guard.settle(&switched_off);
+        if let Err(error) = &sets
+            && !matches!(error, tiberius::error::Error::Server(error) if error.class() < 20)
+        {
+            guard.finished = false;
+        }
+        switched_off.with_context(|| format!("turning {setting} off"))?;
+        sets.with_context(|| format!("explaining: {}", statement.trim()))
     }
 
     async fn preview_page(
