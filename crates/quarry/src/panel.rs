@@ -1148,8 +1148,14 @@ impl QuarryPanel {
                 cx,
             )
         });
-        workspace.update(cx, |workspace, cx| {
-            workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+        // Quarry is itself a tab, usually the active one, and adding an item deactivates the
+        // active item by updating it. Doing that while this view is mid-update panics, so the
+        // tab goes into the pane once this update is over.
+        let item = view.clone();
+        window.defer(cx, move |window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+            });
         });
         Some(view)
     }
@@ -1173,9 +1179,8 @@ impl QuarryPanel {
             Some(database) => format!("{name} · {database}"),
             None => name,
         };
-        if let Some(view) = self.open_tab(index, database, title.into(), None, window, cx) {
-            view.focus_handle(cx).focus(window, cx);
-        }
+        // Adding the tab focuses it.
+        self.open_tab(index, database, title.into(), None, window, cx);
     }
 
     /// Opens a tab showing the first page of a table, collection or key, which is what
