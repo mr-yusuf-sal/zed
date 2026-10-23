@@ -1402,7 +1402,31 @@ impl ExternalAgentServer for LocalRegistryNpxAgent {
 
             let (package_name, package_spec) = bounded_npm_package_spec(&package);
             let node_modules_dir = install_dir.join("node_modules");
-            install_npx_package(&node_runtime, &install_dir, &package_spec).await?;
+            let registry_version = package
+                .rsplit_once('@')
+                .and_then(|(_, version)| Version::parse(version).ok());
+            let installed_version = node_runtime::read_package_installed_version(
+                node_modules_dir.clone(),
+                package_name,
+            )
+            .await
+            .log_err()
+            .flatten();
+            // `npm install` needs the network even when the package is already
+            // installed, and offline it retries for about a minute and a half
+            // before failing, so starting the agent without network access
+            // would hang and then fail although the agent is right there.
+            if registry_version.is_none() || installed_version != registry_version {
+                let install = install_npx_package(&node_runtime, &install_dir, &package_spec).await;
+                match (install, &installed_version) {
+                    (Ok(()), _) => {}
+                    (Err(error), Some(installed_version)) => log::warn!(
+                        "installing {package_spec} failed, starting the installed \
+                         {package_name}@{installed_version} instead: {error:#}"
+                    ),
+                    (Err(error), None) => return Err(error),
+                }
+            }
             if let Some(incomplete_package_dir) =
                 find_incomplete_npm_package(fs.as_ref(), &node_modules_dir).await?
             {
