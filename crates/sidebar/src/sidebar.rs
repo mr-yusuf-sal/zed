@@ -69,7 +69,8 @@ use workspace::{
     CloseWindow, FocusWorkspaceSidebar, MoveProjectDown, MoveProjectUp, MultiWorkspace,
     MultiWorkspaceEvent, NextProject, NextThread, Open, OpenMode, PreviousProject, PreviousThread,
     ProjectGroupKey, RemovalIntent, SaveIntent, Sidebar as WorkspaceSidebar, SidebarSide, Toast,
-    ToggleWorkspaceSidebar, Workspace, notifications::NotificationId, sidebar_side_context_menu,
+    ToggleWorkspaceSidebar, Workspace, dock::AutoHideMode, notifications::NotificationId,
+    sidebar_side_context_menu,
 };
 
 use git_ui_core::worktree_service::{RemoteBranchName, worktree_create_targets};
@@ -7538,25 +7539,27 @@ impl Sidebar {
     }
 
     fn render_sidebar_pin_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let is_pinned = self
+        let mode = self
             .multi_workspace
             .upgrade()
-            .is_some_and(|multi_workspace| multi_workspace.read(cx).sidebar_pinned());
-        let tooltip = if is_pinned {
-            "Unpin Sidebar (Auto-Hide)"
-        } else {
-            "Pin Sidebar"
-        };
+            .map(|multi_workspace| multi_workspace.read(cx).sidebar_auto_hide_mode())
+            .unwrap_or_default();
+        let tooltip: SharedString = format!(
+            "Sidebar: {} (click for {})",
+            mode.label(),
+            mode.next().label()
+        )
+        .into();
 
-        IconButton::new("sidebar-pin", IconName::Pin)
+        IconButton::new(("sidebar-auto-hide-mode", mode as u64), mode.icon())
             .icon_size(IconSize::Small)
-            .toggle_state(is_pinned)
-            .aria_label(tooltip)
+            .toggle_state(mode == AutoHideMode::Pinned)
+            .aria_label(tooltip.clone())
             .tooltip(Tooltip::text(tooltip))
-            .on_click(cx.listener(|this, _, _, cx| {
+            .on_click(cx.listener(|this, _, window, cx| {
                 if let Some(multi_workspace) = this.multi_workspace.upgrade() {
                     multi_workspace.update(cx, |multi_workspace, cx| {
-                        multi_workspace.toggle_sidebar_pinned(cx);
+                        multi_workspace.cycle_sidebar_auto_hide_mode(window, cx);
                     });
                 }
                 cx.notify();

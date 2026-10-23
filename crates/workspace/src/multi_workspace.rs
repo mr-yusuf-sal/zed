@@ -26,7 +26,7 @@ use ui::{ContextMenu, right_click_menu};
 const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.0);
 const SIDEBAR_PINNED_KEY: &str = "sidebar_pinned";
 
-use crate::dock::{AUTO_HIDE_DELAY, AUTO_HIDE_REVEAL_EDGE};
+use crate::dock::{AUTO_HIDE_DELAY, AUTO_HIDE_REVEAL_EDGE, AutoHideMode};
 use crate::open_remote_project_with_existing_connection;
 use crate::{
     CloseIntent, CloseWindow, DockPosition, Event as WorkspaceEvent, Item, ModalView, OpenMode,
@@ -318,7 +318,7 @@ pub struct MultiWorkspace {
     sidebar: Option<Box<dyn SidebarHandle>>,
     sidebar_open: bool,
     sidebar_overlay: Option<AnyView>,
-    sidebar_pinned: bool,
+    sidebar_auto_hide_mode: AutoHideMode,
     // Same arming rule as `Dock`: a sidebar opened from the keyboard only auto-hides after the
     // mouse has been over it once.
     sidebar_hovered_since_open: bool,
@@ -385,11 +385,7 @@ impl MultiWorkspace {
             sidebar: None,
             sidebar_open: false,
             sidebar_overlay: None,
-            sidebar_pinned: db::kvp::KeyValueStore::global(cx)
-                .read_kvp(SIDEBAR_PINNED_KEY)
-                .log_err()
-                .flatten()
-                .is_some_and(|value| value == "true"),
+            sidebar_auto_hide_mode: AutoHideMode::load(SIDEBAR_PINNED_KEY, cx),
             sidebar_hovered_since_open: false,
             sidebar_auto_hide_task: None,
             root_bounds: None,
@@ -427,19 +423,25 @@ impl MultiWorkspace {
         self.sidebar_open
     }
 
-    pub fn sidebar_pinned(&self) -> bool {
-        self.sidebar_pinned
+    pub fn sidebar_auto_hide_mode(&self) -> AutoHideMode {
+        self.sidebar_auto_hide_mode
     }
 
-    pub fn toggle_sidebar_pinned(&mut self, cx: &mut Context<Self>) {
-        self.sidebar_pinned = !self.sidebar_pinned;
+    pub fn cycle_sidebar_auto_hide_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_auto_hide_mode = self.sidebar_auto_hide_mode.next();
         self.sidebar_auto_hide_task = None;
-        let pinned = self.sidebar_pinned;
-        let kvp = db::kvp::KeyValueStore::global(cx);
-        db::write_and_log(cx, move || async move {
-            kvp.write_kvp(SIDEBAR_PINNED_KEY.to_string(), pinned.to_string())
-                .await
-        });
+        self.sidebar_auto_hide_mode
+            .store(SIDEBAR_PINNED_KEY.to_string(), cx);
+        if self.multi_workspace_enabled(cx) {
+            match self.sidebar_auto_hide_mode {
+                AutoHideMode::Hidden if self.sidebar_open => self.close_sidebar(window, cx),
+                AutoHideMode::Pinned if !self.sidebar_open => {
+                    self.previous_focus_handle = window.focused(cx);
+                    self.apply_open_sidebar(cx);
+                }
+                _ => {}
+            }
+        }
         cx.notify();
     }
 
@@ -464,7 +466,8 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.sidebar_pinned || !self.multi_workspace_enabled(cx) {
+        if self.sidebar_auto_hide_mode != AutoHideMode::Hover || !self.multi_workspace_enabled(cx)
+        {
             return;
         }
         let Some(root_bounds) = self.root_bounds else {
@@ -517,7 +520,7 @@ impl MultiWorkspace {
     fn hide_sidebar_after_mouse_left(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // The thread switcher overlay, a modal, or a drag out of the sidebar still needs it; the
         // next mouse move after they end re-arms the timer.
-        if self.sidebar_pinned
+        if self.sidebar_auto_hide_mode != AutoHideMode::Hover
             || !self.sidebar_open
             || cx.has_active_drag()
             || self.sidebar_overlay.is_some()
