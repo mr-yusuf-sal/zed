@@ -3,17 +3,18 @@ use std::{cmp, path::PathBuf, process::ExitStatus, sync::Arc, time::Duration};
 use crate::{
     TerminalView, default_working_directory,
     persistence::{
-        SerializedItems, SerializedTerminalPanel, deserialize_terminal_panel, serialize_pane_group,
+        SerializedItems, SerializedTerminalPanel, deserialize_terminal_panel, end_hosted_sessions,
+        serialize_pane_group,
     },
 };
 use breadcrumbs::Breadcrumbs;
-use collections::{HashMap, HashSet};
+use collections::HashMap;
 use db::kvp::KeyValueStore;
 use futures::{channel::oneshot, future::join_all};
 use gpui::{
     Action, Anchor, App, AsyncApp, AsyncWindowContext, Axis, Context, Entity, EntityId,
-    EventEmitter, FocusHandle, Focusable, Global, IntoElement, ParentElement, Pixels, Render,
-    Styled, Task, TaskExt, WeakEntity, Window, WindowId, actions,
+    EventEmitter, FocusHandle, Focusable, IntoElement, ParentElement, Pixels, Render, Styled, Task,
+    TaskExt, WeakEntity, Window, actions,
 };
 use itertools::Itertools;
 use project::{Fs, Project};
@@ -311,7 +312,7 @@ impl TerminalPanel {
             self.serialize(cx);
         }
         cx.notify();
-        if self.active && self.claim_default_shell(window, cx) {
+        if self.active && self.should_start_default_shell(cx) {
             let working_directory = self
                 .workspace
                 .update(cx, |workspace, cx| default_working_directory(workspace, cx))
@@ -354,26 +355,44 @@ impl TerminalPanel {
                 .log_err()
                 .flatten()
         {
-            let started_at = std::time::Instant::now();
-            let deserialized = workspace
-                .update_in(cx, |workspace, window, cx| {
-                    deserialize_terminal_panel(
-                        workspace.weak_handle(),
-                        workspace.project().clone(),
-                        database_id,
-                        serialized_panel,
-                        terminal_panel.clone(),
-                        window,
-                        cx,
-                    )
-                })?
-                .await;
-            if let Some(restored_terminals) = deserialized.log_err() {
-                restored = restored_terminals > 0;
-                log::debug!(
-                    "terminal panel: restored {restored_terminals} serialized terminal(s) in {:?}",
-                    started_at.elapsed()
-                );
+            let terminals_open_elsewhere = terminal_panel
+                .read_with(cx, |terminal_panel, cx| {
+                    terminal_panel.terminals_open_elsewhere(cx)
+                })
+                .unwrap_or(false);
+            if terminals_open_elsewhere {
+                // This project was opened after the window's terminals, which
+                // follow whichever project is shown, so the terminals it saved
+                // in an earlier session are not shown next to them. Their shells
+                // are ended so they don't keep running unreachable in a host;
+                // the cleanup below drops their rows.
+                let project =
+                    workspace.read_with(cx, |workspace, _| workspace.project().clone())?;
+                end_hosted_sessions(serialized_panel.item_ids(), database_id, project, cx).await;
+                // Lets `finish_restoration` overwrite the saved layout.
+                restored = true;
+            } else {
+                let started_at = std::time::Instant::now();
+                let deserialized = workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        deserialize_terminal_panel(
+                            workspace.weak_handle(),
+                            workspace.project().clone(),
+                            database_id,
+                            serialized_panel,
+                            terminal_panel.clone(),
+                            window,
+                            cx,
+                        )
+                    })?
+                    .await;
+                if let Some(restored_terminals) = deserialized.log_err() {
+                    restored = restored_terminals > 0;
+                    log::debug!(
+                        "terminal panel: restored {restored_terminals} serialized terminal(s) in {:?}",
+                        started_at.elapsed()
+                    );
+                }
             }
         }
 
@@ -1301,28 +1320,48 @@ impl TerminalPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(workspace) = self.workspace.upgrade() else {
-            return;
-        };
-        let Some(multi_workspace) = workspace
-            .read(cx)
-            .multi_workspace()
-            .and_then(|multi_workspace| multi_workspace.upgrade())
+        let Some(WindowTerminalPanels {
+            displayed: true,
+            others,
+        }) = self.window_terminal_panels(cx)
         else {
             return;
         };
-        let multi_workspace = multi_workspace.read(cx);
-        if multi_workspace.workspace() != &workspace {
-            return;
+        for other_terminal_panel in &others {
+            self.take_terminals_from(other_terminal_panel, window, cx);
         }
-        let other_terminal_panels = multi_workspace
+    }
+
+    /// Where this panel stands among the terminal panels of its window, or
+    /// `None` when its workspace isn't part of a multi-workspace.
+    fn window_terminal_panels(&self, cx: &App) -> Option<WindowTerminalPanels> {
+        let workspace = self.workspace.upgrade()?;
+        let multi_workspace = workspace.read(cx).multi_workspace()?.upgrade()?;
+        let multi_workspace = multi_workspace.read(cx);
+        let others = multi_workspace
             .workspaces()
             .filter(|other_workspace| *other_workspace != &workspace)
             .filter_map(|other_workspace| other_workspace.read(cx).panel::<TerminalPanel>(cx))
-            .collect::<Vec<_>>();
-        for other_terminal_panel in &other_terminal_panels {
-            self.take_terminals_from(other_terminal_panel, window, cx);
-        }
+            .collect();
+        Some(WindowTerminalPanels {
+            displayed: multi_workspace.workspace() == &workspace,
+            others,
+        })
+    }
+
+    /// Whether another project in this window has terminals open. Its own saved
+    /// terminals and default shell are only wanted when none are, since the
+    /// window's terminals follow whichever project is shown.
+    fn terminals_open_elsewhere(&self, cx: &App) -> bool {
+        self.window_terminal_panels(cx)
+            .is_some_and(|panels| panels.others_have_terminals(cx))
+    }
+
+    fn has_any_terminals(&self, cx: &App) -> bool {
+        self.center
+            .panes()
+            .into_iter()
+            .any(|pane| pane.read(cx).items_len() > 0)
     }
 
     fn build_terminal_layout(
@@ -1374,19 +1413,14 @@ impl TerminalPanel {
         }
     }
 
-    /// Whether to start a shell because this panel is empty, which is only done
-    /// the first time a terminal panel is shown in a window.
-    ///
-    /// Terminals follow the project shown in the window, so after that an empty
-    /// panel means the user closed them, and a shell started here would show up
-    /// as an extra terminal on every project switch.
-    fn claim_default_shell(&self, window: &Window, cx: &mut App) -> bool {
-        let has_no_terminals = self.has_no_terminals(cx);
-        let first_in_window = cx
-            .default_global::<WindowsWithTerminalPanel>()
-            .0
-            .insert(window.window_handle().window_id());
-        first_in_window && has_no_terminals
+    /// Whether to start a shell because this panel is empty: only when the
+    /// window has no terminals open at all, and only in the panel on screen, so
+    /// switching projects never adds one next to the terminals that came along.
+    fn should_start_default_shell(&self, cx: &App) -> bool {
+        self.has_no_terminals(cx)
+            && self
+                .window_terminal_panels(cx)
+                .is_none_or(|panels| panels.displayed && !panels.others_have_terminals(cx))
     }
 
     fn has_no_terminals(&self, cx: &App) -> bool {
@@ -1495,10 +1529,18 @@ fn is_enabled_in_workspace(workspace: &Workspace, cx: &App) -> bool {
     workspace.project().read(cx).supports_terminal(cx)
 }
 
-#[derive(Default)]
-struct WindowsWithTerminalPanel(HashSet<WindowId>);
+struct WindowTerminalPanels {
+    displayed: bool,
+    others: Vec<Entity<TerminalPanel>>,
+}
 
-impl Global for WindowsWithTerminalPanel {}
+impl WindowTerminalPanels {
+    fn others_have_terminals(&self, cx: &App) -> bool {
+        self.others
+            .iter()
+            .any(|panel| panel.read(cx).has_any_terminals(cx))
+    }
+}
 
 enum TerminalLayout {
     Pane {
@@ -2015,7 +2057,7 @@ impl Panel for TerminalPanel {
         // updated, and gathering terminals reads the workspace.
         cx.defer_in(window, |this, window, cx| {
             this.take_terminals_from_other_workspaces(window, cx);
-            if this.restoring || !this.claim_default_shell(window, cx) {
+            if this.restoring || !this.should_start_default_shell(cx) {
                 return;
             }
             let Ok(kind) = this
