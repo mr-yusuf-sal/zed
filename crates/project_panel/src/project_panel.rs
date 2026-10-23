@@ -617,6 +617,9 @@ pub enum Event {
         entry_id: ProjectEntryId,
         focus_opened_item: bool,
         allow_preview: bool,
+        /// Opens the entry in a tab that is neither activated nor focused, leaving the Main tab
+        /// holding the panel on screen.
+        in_background: bool,
     },
     SplitEntry {
         entry_id: ProjectEntryId,
@@ -929,6 +932,7 @@ impl ProjectPanel {
                     entry_id,
                     focus_opened_item: _,
                     allow_preview,
+                    in_background,
                 } => {
                     if let Some(worktree) = project.read(cx).worktree_for_entry(entry_id, cx)
                         && let Some(entry) = worktree.read(cx).entry_for_id(entry_id) {
@@ -944,12 +948,12 @@ impl ProjectPanel {
                                         path: file_path.clone(),
                                     },
                                     None,
-                                    // The opened item takes the place of the Main tab holding the
+                                    // An opened item takes the place of the Main tab holding the
                                     // panel, so focus has to follow it rather than stay on a
                                     // hidden panel.
-                                    true,
+                                    !in_background,
                                     allow_preview,
-                                    true,
+                                    !in_background,
                                     window, cx,
                                 )
                                 .detach_and_prompt_err("Failed to open file", window, cx, move |e, _, _| {
@@ -2417,6 +2421,16 @@ impl ProjectPanel {
             entry_id,
             focus_opened_item,
             allow_preview,
+            in_background: false,
+        });
+    }
+
+    fn open_entry_in_background(&mut self, entry_id: ProjectEntryId, cx: &mut Context<Self>) {
+        cx.emit(Event::OpenedEntry {
+            entry_id,
+            focus_opened_item: false,
+            allow_preview: false,
+            in_background: true,
         });
     }
 
@@ -6473,13 +6487,17 @@ impl ProjectPanel {
                         } else {
                             project_panel.toggle_expanded(entry_id, window, cx);
                         }
-                    } else {
+                    } else if event.click_count() > 1 || project_panel.selection == Some(selection) {
+                        // Opening a file covers the Main tab holding the panel, so a first click
+                        // only selects it and a click on the selected file (a double click is
+                        // one too) opens it.
                         let preview_tabs_enabled =
                             PreviewTabsSettings::get_global(cx).enable_preview_from_project_panel;
-                        let click_count = event.click_count();
-                        let focus_opened_item = click_count > 1;
-                        let allow_preview = preview_tabs_enabled && click_count == 1;
-                        project_panel.open_entry(entry_id, focus_opened_item, allow_preview, cx);
+                        project_panel.open_entry(entry_id, true, preview_tabs_enabled, cx);
+                    } else {
+                        project_panel.marked_entries.clear();
+                        project_panel.selection = Some(selection);
+                        cx.notify();
                     }
                 }),
             )
@@ -6489,7 +6507,7 @@ impl ProjectPanel {
                         return;
                     }
 
-                    project_panel.open_entry(entry_id, true, false, cx);
+                    project_panel.open_entry_in_background(entry_id, cx);
                     cx.stop_propagation();
                 }),
             )

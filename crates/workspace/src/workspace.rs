@@ -2983,19 +2983,22 @@ impl Workspace {
 
     /// Shows the first permanent item in the center without moving focus to it.
     pub fn activate_permanent_item(&mut self, window: &mut Window, cx: &mut App) -> bool {
-        let found = self.panes.iter().find_map(|pane| {
-            pane.read(cx)
-                .items()
-                .position(|item| item.is_permanent(cx))
-                .map(|index| (pane.clone(), index))
-        });
-        let Some((pane, index)) = found else {
+        let Some((pane, index)) = self.permanent_item_position(cx) else {
             return false;
         };
         pane.update(cx, |pane, cx| {
             pane.activate_item(index, true, false, window, cx);
         });
         true
+    }
+
+    fn permanent_item_position(&self, cx: &App) -> Option<(Entity<Pane>, usize)> {
+        self.panes.iter().find_map(|pane| {
+            pane.read(cx)
+                .items()
+                .position(|item| item.is_permanent(cx))
+                .map(|index| (pane.clone(), index))
+        })
     }
 
     pub fn remove_panel<T: Panel>(
@@ -3431,7 +3434,27 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Task<Result<()>> {
+        if let Some(pane) = pane.upgrade()
+            && !pane.read(cx).can_navigate_backward()
+        {
+            self.go_back_to_permanent_item(window, cx);
+            return Task::ready(Ok(()));
+        }
         self.navigate_history(pane, NavigationMode::GoingBack, window, cx)
+    }
+
+    /// With nothing left to go back to, Go Back lands on the permanent item. The item it leaves
+    /// is recorded the way a step back records it, so Go Forward returns to it instead of Go
+    /// Back bouncing between the two.
+    fn go_back_to_permanent_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((pane, index)) = self.permanent_item_position(cx) else {
+            return;
+        };
+        pane.update(cx, |pane, cx| {
+            pane.nav_history_mut().set_mode(NavigationMode::GoingBack);
+            pane.activate_item(index, true, true, window, cx);
+            pane.nav_history_mut().set_mode(NavigationMode::Normal);
+        });
     }
 
     pub fn go_forward(
