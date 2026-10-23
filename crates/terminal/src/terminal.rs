@@ -2,6 +2,7 @@ mod mappings;
 
 mod alacritty;
 mod pty_info;
+pub mod terminal_host;
 pub mod terminal_settings;
 
 #[cfg(not(windows))]
@@ -29,6 +30,7 @@ use pty_info::{ProcessIdGetter, PtyProcessInfo};
 use serde::{Deserialize, Serialize};
 use settings::Settings;
 use task::{HideStrategy, Shell, ShellKind, SpawnInTerminal};
+use terminal_host::{HostedPty, ScreenSize};
 use terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape, TerminalSettings};
 use theme::{ActiveTheme, Theme};
 use urlencoding;
@@ -760,6 +762,9 @@ impl fmt::Debug for TerminalBackendEvent {
 
 enum PtyEvent {
     Event(TerminalBackendEvent, u64),
+    /// A terminal host replayed its screen, which left the emulator at the
+    /// size the host's screen had.
+    HostAttached(ScreenSize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1096,6 +1101,75 @@ impl TerminalBuilder {
         working_directory: Option<PathBuf>,
         mode: TerminalMode,
         shell: Shell,
+        env: HashMap<String, String>,
+        cursor_shape: SettingsCursorShape,
+        alternate_scroll: AlternateScroll,
+        max_scroll_history_lines: Option<usize>,
+        path_hyperlink_regexes: Vec<String>,
+        path_hyperlink_timeout: Duration,
+        is_remote_terminal: bool,
+        window_id: u64,
+        cx: &App,
+        activation_script: Vec<String>,
+        path_style: PathStyle,
+    ) -> Task<Result<TerminalBuilder>> {
+        Self::new_internal(
+            working_directory,
+            mode,
+            shell,
+            env,
+            cursor_shape,
+            alternate_scroll,
+            max_scroll_history_lines,
+            path_hyperlink_regexes,
+            path_hyperlink_timeout,
+            is_remote_terminal,
+            window_id,
+            cx,
+            activation_script,
+            path_style,
+            None,
+        )
+    }
+
+    /// Connects to the terminal host running `session_id`, showing the shell
+    /// it kept running while Zed was closed. Fails when that host is gone.
+    pub fn attach_hosted(
+        session_id: String,
+        shell: Shell,
+        env: HashMap<String, String>,
+        cursor_shape: SettingsCursorShape,
+        alternate_scroll: AlternateScroll,
+        max_scroll_history_lines: Option<usize>,
+        path_hyperlink_regexes: Vec<String>,
+        path_hyperlink_timeout: Duration,
+        window_id: u64,
+        cx: &App,
+        path_style: PathStyle,
+    ) -> Task<Result<TerminalBuilder>> {
+        Self::new_internal(
+            None,
+            TerminalMode::interactive(),
+            shell,
+            env,
+            cursor_shape,
+            alternate_scroll,
+            max_scroll_history_lines,
+            path_hyperlink_regexes,
+            path_hyperlink_timeout,
+            false,
+            window_id,
+            cx,
+            Vec::new(),
+            path_style,
+            Some(session_id),
+        )
+    }
+
+    fn new_internal(
+        working_directory: Option<PathBuf>,
+        mode: TerminalMode,
+        shell: Shell,
         mut env: HashMap<String, String>,
         cursor_shape: SettingsCursorShape,
         alternate_scroll: AlternateScroll,
@@ -1107,6 +1181,7 @@ impl TerminalBuilder {
         cx: &App,
         activation_script: Vec<String>,
         path_style: PathStyle,
+        host_session: Option<String>,
     ) -> Task<Result<TerminalBuilder>> {
         let version = release_channel::AppVersion::global(cx);
         let background_executor = cx.background_executor().clone();
@@ -1232,10 +1307,57 @@ impl TerminalBuilder {
                 0,
             );
 
+            // Only interactive shells are hosted: a task's terminal is meant to
+            // end with its command, and its completion is awaited in this
+            // process.
+            let host_connection = match host_session {
+                Some(session_id) => {
+                    Some(terminal_host::connect(terminal_host::Session::Attach(session_id)).await?)
+                }
+                None if terminal_host::is_enabled()
+                    && !no_pty
+                    && !is_remote_terminal
+                    && task.is_none()
+                    && completion_tx.is_none() =>
+                {
+                    let request = terminal_host::SpawnRequest {
+                        program: shell_params.as_ref().map(|params| params.program.clone()),
+                        args: shell_params
+                            .as_ref()
+                            .and_then(|params| params.args.clone())
+                            .unwrap_or_default(),
+                        env: env
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value.clone()))
+                            .collect(),
+                        working_directory: working_directory.clone(),
+                        escape_args: shell_kind.tty_escape_args(),
+                        scrolling_history,
+                        size: ScreenSize::from_bounds(TerminalBounds::default()),
+                    };
+                    // A shell running in Zed is better than none.
+                    terminal_host::connect(terminal_host::Session::Spawn(request))
+                        .await
+                        .log_err()
+                }
+                None => None,
+            };
+
             // When `no_pty` is set (headless hosts), run the task as a plain
             // subprocess and pump its piped output into the same emulator the
             // PTY path would feed.
-            let (terminal_type, subprocess) = if no_pty {
+            let (terminal_type, subprocess) = if let Some(connection) = host_connection {
+                let pid_getter = ProcessIdGetter::for_hosted_process(connection.pid);
+                let hosted =
+                    HostedPty::start(connection, term.clone(), events_tx, &background_executor);
+                (
+                    TerminalType::Pty {
+                        resources: PtyResources::Active(PtySender::Hosted(hosted)),
+                        info: Arc::new(PtyProcessInfo::new(pid_getter)),
+                    },
+                    None,
+                )
+            } else if no_pty {
                 let (program, args) = match &shell_params {
                     Some(params) => (
                         params.program.clone(),
@@ -1643,6 +1765,15 @@ impl Terminal {
                 if self.output_events_tx.is_none() || generation == self.output_generation {
                     self.process_event(event, cx);
                 }
+            }
+            PtyEvent::HostAttached(size) => {
+                // Until the terminal has been laid out its bounds are the
+                // default ones, and its first layout resizes it anyway.
+                let bounds = self.last_content.terminal_bounds;
+                if bounds != TerminalBounds::default() && ScreenSize::from_bounds(bounds) != size {
+                    self.events.push_back(InternalEvent::Resize(bounds));
+                }
+                cx.emit(Event::Wakeup);
             }
         }
     }
@@ -3169,6 +3300,10 @@ impl Terminal {
         self.output_processor = None;
 
         pty_tx.shutdown();
+        // The host keeps the shell running for the next Zed to attach to.
+        if pty_tx.hosted().is_some() {
+            return;
+        }
         info.terminate_child_process();
 
         let timer = self.background_executor.timer(Duration::from_millis(100));
@@ -3178,6 +3313,31 @@ impl Terminal {
                 info.kill_child_process();
             })
             .detach();
+    }
+
+    /// The terminal host session this terminal's shell runs in, if it runs in
+    /// one.
+    pub fn hosted_session_id(&self) -> Option<&str> {
+        match &self.terminal_type {
+            TerminalType::Pty {
+                resources: PtyResources::Active(pty_tx),
+                ..
+            } => pty_tx.hosted().map(HostedPty::session_id),
+            _ => None,
+        }
+    }
+
+    /// Ends a hosted shell. Dropping the terminal only disconnects from its
+    /// host, which keeps the shell running for Zed to attach to again.
+    pub fn kill_hosted_session(&self) {
+        if let TerminalType::Pty {
+            resources: PtyResources::Active(pty_tx),
+            ..
+        } = &self.terminal_type
+            && let Some(hosted) = pty_tx.hosted()
+        {
+            hosted.kill();
+        }
     }
 
     pub fn pid(&self) -> Option<sysinfo::Pid> {

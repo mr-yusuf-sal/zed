@@ -1545,6 +1545,20 @@ impl Render for TerminalView {
 impl Item for TerminalView {
     type Event = ItemEvent;
 
+    fn on_removed(&self, cx: &mut Context<Self>) {
+        // Moving a terminal to another pane or workspace also removes it from
+        // its pane first, so its hosted shell is only ended if the view is
+        // gone once the move would have completed. Quitting Zed drops views
+        // without removing them, which leaves the shell to its host.
+        let terminal = self.terminal.clone();
+        let view = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            if view.upgrade().is_none() {
+                terminal.read(cx).kill_hosted_session();
+            }
+        });
+    }
+
     fn tab_tooltip_content(&self, cx: &App) -> Option<TabTooltipContent> {
         Some(TabTooltipContent::Custom(Box::new(Tooltip::element({
             let terminal = self.terminal().read(cx);
@@ -1999,6 +2013,7 @@ impl SerializableItem for TerminalView {
 
         let workspace_id = self.workspace_id?;
         let cwd = terminal.working_directory();
+        let host_session = terminal.hosted_session_id().map(ToOwned::to_owned);
         let custom_title = self.custom_title.clone();
         self.needs_serialize = false;
 
@@ -2009,6 +2024,8 @@ impl SerializableItem for TerminalView {
                     .await?;
             }
             db.save_custom_title(item_id, workspace_id, custom_title)
+                .await?;
+            db.save_host_session(item_id, workspace_id, host_session)
                 .await?;
             Ok(())
         }))
@@ -2027,7 +2044,7 @@ impl SerializableItem for TerminalView {
         cx: &mut App,
     ) -> Task<anyhow::Result<Entity<Self>>> {
         window.spawn(cx, async move |cx| {
-            let (cwd, custom_title) = cx
+            let (cwd, custom_title, host_session) = cx
                 .update(|_window, cx| {
                     let db = TerminalDb::global(cx);
                     let from_db = db
@@ -2049,14 +2066,33 @@ impl SerializableItem for TerminalView {
                         .log_err()
                         .flatten()
                         .filter(|title| !title.trim().is_empty());
-                    (cwd, custom_title)
+                    let host_session = db
+                        .get_host_session(item_id, workspace_id)
+                        .log_err()
+                        .flatten();
+                    (cwd, custom_title, host_session)
                 })
                 .ok()
-                .unwrap_or((None, None));
+                .unwrap_or((None, None, None));
 
-            let terminal = project
-                .update(cx, |project, cx| project.create_terminal_shell(cwd, cx))
-                .await?;
+            let attached = match host_session {
+                Some(session_id) => project
+                    .update(cx, |project, cx| {
+                        project.attach_hosted_terminal(session_id, cwd.clone(), cx)
+                    })
+                    .await
+                    .log_err(),
+                None => None,
+            };
+            // The shell exited while Zed was closed, or ran in Zed itself.
+            let terminal = match attached {
+                Some(terminal) => terminal,
+                None => {
+                    project
+                        .update(cx, |project, cx| project.create_terminal_shell(cwd, cx))
+                        .await?
+                }
+            };
             cx.update(|window, cx| {
                 cx.new(|cx| {
                     let mut view = TerminalView::new(

@@ -4,6 +4,7 @@ use std::num::NonZeroU32;
 use std::os::fd::AsRawFd;
 use std::{borrow::Cow, io, ops::RangeInclusive, path::PathBuf, sync::Arc};
 
+mod host;
 mod hyperlinks;
 
 use alacritty_terminal::{
@@ -41,9 +42,13 @@ use crate::{
     Selection, SelectionRange, SelectionSide, SelectionType, TerminalBackendEvent, TerminalBounds,
     ViMotion,
     pty_info::ProcessIdGetter,
+    terminal_host::{HostedPty, ScreenSize},
     terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape},
 };
 
+pub(crate) use host::{
+    HostClient, HostOutput, HostPty, HostPtyOptions, PtyCommand, replay_snapshot,
+};
 pub(super) use hyperlinks::{HyperlinkMatch, RegexSearches};
 
 pub(super) type AlacrittyPty = tty::Pty;
@@ -85,28 +90,48 @@ impl From<&AlacrittyPty> for ProcessIdGetter {
     }
 }
 
-pub(super) struct PtySender {
-    notifier: Notifier,
+pub(super) enum PtySender {
+    Local(Notifier),
+    /// The PTY belongs to a terminal host process (see [`crate::terminal_host`]).
+    Hosted(HostedPty),
 }
 
 impl PtySender {
     pub(super) fn notify(&self, input: impl Into<Cow<'static, [u8]>>) {
-        self.notifier.notify(input);
-    }
-
-    pub(super) fn resize(&self, bounds: TerminalBounds) {
-        if let Err(error) = self
-            .notifier
-            .0
-            .send(Msg::Resize(window_size_from_terminal_bounds(bounds)))
-        {
-            log::error!("failed to resize alacritty pty: {error}");
+        match self {
+            Self::Local(notifier) => notifier.notify(input),
+            Self::Hosted(hosted) => hosted.write(&input.into()),
         }
     }
 
+    pub(super) fn resize(&self, bounds: TerminalBounds) {
+        match self {
+            Self::Local(notifier) => {
+                if let Err(error) = notifier
+                    .0
+                    .send(Msg::Resize(window_size_from_terminal_bounds(bounds)))
+                {
+                    log::error!("failed to resize alacritty pty: {error}");
+                }
+            }
+            Self::Hosted(hosted) => hosted.resize(ScreenSize::from_bounds(bounds)),
+        }
+    }
+
+    /// Stops a local PTY's event loop. A hosted PTY keeps running in its host;
+    /// dropping the sender only disconnects from it.
     pub(super) fn shutdown(&self) {
-        if let Err(error) = self.notifier.0.send(Msg::Shutdown) {
+        if let Self::Local(notifier) = self
+            && let Err(error) = notifier.0.send(Msg::Shutdown)
+        {
             log::debug!("failed to shut down alacritty pty loop: {error}");
+        }
+    }
+
+    pub(super) fn hosted(&self) -> Option<&HostedPty> {
+        match self {
+            Self::Local(_) => None,
+            Self::Hosted(hosted) => Some(hosted),
         }
     }
 }
@@ -231,9 +256,7 @@ pub(super) fn spawn_event_loop(
     let pty_tx = event_loop.channel();
     let _io_thread = event_loop.spawn();
 
-    Ok(PtySender {
-        notifier: Notifier(pty_tx),
-    })
+    Ok(PtySender::Local(Notifier(pty_tx)))
 }
 
 pub(super) fn resize(term: &mut AlacrittyTerm, bounds: TerminalBounds) {
