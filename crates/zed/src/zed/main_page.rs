@@ -3,17 +3,23 @@ use std::time::Duration;
 use acp_thread::{AcpThread, AgentThreadEntry, ThreadStatus, ToolCallStatus};
 use agent_client_protocol::schema::v1 as acp;
 use agent_ui::{AgentPanel, ConversationView};
-use git::status::FileStatus;
-use git_ui::{git_status_icon, project_diff::ProjectDiff};
-use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels, Render, SharedString, Task,
-    WeakEntity, Window, WindowHandle, canvas, px,
+use askpass::AskPassDelegate;
+use editor::Editor;
+use git::{
+    repository::{CommitOptions, RepoPath},
+    status::FileStatus,
 };
-use project::{Project, ProjectPath};
+use git_ui::{git_status_icon, project_diff::ProjectDiff};
+use git_ui_core::{askpass_modal::AskPassModal, notifications::show_error_toast};
+use gpui::{
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels, PromptLevel, Render,
+    SharedString, Task, WeakEntity, Window, WindowHandle, canvas, px,
+};
+use project::{Project, ProjectPath, git_store::Repository};
 use project_panel::ProjectPanel;
 use terminal::TaskStatus;
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
-use ui::{ListItem, ListItemSpacing, prelude::*};
+use ui::{ListItem, ListItemSpacing, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{
     ItemNavHistory, MultiWorkspace, Workspace,
@@ -26,12 +32,15 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const THREE_COLUMN_MIN_WIDTH: Pixels = px(1100.);
 
 /// The permanent "Main" tab: what every agent and terminal is doing, the project's uncommitted
-/// changes and the project panel, side by side.
+/// and staged changes with a commit form, and the project panel, side by side.
 pub struct MainPage {
     workspace: WeakEntity<Workspace>,
     project_panel: Entity<ProjectPanel>,
     activity: Vec<ProjectActivity>,
     changes: Vec<RepositoryChanges>,
+    commit_title_editor: Entity<Editor>,
+    commit_description_editor: Entity<Editor>,
+    pending_commit: Option<Task<()>>,
     three_columns: bool,
     nav_history: Option<ItemNavHistory>,
     _refresh_task: Task<()>,
@@ -84,14 +93,23 @@ enum TerminalState {
 #[derive(PartialEq)]
 struct RepositoryChanges {
     name: SharedString,
-    files: Vec<ChangedFile>,
+    repository: WeakEntity<Repository>,
+    unstaged: Vec<ChangedFile>,
+    staged: Vec<ChangedFile>,
 }
 
-#[derive(PartialEq)]
+impl RepositoryChanges {
+    fn files(&self, staged: bool) -> &[ChangedFile] {
+        if staged { &self.staged } else { &self.unstaged }
+    }
+}
+
+#[derive(Clone, PartialEq)]
 struct ChangedFile {
     file_name: SharedString,
     directory: Option<SharedString>,
     status: FileStatus,
+    repo_path: RepoPath,
     project_path: Option<ProjectPath>,
 }
 
@@ -99,8 +117,19 @@ impl MainPage {
     pub fn new(
         workspace: WeakEntity<Workspace>,
         project_panel: Entity<ProjectPanel>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let commit_title_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Commit title", window, cx);
+            editor
+        });
+        let commit_description_editor = cx.new(|cx| {
+            let mut editor = Editor::auto_height(3, 8, window, cx);
+            editor.set_placeholder_text("Description (optional)", window, cx);
+            editor
+        });
         let refresh_task = cx.spawn(async move |this, cx| {
             while this.update(cx, |this, cx| this.refresh(cx)).is_ok() {
                 cx.background_executor().timer(REFRESH_INTERVAL).await;
@@ -111,6 +140,9 @@ impl MainPage {
             project_panel,
             activity: Vec::new(),
             changes: Vec::new(),
+            commit_title_editor,
+            commit_description_editor,
+            pending_commit: None,
             three_columns: false,
             nav_history: None,
             _refresh_task: refresh_task,
@@ -154,39 +186,67 @@ impl MainPage {
             .into_any_element()
     }
 
-    fn render_changes(&self) -> AnyElement {
+    fn render_changes(&self, staged: bool, cx: &mut Context<Self>) -> AnyElement {
         if self.changes.is_empty() {
             return render_placeholder("This project has no git repository.");
         }
-        if self.changes.iter().all(|repository| repository.files.is_empty()) {
-            return render_placeholder("No uncommitted changes.");
+        if self
+            .changes
+            .iter()
+            .all(|repository| repository.files(staged).is_empty())
+        {
+            return render_placeholder(if staged {
+                "No staged changes."
+            } else {
+                "No uncommitted changes."
+            });
         }
 
         let mut row_index = 0;
-        v_flex()
-            .gap_2()
-            .children(
-                self.changes
-                    .iter()
-                    .filter(|repository| !repository.files.is_empty())
-                    .map(|repository| {
-                        v_flex()
-                            .child(render_group_header(
-                                format!("{} ({})", repository.name, repository.files.len()).into(),
-                            ))
-                            .children(repository.files.iter().map(|file| {
-                                row_index += 1;
-                                self.render_changed_file(row_index, file)
-                            }))
-                    }),
-            )
-            .into_any_element()
+        let mut repositories = Vec::new();
+        for (repository_index, repository) in self.changes.iter().enumerate() {
+            let files = repository.files(staged);
+            if files.is_empty() {
+                continue;
+            }
+            let mut rows = Vec::new();
+            for file in files {
+                row_index += 1;
+                rows.push(self.render_changed_file(row_index, staged, repository, file, cx));
+            }
+            repositories.push(
+                v_flex()
+                    .child(render_repository_header(
+                        repository_index,
+                        staged,
+                        repository,
+                        files,
+                        cx,
+                    ))
+                    .children(rows),
+            );
+        }
+        v_flex().gap_2().children(repositories).into_any_element()
     }
 
-    fn render_changed_file(&self, row_index: usize, file: &ChangedFile) -> impl IntoElement {
+    fn render_changed_file(
+        &self,
+        row_index: usize,
+        staged: bool,
+        repository: &RepositoryChanges,
+        file: &ChangedFile,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let workspace = self.workspace.clone();
         let project_path = file.project_path.clone();
-        ListItem::new(("main-page-change", row_index))
+        let repository_handle = repository.repository.clone();
+        let repo_path = file.repo_path.clone();
+        let (id, icon, tooltip) = if staged {
+            ("main-page-staged-change", IconName::Dash, "Unstage File")
+        } else {
+            ("main-page-change", IconName::Plus, "Stage File")
+        };
+        ListItem::new((id, row_index))
             .spacing(ListItemSpacing::Dense)
             .start_slot(git_status_icon(file.status))
             .child(
@@ -199,6 +259,15 @@ impl MainPage {
                             .size(LabelSize::Small)
                             .color(Color::Muted)
                             .truncate()
+                    })),
+            )
+            .end_slot(
+                IconButton::new((id, row_index), icon)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text(tooltip))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.set_staged(&repository_handle, vec![repo_path.clone()], !staged, cx);
                     })),
             )
             .on_click(move |_, window, cx| {
@@ -220,6 +289,218 @@ impl MainPage {
                         .log_err();
                 });
             })
+            .into_any_element()
+    }
+
+    fn set_staged(
+        &mut self,
+        repository: &WeakEntity<Repository>,
+        repo_paths: Vec<RepoPath>,
+        stage: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = repository.upgrade() else {
+            return;
+        };
+        let task = repository.update(cx, |repository, cx| {
+            if stage {
+                repository.stage_entries(repo_paths, cx)
+            } else {
+                repository.unstage_entries(repo_paths, cx)
+            }
+        });
+        let workspace = self.workspace.clone();
+        cx.spawn(async move |_, cx| {
+            if let Err(error) = task.await {
+                cx.update(|cx| {
+                    if let Some(workspace) = workspace.upgrade() {
+                        let action = if stage { "add" } else { "reset" };
+                        show_error_toast(workspace, action, error, cx);
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn active_repository(&self, cx: &App) -> Option<Entity<Repository>> {
+        let workspace = self.workspace.upgrade()?;
+        workspace.read(cx).project().read(cx).active_repository(cx)
+    }
+
+    fn commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_commit.is_some() {
+            return;
+        }
+        let Some(repository) = self.active_repository(cx) else {
+            return;
+        };
+        let title = self.commit_title_editor.read(cx).text(cx);
+        let title = title.trim();
+        if title.is_empty() {
+            self.commit_title_editor.focus_handle(cx).focus(window, cx);
+            return;
+        }
+        let has_staged_changes = repository
+            .read(cx)
+            .cached_status()
+            .any(|entry| entry.status.staging().has_staged());
+        if !has_staged_changes {
+            let prompt = window.prompt(
+                PromptLevel::Warning,
+                "No staged changes to commit",
+                None,
+                &["OK"],
+                cx,
+            );
+            cx.spawn(async move |_, _| {
+                prompt.await.log_err();
+            })
+            .detach();
+            return;
+        }
+
+        let description = self.commit_description_editor.read(cx).text(cx);
+        let description = description.trim();
+        let message = if description.is_empty() {
+            title.to_string()
+        } else {
+            format!("{title}\n\n{description}")
+        };
+        let askpass = self.askpass_delegate("git commit", window, cx);
+        let commit = repository.update(cx, |repository, cx| {
+            repository.commit(message.into(), None, CommitOptions::default(), askpass, cx)
+        });
+        self.pending_commit = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = match commit.await {
+                Ok(result) => result,
+                Err(error) => Err(error.into()),
+            };
+            this.update_in(cx, |this, window, cx| {
+                this.pending_commit = None;
+                match result {
+                    Ok(()) => {
+                        this.commit_title_editor
+                            .update(cx, |editor, cx| editor.clear(window, cx));
+                        this.commit_description_editor
+                            .update(cx, |editor, cx| editor.clear(window, cx));
+                    }
+                    Err(error) => {
+                        if let Some(workspace) = this.workspace.upgrade() {
+                            show_error_toast(workspace, "commit", error, cx);
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        }));
+        cx.notify();
+    }
+
+    fn askpass_delegate(
+        &self,
+        operation: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AskPassDelegate {
+        let workspace = self.workspace.clone();
+        let window = window.window_handle();
+        AskPassDelegate::new_with_cancellation(
+            &mut cx.to_async(),
+            move |prompt, tx, cancellation, cx| {
+                window
+                    .update(cx, |_, window, cx| {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.toggle_modal(window, cx, |window, cx| {
+                                AskPassModal::new(
+                                    operation.into(),
+                                    prompt.into(),
+                                    tx,
+                                    cancellation,
+                                    window,
+                                    cx,
+                                )
+                            });
+                        })
+                    })
+                    .log_err();
+            },
+        )
+    }
+
+    fn render_commit_form(&self, cx: &mut Context<Self>) -> AnyElement {
+        let border_color = cx.theme().colors().border_variant;
+        let editor_background = cx.theme().colors().editor_background;
+        let repository = self.active_repository(cx);
+        let branch_name = repository.as_ref().and_then(|repository| {
+            repository
+                .read(cx)
+                .branch
+                .as_ref()
+                .map(|branch| SharedString::from(branch.name().to_string()))
+        });
+        let editor_container = |editor: Entity<Editor>| {
+            div()
+                .px_1p5()
+                .py_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(border_color)
+                .bg(editor_background)
+                .child(editor)
+        };
+        let committing = self.pending_commit.is_some();
+        v_flex()
+            .p_2()
+            .gap_1p5()
+            .border_t_1()
+            .border_color(border_color)
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .child(
+                        Label::new("Commit")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .children(branch_name.map(|branch_name| {
+                        Label::new(branch_name)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .truncate()
+                    })),
+            )
+            .child(editor_container(self.commit_title_editor.clone()))
+            .child(editor_container(self.commit_description_editor.clone()))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .justify_end()
+                    .child(
+                        Button::new("main-page-push", "Push")
+                            .start_icon(Icon::new(IconName::ArrowUp).size(IconSize::Small))
+                            .disabled(repository.is_none())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                // The git panel owns pushing: it picks the remote, asks for
+                                // credentials and reports the result.
+                                this.project_panel.focus_handle(cx).dispatch_action(
+                                    &git::Push,
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    )
+                    .child(
+                        Button::new("main-page-commit", "Commit")
+                            .style(ButtonStyle::Filled)
+                            .start_icon(Icon::new(IconName::Check).size(IconSize::Small))
+                            .loading(committing)
+                            .disabled(repository.is_none() || committing)
+                            .on_click(cx.listener(|this, _, window, cx| this.commit(window, cx))),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn render_section(
@@ -227,7 +508,7 @@ impl MainPage {
         title: &'static str,
         content: AnyElement,
         cx: &App,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
         v_flex()
             .size_full()
             .min_w_0()
@@ -238,11 +519,7 @@ impl MainPage {
                     .py_1()
                     .border_b_1()
                     .border_color(cx.theme().colors().border_variant)
-                    .child(
-                        Label::new(title)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
+                    .child(Label::new(title).size(LabelSize::Small).color(Color::Muted)),
             )
             .child(
                 div()
@@ -253,6 +530,7 @@ impl MainPage {
                     .overflow_y_scroll()
                     .child(content),
             )
+            .into_any_element()
     }
 }
 
@@ -270,7 +548,48 @@ fn render_group_header(name: SharedString) -> impl IntoElement {
         .child(Label::new(name).size(LabelSize::XSmall).color(Color::Muted))
 }
 
-fn render_thread_row(row_index: usize, project: &ProjectActivity, thread: &ThreadRow) -> AnyElement {
+fn render_repository_header(
+    repository_index: usize,
+    staged: bool,
+    repository: &RepositoryChanges,
+    files: &[ChangedFile],
+    cx: &mut Context<MainPage>,
+) -> AnyElement {
+    let repository_handle = repository.repository.clone();
+    let repo_paths = files
+        .iter()
+        .map(|file| file.repo_path.clone())
+        .collect::<Vec<_>>();
+    let (id, label) = if staged {
+        ("main-page-unstage-all", "Unstage All")
+    } else {
+        ("main-page-stage-all", "Stage All")
+    };
+    h_flex()
+        .pl_2()
+        .pr_1()
+        .pt_1()
+        .justify_between()
+        .child(
+            Label::new(format!("{} ({})", repository.name, files.len()))
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        )
+        .child(
+            Button::new((id, repository_index), label)
+                .label_size(LabelSize::XSmall)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_staged(&repository_handle, repo_paths.clone(), !staged, cx);
+                })),
+        )
+        .into_any_element()
+}
+
+fn render_thread_row(
+    row_index: usize,
+    project: &ProjectActivity,
+    thread: &ThreadRow,
+) -> AnyElement {
     let (icon, icon_color, state_label) = match thread.state {
         ThreadState::Running => (IconName::LoadCircle, Color::Accent, "Running"),
         ThreadState::WaitingForConfirmation => (IconName::Warning, Color::Warning, "Waiting"),
@@ -485,9 +804,7 @@ fn thread_rows(panel: &Entity<AgentPanel>, cx: &App) -> Vec<ThreadRow> {
             continue;
         }
         rows.push(ThreadRow {
-            title: root_thread
-                .title()
-                .unwrap_or_else(|| "New Thread".into()),
+            title: root_thread.title().unwrap_or_else(|| "New Thread".into()),
             state: thread_state(root_thread, view.root_thread_has_pending_tool_call(cx)),
             conversation_view: conversation_view.downgrade(),
             subagent_session: None,
@@ -609,8 +926,8 @@ fn collect_changes(project: &Entity<Project>, cx: &App) -> Vec<RepositoryChanges
 
     repositories
         .iter()
-        .map(|repository| {
-            let repository = repository.read(cx);
+        .map(|repository_handle| {
+            let repository = repository_handle.read(cx);
             let name = repository
                 .work_directory_abs_path
                 .file_name()
@@ -633,12 +950,25 @@ fn collect_changes(project: &Entity<Project>, cx: &App) -> Vec<RepositoryChanges
                         .filter(|parent| !parent.is_empty())
                         .map(SharedString::from),
                     status: entry.status,
+                    repo_path: entry.repo_path.clone(),
                     project_path: repository.repo_path_to_project_path(&entry.repo_path, cx),
                 })
+                .collect::<Vec<_>>();
+            // A partially staged file belongs to both lists.
+            let staged = files
+                .iter()
+                .filter(|file| file.status.staging().has_staged())
+                .cloned()
+                .collect();
+            let unstaged = files
+                .into_iter()
+                .filter(|file| file.status.staging().has_unstaged())
                 .collect();
             RepositoryChanges {
                 name: name.into(),
-                files,
+                repository: repository_handle.downgrade(),
+                unstaged,
+                staged,
             }
         })
         .collect()
@@ -671,12 +1001,30 @@ impl Render for MainPage {
             self.render_activity(),
             cx,
         );
-        let changes = Self::render_section(
+        let unstaged_changes = Self::render_section(
             "main-page-changes",
             "Uncommitted Changes",
-            self.render_changes(),
+            self.render_changes(false, cx),
             cx,
         );
+        let staged_changes = Self::render_section(
+            "main-page-staged-changes",
+            "Staged Changes",
+            self.render_changes(true, cx),
+            cx,
+        );
+        let changes = v_flex()
+            .size_full()
+            .child(div().flex_1().min_h_0().child(unstaged_changes))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .border_t_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(staged_changes),
+            )
+            .child(self.render_commit_form(cx));
 
         h_flex()
             .relative()
