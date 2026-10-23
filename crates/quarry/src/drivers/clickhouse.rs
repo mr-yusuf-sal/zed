@@ -1,4 +1,5 @@
 use crate::driver::{CatalogEntry, Driver, ObjectKind, ObjectNode, ResultSet, TlsMode};
+use crate::schema_diff::{ColumnShape, SchemaSnapshot, TableChange, TableShape};
 use anyhow::{Context as _, Result, bail};
 use parking_lot::Mutex;
 use std::{
@@ -578,6 +579,135 @@ impl Driver for ClickHouseDriver {
     async fn create_script(&self, path: &[SharedString]) -> Result<String> {
         let definition = self.definition(path).await?;
         Ok(format!("{definition};\n"))
+    }
+
+    fn supports_schema_compare(&self, path: &[SharedString]) -> bool {
+        path.len() == 1
+    }
+
+    /// A ClickHouse database plays the part of a schema. Views are left out: their columns
+    /// follow from their query, not from an ALTER.
+    async fn schema_snapshot(&self, path: &[SharedString]) -> Result<SchemaSnapshot> {
+        let [database] = path else {
+            bail!("expected a database, got {path:?}");
+        };
+        let result = self
+            .metadata(&format!(
+                "SELECT c.table, c.name, c.type, c.default_kind, c.default_expression
+                 FROM system.columns c
+                 JOIN system.tables t ON t.database = c.database AND t.name = c.table
+                 WHERE c.database = {} AND t.engine NOT LIKE '%View'
+                 ORDER BY c.table, c.position",
+                quote_literal(database)
+            ))
+            .await?;
+        let mut snapshot = SchemaSnapshot::default();
+        for row in result.rows {
+            let mut values = row.into_iter();
+            let (Some(table), Some(name), Some(data_type)) = (
+                values.next().flatten(),
+                values.next().flatten(),
+                values.next().flatten(),
+            ) else {
+                continue;
+            };
+            let kind = values.next().flatten().unwrap_or_default();
+            let expression = values.next().flatten().filter(|text| !text.is_empty());
+            let (default, extra) = match (kind.as_ref(), expression) {
+                ("DEFAULT", Some(expression)) => (Some(expression.to_string()), None),
+                (kind @ ("MATERIALIZED" | "ALIAS" | "EPHEMERAL"), expression) => (
+                    None,
+                    Some(match expression {
+                        Some(expression) => format!("{kind} {expression}"),
+                        None => kind.to_string(),
+                    }),
+                ),
+                _ => (None, None),
+            };
+            let column = ColumnShape {
+                name: name.to_string(),
+                nullable: data_type.starts_with("Nullable("),
+                data_type: data_type.to_string(),
+                default,
+                extra,
+            };
+            match snapshot.tables.last_mut() {
+                Some(last) if last.name == table.as_ref() => last.columns.push(column),
+                _ => snapshot.tables.push(TableShape {
+                    name: table.to_string(),
+                    columns: vec![column],
+                }),
+            }
+        }
+        Ok(snapshot)
+    }
+
+    /// Nullability is part of a ClickHouse type, so a type change covers it too.
+    fn alter_table(&self, schema: &[SharedString], change: &TableChange) -> Vec<String> {
+        let Some(database) = schema.first() else {
+            return Vec::new();
+        };
+        let table = format!("{}.{}", quote_ident(database), quote_ident(&change.table));
+        let definition = |column: &ColumnShape| {
+            let mut definition = format!("{} {}", quote_ident(&column.name), column.data_type);
+            if let Some(default) = &column.default {
+                definition.push_str(&format!(" DEFAULT {default}"));
+            }
+            if let Some(extra) = &column.extra {
+                definition.push_str(&format!(" {extra}"));
+            }
+            definition
+        };
+        let mut statements = Vec::new();
+        for column in &change.added {
+            statements.push(format!(
+                "ALTER TABLE {table} ADD COLUMN {};",
+                definition(column)
+            ));
+        }
+        for change in &change.changed {
+            statements.push(format!(
+                "ALTER TABLE {table} MODIFY COLUMN {};",
+                definition(&change.after)
+            ));
+        }
+        for column in &change.dropped {
+            statements.push(format!(
+                "-- ALTER TABLE {table} DROP COLUMN {};",
+                quote_ident(&column.name)
+            ));
+        }
+        statements
+    }
+
+    fn drop_table(&self, schema: &[SharedString], table: &str) -> String {
+        match schema.first() {
+            Some(database) => format!(
+                "DROP TABLE {}.{};",
+                quote_ident(database),
+                quote_ident(table)
+            ),
+            None => String::new(),
+        }
+    }
+
+    /// ClickHouse prints the CREATE statement with the database bare when it can
+    /// (`CREATE TABLE app.orders`) and backquoted otherwise.
+    fn retarget_script(&self, script: &str, from: &[SharedString], to: &[SharedString]) -> String {
+        let (Some(from), Some(to)) = (from.first(), to.first()) else {
+            return script.to_string();
+        };
+        script
+            .replacen(
+                &format!("CREATE TABLE {from}."),
+                &format!("CREATE TABLE {}.", quote_ident(to)),
+                1,
+            )
+            .replacen(
+                &format!("CREATE TABLE {}.", quote_ident(from)),
+                &format!("CREATE TABLE {}.", quote_ident(to)),
+                1,
+            )
     }
 
     fn qualified_name(&self, path: &[SharedString]) -> Option<String> {

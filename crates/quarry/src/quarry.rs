@@ -13,6 +13,7 @@ pub mod panel;
 pub mod query_view;
 pub mod result_table;
 pub mod runtime;
+pub mod schema_diff;
 pub mod statements;
 pub mod templates;
 pub mod tunnel;

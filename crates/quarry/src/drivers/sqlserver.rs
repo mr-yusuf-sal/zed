@@ -1,6 +1,7 @@
 use crate::driver::{
     CatalogEntry, CellEdit, Driver, EditTarget, ObjectKind, ObjectNode, ResultSet, RowKey, TlsMode,
 };
+use crate::schema_diff::{ColumnShape, SchemaSnapshot, TableChange, TableShape};
 use anyhow::{Context as _, Result, bail};
 use futures::TryStreamExt as _;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -1166,6 +1167,167 @@ impl Driver for SqlServerDriver {
             bail!("the key matched {deleted} rows instead of one; nothing was deleted");
         }
         Ok(deleted)
+    }
+
+    fn supports_schema_compare(&self, path: &[SharedString]) -> bool {
+        path.len() == 2
+    }
+
+    async fn schema_snapshot(&self, path: &[SharedString]) -> Result<SchemaSnapshot> {
+        let [database, schema] = path else {
+            bail!("expected a database and a schema, got {path:?}");
+        };
+        let database_ident = quote_ident(database);
+        let sql = format!(
+            "SELECT t.name, c.name, ty.name, c.max_length, c.precision, c.scale, c.is_nullable,
+                    c.is_identity, CAST(ic.seed_value AS nvarchar(100)),
+                    CAST(ic.increment_value AS nvarchar(100)), cc.definition, dc.definition
+             FROM {database_ident}.sys.tables t
+             JOIN {database_ident}.sys.schemas s ON s.schema_id = t.schema_id
+             JOIN {database_ident}.sys.columns c ON c.object_id = t.object_id
+             JOIN {database_ident}.sys.types ty ON ty.user_type_id = c.user_type_id
+             LEFT JOIN {database_ident}.sys.identity_columns ic
+               ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+             LEFT JOIN {database_ident}.sys.computed_columns cc
+               ON cc.object_id = c.object_id AND cc.column_id = c.column_id
+             LEFT JOIN {database_ident}.sys.default_constraints dc
+               ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id
+             WHERE s.name = {} AND t.is_ms_shipped = 0
+             ORDER BY t.name, c.column_id",
+            quote_literal(schema)
+        );
+        let mut snapshot = SchemaSnapshot::default();
+        for row in self.rows(&sql).await? {
+            let mut values = row.into_iter();
+            let (Some(table), Some(name), Some(type_name)) = (
+                values.next().flatten(),
+                values.next().flatten(),
+                values.next().flatten(),
+            ) else {
+                continue;
+            };
+            let numbers: Vec<Option<i64>> = values
+                .by_ref()
+                .take(3)
+                .map(|value| value.and_then(|value| value.parse().ok()))
+                .collect();
+            let nullable = values.next().flatten().as_deref() == Some("1");
+            let identity = values.next().flatten().as_deref() == Some("1");
+            let seed = values.next().flatten();
+            let increment = values.next().flatten();
+            let computed = values.next().flatten();
+            let default = values.next().flatten().map(|text| text.to_string());
+            let extra = if let Some(computed) = computed {
+                Some(format!("AS {computed}"))
+            } else if identity {
+                Some(format!(
+                    "IDENTITY({}, {})",
+                    seed.as_deref().unwrap_or("1"),
+                    increment.as_deref().unwrap_or("1")
+                ))
+            } else {
+                None
+            };
+            let column = ColumnShape {
+                name: name.to_string(),
+                data_type: column_type(&type_name, &numbers),
+                nullable,
+                default,
+                extra,
+            };
+            match snapshot.tables.last_mut() {
+                Some(last) if last.name == table.as_ref() => last.columns.push(column),
+                _ => snapshot.tables.push(TableShape {
+                    name: table.to_string(),
+                    columns: vec![column],
+                }),
+            }
+        }
+        Ok(snapshot)
+    }
+
+    /// Each statement is its own batch: T-SQL compiles a batch before running it, so a column
+    /// added earlier in the same batch would be unknown to a later statement naming it.
+    fn alter_table(&self, schema: &[SharedString], change: &TableChange) -> Vec<String> {
+        let Some(schema) = schema.get(1) else {
+            return Vec::new();
+        };
+        let table = format!("{}.{}", quote_ident(schema), quote_ident(&change.table));
+        let mut statements = Vec::new();
+        for column in &change.added {
+            let name = quote_ident(&column.name);
+            let definition = match &column.extra {
+                Some(computed) if computed.starts_with("AS ") => format!("{name} {computed}"),
+                extra => {
+                    let mut definition = format!("{name} {}", column.data_type);
+                    if let Some(identity) = extra {
+                        definition.push_str(&format!(" {identity}"));
+                    }
+                    definition.push_str(if column.nullable {
+                        " NULL"
+                    } else {
+                        " NOT NULL"
+                    });
+                    if let Some(default) = &column.default {
+                        definition.push_str(&format!(" DEFAULT {default}"));
+                    }
+                    definition
+                }
+            };
+            statements.push(format!("ALTER TABLE {table} ADD {definition};\nGO"));
+        }
+        for change in &change.changed {
+            let (before, after) = (&change.before, &change.after);
+            let column = quote_ident(&after.name);
+            if before.extra != after.extra {
+                statements.push(format!(
+                    "-- {column}: {} becomes {}; change it by hand",
+                    before.extra.as_deref().unwrap_or("a plain column"),
+                    after.extra.as_deref().unwrap_or("a plain column"),
+                ));
+            }
+            if before.data_type != after.data_type || before.nullable != after.nullable {
+                statements.push(format!(
+                    "ALTER TABLE {table} ALTER COLUMN {column} {} {};\nGO",
+                    after.data_type,
+                    if after.nullable { "NULL" } else { "NOT NULL" }
+                ));
+            }
+            if before.default != after.default {
+                statements.push(format!(
+                    "-- {column}: the default goes from {} to {}; a default is a named constraint \
+                     in SQL Server, so replace it by hand",
+                    before.default.as_deref().unwrap_or("none"),
+                    after.default.as_deref().unwrap_or("none"),
+                ));
+            }
+        }
+        for column in &change.dropped {
+            statements.push(format!(
+                "-- ALTER TABLE {table} DROP COLUMN {}; (drop its default constraint first, if it has one)",
+                quote_ident(&column.name)
+            ));
+        }
+        statements
+    }
+
+    fn drop_table(&self, schema: &[SharedString], table: &str) -> String {
+        match schema.get(1) {
+            Some(schema) => format!("DROP TABLE {}.{};", quote_ident(schema), quote_ident(table)),
+            None => String::new(),
+        }
+    }
+
+    /// The CREATE script names everything with bracketed two-part names, the referenced
+    /// tables of its foreign keys included, so moving the schema is a plain replacement.
+    fn retarget_script(&self, script: &str, from: &[SharedString], to: &[SharedString]) -> String {
+        let (Some(from), Some(to)) = (from.get(1), to.get(1)) else {
+            return script.to_string();
+        };
+        script.replace(
+            &format!("{}.", quote_ident(from)),
+            &format!("{}.", quote_ident(to)),
+        )
     }
 
     async fn update_cell(&self, edit: &CellEdit) -> Result<u64> {
