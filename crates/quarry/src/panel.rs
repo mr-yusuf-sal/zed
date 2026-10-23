@@ -1,7 +1,7 @@
 use crate::{
     connection_store::{ConnectionStore, connection_url, parse_connection_url},
     docker::DiscoveredServer,
-    driver::{ConnectionConfig, Driver, Environment, ObjectKind, ObjectNode},
+    driver::{ConnectionConfig, Driver, Engine, Environment, KeyAction, ObjectKind, ObjectNode},
     query_view::{PREVIEW_ROW_LIMIT, QueryView, environment_badge},
     runtime::QuarryRuntime,
 };
@@ -34,6 +34,31 @@ actions!(
 );
 
 const SELECT_ROW_LIMIT: usize = 100;
+
+/// What the one-line prompt under the header is asking for.
+#[derive(Clone)]
+enum PromptKind {
+    Password,
+    /// Seconds until a Redis key expires.
+    Ttl(ObjectNode),
+    /// A Redis key's new full name.
+    Rename(ObjectNode),
+    /// A glob to SCAN for under a Redis database or prefix.
+    FindKeys(ObjectNode),
+}
+
+struct InlinePrompt {
+    /// The connection it is about. Positions shift when a connection is deleted, which is why
+    /// deleting one closes the prompt.
+    index: usize,
+    kind: PromptKind,
+    editor: Entity<Editor>,
+}
+
+/// A Redis key's full name, which the tree splits on `:` into its path after the database.
+fn redis_key(node: &ObjectNode) -> String {
+    node.path.get(1..).unwrap_or_default().join(":")
+}
 
 #[derive(Clone, Copy)]
 enum Script {
@@ -201,8 +226,8 @@ pub struct QuarryPanel {
     next_state_id: usize,
     /// Present while the user is filling in the add- or edit-connection form.
     draft: Option<Draft>,
-    /// Set while changing the password of a connection that already exists.
-    password_prompt: Option<(usize, Entity<Editor>)>,
+    /// Set while asking for one line of input: a new password, a key's TTL or name, a pattern.
+    prompt: Option<InlinePrompt>,
     /// Narrows the tree to names containing this text. It filters what has been loaded; a
     /// folder that was never expanded is not searched, because that would mean asking the
     /// server for everything.
@@ -258,7 +283,7 @@ impl QuarryPanel {
             states: (0..count).map(ConnectionState::new).collect(),
             next_state_id: count,
             draft: None,
-            password_prompt: None,
+            prompt: None,
             filter,
             width: None,
             position: DockPosition::Left,
@@ -287,7 +312,7 @@ impl QuarryPanel {
             editor
         });
         url.focus_handle(cx).focus(window, cx);
-        self.password_prompt = None;
+        self.prompt = None;
         self.draft = Some(Draft {
             name: new_name_editor(None, window, cx),
             url,
@@ -318,7 +343,7 @@ impl QuarryPanel {
         password.update(cx, |editor, cx| {
             editor.set_placeholder_text("password (blank keeps the saved one)", window, cx);
         });
-        self.password_prompt = None;
+        self.prompt = None;
         self.draft = Some(Draft {
             name: new_name_editor(Some(&config.name), window, cx),
             url,
@@ -670,7 +695,7 @@ impl QuarryPanel {
         };
         self.states.remove(index);
         // The prompt refers to a connection by position, which has just shifted.
-        self.password_prompt = None;
+        self.prompt = None;
         if self
             .draft
             .as_ref()
@@ -702,17 +727,201 @@ impl QuarryPanel {
     }
 
     fn start_password_prompt(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let editor = new_password_editor(window, cx);
+        self.start_prompt(index, PromptKind::Password, window, cx);
+    }
+
+    fn start_prompt(
+        &mut self,
+        index: usize,
+        kind: PromptKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = match &kind {
+            PromptKind::Password => new_password_editor(window, cx),
+            PromptKind::Ttl(_) | PromptKind::Rename(_) | PromptKind::FindKeys(_) => {
+                let (placeholder, text) = match &kind {
+                    PromptKind::Ttl(_) => ("seconds; 0 removes the TTL", None),
+                    PromptKind::Rename(node) => ("new key name", Some(redis_key(node))),
+                    _ => ("glob, e.g. *:email or session:*", None),
+                };
+                cx.new(|cx| {
+                    let mut editor = Editor::single_line(window, cx);
+                    editor.set_placeholder_text(placeholder, window, cx);
+                    if let Some(text) = text {
+                        editor.set_text(text, window, cx);
+                        editor.select_all(&editor::actions::SelectAll, window, cx);
+                    }
+                    editor
+                })
+            }
+        };
         editor.focus_handle(cx).focus(window, cx);
-        self.password_prompt = Some((index, editor));
+        self.prompt = Some(InlinePrompt {
+            index,
+            kind,
+            editor,
+        });
         cx.notify();
     }
 
-    fn confirm_password_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((index, editor)) = self.password_prompt.take() else {
+    fn confirm_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(InlinePrompt {
+            index,
+            kind,
+            editor,
+        }) = self.prompt.take()
+        else {
             return;
         };
-        let password = editor.read(cx).text(cx);
+        let text = editor.read(cx).text(cx);
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+        match kind {
+            PromptKind::Password => self.change_password(index, text, cx),
+            PromptKind::Ttl(node) => match text.trim() {
+                "" | "0" => self.run_key_action(index, node, KeyAction::Expire(None), cx),
+                seconds => match seconds.parse::<u64>() {
+                    Ok(seconds) => {
+                        self.run_key_action(index, node, KeyAction::Expire(Some(seconds)), cx)
+                    }
+                    Err(_) => {
+                        self.notice = Some((
+                            format!("{seconds:?} is not a number of seconds").into(),
+                            Color::Error,
+                        ));
+                    }
+                },
+            },
+            PromptKind::Rename(node) => {
+                let new_name = text.trim().to_string();
+                if !new_name.is_empty() && new_name != redis_key(&node) {
+                    self.run_key_action(index, node, KeyAction::Rename(new_name), cx);
+                }
+            }
+            PromptKind::FindKeys(node) => self.find_keys(index, node, text, window, cx),
+        }
+    }
+
+    /// Changes a key from the tree, then reloads the folder it was in so the tree shows what
+    /// is there now. A failure goes to the notice under the header.
+    fn run_key_action(
+        &mut self,
+        index: usize,
+        node: ObjectNode,
+        action: KeyAction,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((state_id, driver)) = self
+            .states
+            .get(index)
+            .and_then(|state| state.driver.clone().map(|driver| (state.id, driver)))
+        else {
+            return;
+        };
+        let Some(runtime) = QuarryRuntime::global(cx) else {
+            return;
+        };
+        let applied = {
+            let path = node.path.clone();
+            runtime.spawn(async move { driver.key_action(&path, &action).await })
+        };
+        let parent = node
+            .path
+            .get(..node.path.len().saturating_sub(1))
+            .unwrap_or_default()
+            .to_vec();
+        let task = cx.spawn(async move |this, cx| {
+            let applied = applied.await;
+            this.update(cx, |this, cx| {
+                let Some(index) = this.index_of(state_id) else {
+                    return;
+                };
+                if let Err(error) = applied {
+                    this.notice = Some((format!("{error:#}").into(), Color::Error));
+                }
+                this.reload_node(index, parent, cx);
+            })
+            .ok();
+        });
+        self._tasks.push(task);
+    }
+
+    fn confirm_delete_key(
+        &mut self,
+        index: usize,
+        node: ObjectNode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state_id) = self.states.get(index).map(|state| state.id) else {
+            return;
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Delete the key {}?", redis_key(&node)),
+            Some("Its value is removed from the server."),
+            &["Delete", "Cancel"],
+            cx,
+        );
+        let task = cx.spawn(async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                if let Some(index) = this.index_of(state_id) {
+                    this.run_key_action(index, node, KeyAction::Delete, cx);
+                }
+            })
+            .ok();
+        });
+        self._tasks.push(task);
+    }
+
+    /// Opens a tab listing the keys under `node` that match `pattern`, found by SCAN on the
+    /// server rather than in what the tree has loaded.
+    fn find_keys(
+        &mut self,
+        index: usize,
+        node: ObjectNode,
+        pattern: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(driver) = self
+            .states
+            .get(index)
+            .and_then(|state| state.driver.clone())
+        else {
+            return;
+        };
+        let Some(runtime) = QuarryRuntime::global(cx) else {
+            return;
+        };
+        let pattern = match pattern.trim() {
+            "" => "*".to_string(),
+            pattern => pattern.to_string(),
+        };
+        let title = SharedString::from(format!("{} · {pattern}", node.path.join(":")));
+        let Some(view) = self.open_tab(index, node.path.first().cloned(), title, None, window, cx)
+        else {
+            return;
+        };
+        view.update(cx, |view, cx| view.set_loading(cx));
+        let found = runtime.spawn(async move { driver.search(&node.path, &pattern).await });
+        let view = view.downgrade();
+        let task = cx.spawn(async move |_, cx| {
+            let found = found.await;
+            view.update(cx, |view, cx| match found {
+                Ok(result) => view.show_result(result, cx),
+                Err(error) => view.show_error(format!("{error:#}").into(), cx),
+            })
+            .ok();
+        });
+        self._tasks.push(task);
+    }
+
+    fn change_password(&mut self, index: usize, password: String, cx: &mut Context<Self>) {
         if let Some(config) = self.store.read(cx).get(index).cloned() {
             self.save_password(&config, password, cx);
             // Drop the open driver so the next click reconnects with the new password instead
@@ -724,8 +933,6 @@ impl QuarryPanel {
                 state.error = None;
             }
         }
-        self.focus_handle.focus(window, cx);
-        cx.notify();
     }
 
     fn connect(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -1266,6 +1473,14 @@ impl QuarryPanel {
             .then(|| driver.count_statement(&node.path))
             .flatten();
         let qualified_name = driver.qualified_name(&node.path);
+        let is_redis = self
+            .store
+            .read(cx)
+            .get(index)
+            .is_some_and(|config| config.engine == Engine::Redis);
+        let is_key = is_redis && node.kind == ObjectKind::Key;
+        let can_find_keys =
+            is_redis && matches!(node.kind, ObjectKind::Database | ObjectKind::Folder);
         let panel = cx.entity().downgrade();
 
         let menu = ContextMenu::build(window, cx, move |menu, _, _| {
@@ -1368,6 +1583,51 @@ impl QuarryPanel {
                     cx.write_to_clipboard(ClipboardItem::new_string(qualified_name.clone()))
                 })
             })
+            .when(can_find_keys, |menu| {
+                let node = node.clone();
+                menu.separator().entry(
+                    "Find Keys…",
+                    None,
+                    update(Box::new(move |this, window, cx| {
+                        this.start_prompt(index, PromptKind::FindKeys(node.clone()), window, cx)
+                    })),
+                )
+            })
+            .when(is_key, |menu| {
+                let ttl = node.clone();
+                let persist = node.clone();
+                let rename = node.clone();
+                let delete = node.clone();
+                menu.separator()
+                    .entry(
+                        "Set TTL…",
+                        None,
+                        update(Box::new(move |this, window, cx| {
+                            this.start_prompt(index, PromptKind::Ttl(ttl.clone()), window, cx)
+                        })),
+                    )
+                    .entry(
+                        "Remove TTL",
+                        None,
+                        update(Box::new(move |this, _, cx| {
+                            this.run_key_action(index, persist.clone(), KeyAction::Expire(None), cx)
+                        })),
+                    )
+                    .entry(
+                        "Rename Key…",
+                        None,
+                        update(Box::new(move |this, window, cx| {
+                            this.start_prompt(index, PromptKind::Rename(rename.clone()), window, cx)
+                        })),
+                    )
+                    .entry(
+                        "Delete Key…",
+                        None,
+                        update(Box::new(move |this, window, cx| {
+                            this.confirm_delete_key(index, delete.clone(), window, cx)
+                        })),
+                    )
+            })
             .when(node.has_children, |menu| {
                 let path = node.path.clone();
                 menu.separator().entry(
@@ -1394,7 +1654,17 @@ impl QuarryPanel {
         if !state.expanded.contains(&path) {
             state.expanded.push(path.clone());
         }
+        // Folders open below it are loaded again too, or they would show as open and empty.
+        let open_below: Vec<Vec<SharedString>> = state
+            .expanded
+            .iter()
+            .filter(|expanded| expanded.starts_with(&path) && **expanded != path)
+            .cloned()
+            .collect();
         self.load_children(index, path, cx);
+        for expanded in open_below {
+            self.load_children(index, expanded, cx);
+        }
         cx.notify();
     }
 
@@ -1807,29 +2077,39 @@ impl Render for QuarryPanel {
                     }))
                     .into_any_element()
             }))
-            .children(self.password_prompt.as_ref().map(|(index, editor)| {
-                let name = self
-                    .store
-                    .read(cx)
-                    .get(*index)
-                    .map(|config| config.name.clone())
-                    .unwrap_or_default();
+            .children(self.prompt.as_ref().map(|prompt| {
+                let label = match &prompt.kind {
+                    PromptKind::Password => {
+                        let name = self
+                            .store
+                            .read(cx)
+                            .get(prompt.index)
+                            .map(|config| config.name.clone())
+                            .unwrap_or_default();
+                        format!("Password for {name}")
+                    }
+                    PromptKind::Ttl(node) => format!("TTL of {}", redis_key(node)),
+                    PromptKind::Rename(node) => format!("Rename {}", redis_key(node)),
+                    PromptKind::FindKeys(node) => {
+                        format!("Find keys under {}", node.path.join(":"))
+                    }
+                };
                 v_flex()
                     .w_full()
                     .px_2()
                     .py_1()
                     .gap_0p5()
                     .child(
-                        Label::new(SharedString::from(format!("Password for {name}")))
+                        Label::new(SharedString::from(label))
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
                     )
-                    .child(editor.clone())
+                    .child(prompt.editor.clone())
                     .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
-                        this.confirm_password_prompt(window, cx);
+                        this.confirm_prompt(window, cx);
                     }))
                     .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
-                        this.password_prompt = None;
+                        this.prompt = None;
                         this.focus_handle.focus(window, cx);
                         cx.notify();
                     }))

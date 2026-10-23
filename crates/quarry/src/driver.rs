@@ -146,6 +146,16 @@ pub struct CellEdit {
     pub value: Option<String>,
 }
 
+/// Something done to a whole key from the tree rather than to a row of its value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyAction {
+    /// Expire the key after this many seconds, or never with `None`.
+    Expire(Option<u64>),
+    /// Give the key this full name, refusing if another key already has it.
+    Rename(String),
+    Delete,
+}
+
 /// A name the query editor offers as a completion. Keywords and commands are not here: they
 /// are static per engine and live in `completion.rs`. This is what only the server knows.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -331,6 +341,16 @@ pub trait Driver: Send + Sync {
         _analyze: bool,
     ) -> Result<Vec<ResultSet>> {
         anyhow::bail!("this engine has no query plan to show")
+    }
+
+    /// Keys at or under `path` whose names match the glob `pattern`, searched on the server
+    /// rather than in what the tree happens to have loaded.
+    async fn search(&self, path: &[SharedString], _pattern: &str) -> Result<ResultSet> {
+        anyhow::bail!("{} cannot be searched by pattern", path.join("."))
+    }
+
+    async fn key_action(&self, path: &[SharedString], _action: &KeyAction) -> Result<()> {
+        anyhow::bail!("{} is not a key", path.join("."))
     }
 
     /// Applies one cell change and returns how many rows it touched. Implementations must
