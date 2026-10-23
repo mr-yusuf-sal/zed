@@ -1,5 +1,5 @@
 use crate::driver::{
-    CatalogEntry, CellEdit, Driver, EditTarget, ObjectKind, ObjectNode, ResultSet,
+    CatalogEntry, CellEdit, Driver, EditTarget, ObjectKind, ObjectNode, ResultSet, RowKey,
 };
 use anyhow::{Context as _, Result, bail};
 use futures::TryStreamExt as _;
@@ -212,6 +212,7 @@ impl PostgresDriver {
         );
         let mut key_columns = Vec::new();
         let mut read_only_columns = Vec::new();
+        let mut insert_columns = Vec::new();
         for row in self.rows(database, &sql).await? {
             let mut values = row.into_iter();
             let Some(name) = values.next().flatten() else {
@@ -231,15 +232,19 @@ impl PostgresDriver {
             }
             if is_read_only {
                 read_only_columns.push(index);
+            } else {
+                insert_columns.push(index);
             }
         }
         if key_columns.is_empty() {
             return Ok(None);
         }
+        insert_columns.sort_unstable();
         Ok(Some(EditTarget {
             path: path.to_vec(),
             key_columns,
             read_only_columns,
+            insert_columns,
         }))
     }
 }
@@ -911,6 +916,78 @@ impl Driver for PostgresDriver {
         ))
     }
 
+    async fn insert_row(
+        &self,
+        path: &[SharedString],
+        values: &[(SharedString, String)],
+    ) -> Result<u64> {
+        let [database, schema, table] = path else {
+            bail!("expected database, schema and table, got {path:?}");
+        };
+        // Untyped literals, as in `update_cell`, so Postgres coerces each to its column's type.
+        let sql = if values.is_empty() {
+            format!(
+                "INSERT INTO {} DEFAULT VALUES",
+                qualified_name(schema, table)
+            )
+        } else {
+            format!(
+                "INSERT INTO {} ({}) VALUES ({})",
+                qualified_name(schema, table),
+                values
+                    .iter()
+                    .map(|(column, _)| quote_ident(column))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                values
+                    .iter()
+                    .map(|(_, value)| quote_literal(value))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let pool = self.pool(database).await?;
+        let inserted = (&pool)
+            .execute(sqlx::raw_sql(&sql))
+            .await
+            .with_context(|| format!("running: {sql}"))?
+            .rows_affected();
+        Ok(inserted)
+    }
+
+    async fn delete_row(&self, path: &[SharedString], key: &RowKey) -> Result<u64> {
+        let [database, schema, table] = path else {
+            bail!("expected database, schema and table, got {path:?}");
+        };
+        if key.is_empty() {
+            bail!("refusing to delete from {table} without a key");
+        }
+        let sql = format!(
+            "DELETE FROM {} WHERE {}",
+            qualified_name(schema, table),
+            key_condition(key)
+        );
+        let pool = self.pool(database).await?;
+        let mut transaction = pool.begin().await.context("starting a transaction")?;
+        let deleted = (&mut *transaction)
+            .execute(sqlx::raw_sql(&sql))
+            .await
+            .with_context(|| format!("running: {sql}"))?
+            .rows_affected();
+        if deleted != 1 {
+            transaction
+                .rollback()
+                .await
+                .context("rolling back the delete")?;
+            bail!("the key matched {deleted} rows instead of one; nothing was deleted");
+        }
+        transaction
+            .commit()
+            .await
+            .context("committing the delete")?;
+        Ok(deleted)
+    }
+
     async fn update_cell(&self, edit: &CellEdit) -> Result<u64> {
         let [database, schema, table] = edit.path.as_slice() else {
             bail!("expected database, schema and table, got {:?}", edit.path);
@@ -962,6 +1039,18 @@ impl Driver for PostgresDriver {
             .context("committing the update")?;
         Ok(affected)
     }
+}
+
+/// `WHERE` terms matching a row by its key as displayed: `IS NULL` for a NULL, an untyped
+/// literal for anything else.
+fn key_condition(key: &RowKey) -> String {
+    key.iter()
+        .map(|(column, value)| match value {
+            Some(value) => format!("{} = {}", quote_ident(column), quote_literal(value)),
+            None => format!("{} IS NULL", quote_ident(column)),
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ")
 }
 
 fn qualified_name(schema: &str, name: &str) -> String {

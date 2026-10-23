@@ -1,5 +1,5 @@
 use crate::driver::{
-    CatalogEntry, CellEdit, Driver, EditTarget, ObjectKind, ObjectNode, ResultSet,
+    CatalogEntry, CellEdit, Driver, EditTarget, ObjectKind, ObjectNode, ResultSet, RowKey,
 };
 use anyhow::{Context as _, Result, bail};
 use futures::{TryStreamExt as _, future::join_all};
@@ -223,6 +223,34 @@ fn id_candidates(displayed: Option<&str>) -> Vec<Bson> {
         candidates.push(text);
     }
     candidates
+}
+
+/// The one document whose `_id` is the one displayed in `key`. The grid shows an ObjectId as
+/// bare hex and a number as digits, so every type the text could have been is tried, and more
+/// than one match is refused rather than guessed between.
+async fn find_by_key(collection: &mongodb::Collection<Document>, key: &RowKey) -> Result<Document> {
+    let displayed_id = key
+        .iter()
+        .find(|(name, _)| name.as_ref() == "_id")
+        .map(|(_, value)| value.as_ref().map(|value| value.as_ref()))
+        .context("the row does not say which document it is")?;
+    let filter = doc! { "_id": { "$in": id_candidates(displayed_id) } };
+    let mut matches: Vec<Document> = collection
+        .find(filter)
+        .limit(2)
+        .await
+        .context("finding the document")?
+        .try_collect()
+        .await
+        .context("finding the document")?;
+    if matches.len() != 1 {
+        bail!(
+            "{} documents match _id {}; refusing to guess which one is meant",
+            matches.len(),
+            displayed_id.unwrap_or("null")
+        );
+    }
+    matches.pop().context("finding the document")
 }
 
 fn to_result_set(documents: Vec<Document>, truncated: bool) -> ResultSet {
@@ -467,6 +495,8 @@ impl Driver for MongoDriver {
                 path: vec![database.clone(), collection.clone()],
                 key_columns: vec![id_column],
                 read_only_columns: vec![id_column],
+                // Every field the page shows; `_id` too, though left blank the server makes one.
+                insert_columns: (0..result.columns.len()).collect(),
             });
         Ok(result)
     }
@@ -617,6 +647,55 @@ impl Driver for MongoDriver {
         Some(to_json(doc! { "count": collection.as_ref(), "query": {} }))
     }
 
+    async fn insert_row(
+        &self,
+        path: &[SharedString],
+        values: &[(SharedString, String)],
+    ) -> Result<u64> {
+        let [database, collection, ..] = path else {
+            bail!("expected a database and a collection, got {path:?}");
+        };
+        let mut document = Document::new();
+        for (field, text) in values {
+            if field.contains('.') || field.starts_with('$') {
+                bail!("the field {field:?} cannot be set on a new document");
+            }
+            // An `_id` typed as the bare hex the grid shows is meant as an ObjectId.
+            let value = match ObjectId::parse_str(text.trim()) {
+                Ok(id) if field.as_ref() == "_id" => Bson::ObjectId(id),
+                _ => parse_value(text),
+            };
+            document.insert(field.to_string(), value);
+        }
+        self.client
+            .database(database)
+            .collection::<Document>(collection)
+            .insert_one(document)
+            .await
+            .context("inserting the document")?;
+        Ok(1)
+    }
+
+    async fn delete_row(&self, path: &[SharedString], key: &RowKey) -> Result<u64> {
+        let [database, collection, ..] = path else {
+            bail!("expected a database and a collection, got {path:?}");
+        };
+        let collection = self
+            .client
+            .database(database)
+            .collection::<Document>(collection);
+        let document = find_by_key(&collection, key).await?;
+        let id = document.get("_id").cloned().unwrap_or(Bson::Null);
+        let result = collection
+            .delete_one(doc! { "_id": id })
+            .await
+            .context("deleting the document")?;
+        if result.deleted_count != 1 {
+            bail!("the document was gone before it could be deleted");
+        }
+        Ok(result.deleted_count)
+    }
+
     async fn update_cell(&self, edit: &CellEdit) -> Result<u64> {
         let [database, collection, ..] = edit.path.as_slice() else {
             bail!("expected a database and a collection, got {:?}", edit.path);
@@ -630,33 +709,11 @@ impl Driver for MongoDriver {
         if field.contains('.') || field.starts_with('$') {
             bail!("the field {field:?} cannot be addressed by an update");
         }
-        let displayed_id = edit
-            .key
-            .iter()
-            .find(|(name, _)| name.as_ref() == "_id")
-            .map(|(_, value)| value.as_ref().map(|value| value.as_ref()))
-            .context("the edit does not say which document to change")?;
-
         let collection = self
             .client
             .database(database)
             .collection::<Document>(collection);
-        let filter = doc! { "_id": { "$in": id_candidates(displayed_id) } };
-        let matches: Vec<Document> = collection
-            .find(filter)
-            .limit(2)
-            .await
-            .context("finding the document")?
-            .try_collect()
-            .await
-            .context("finding the document")?;
-        let [document] = matches.as_slice() else {
-            bail!(
-                "{} documents match _id {}; refusing to guess which one to change",
-                matches.len(),
-                displayed_id.unwrap_or("null")
-            );
-        };
+        let document = find_by_key(&collection, &edit.key).await?;
         let id = document.get("_id").cloned().unwrap_or(Bson::Null);
 
         let value = match edit.value.as_deref() {
