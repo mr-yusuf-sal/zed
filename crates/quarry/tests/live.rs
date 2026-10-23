@@ -1386,3 +1386,53 @@ fn sqlserver_create_script_round_trips() {
         );
     });
 }
+
+#[test]
+#[ignore = "needs a live postgres"]
+fn postgres_explain() {
+    runtime().block_on(async {
+        let driver = postgres().await;
+        let plan = only(
+            driver
+                .explain("SELECT * FROM shop.orders WHERE id = 1;", Some("app"), false)
+                .await
+                .expect("explain"),
+        );
+        assert_eq!(plan.columns, vec![SharedString::from("QUERY PLAN")]);
+        assert!(!plan.rows.is_empty());
+        let measured = only(
+            driver
+                .explain("SELECT count(*) FROM shop.orders", Some("app"), true)
+                .await
+                .expect("explain analyze"),
+        );
+        assert!(
+            measured
+                .rows
+                .iter()
+                .any(|row| row[0].as_deref().is_some_and(|line| line.contains("actual")))
+        );
+    });
+}
+
+#[test]
+#[ignore = "needs a live sql server"]
+fn sqlserver_explain_leaves_the_session_as_it_was() {
+    runtime().block_on(async {
+        let driver = sqlserver().await;
+        let plan = driver
+            .explain("SELECT * FROM sales.Stores WHERE StoreId = 1", Some("app"), false)
+            .await
+            .expect("explain");
+        assert!(plan[0].columns.iter().any(|column| column.as_ref() == "StmtText"));
+        let measured = driver
+            .explain("SELECT COUNT(*) FROM sales.Stores", Some("app"), true)
+            .await
+            .expect("explain analyze");
+        assert_eq!(measured.len(), 2, "the result, then its profile: {measured:#?}");
+        // SHOWPLAN_ALL and STATISTICS PROFILE are switched off again, so a query runs.
+        let after = only(driver.query("SELECT 1 AS one", Some("app"), 10).await.expect("after"));
+        assert_eq!(after.columns, vec![SharedString::from("one")]);
+        assert_eq!(cell(&after, 0, 0).as_deref(), Some("1"));
+    });
+}

@@ -53,6 +53,16 @@ const ROW_LIMIT: usize = 2_000;
 /// more each time.
 pub const PREVIEW_ROW_LIMIT: usize = 500;
 
+/// What a run asks of the driver for each statement.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Operation {
+    Query,
+    /// The statement's plan; with `analyze`, measured by running it.
+    Explain {
+        analyze: bool,
+    },
+}
+
 enum Status {
     Connecting,
     Idle,
@@ -453,7 +463,7 @@ impl QueryView {
             .filter(|statement| statements::may_write(statement, engine))
             .count();
         if writes == 0 || self.environment(cx) != Some(Environment::Production) {
-            self.execute(chunks, cx);
+            self.execute(chunks, Operation::Query, cx);
             return;
         }
         let answer = window.prompt(
@@ -467,7 +477,8 @@ impl QueryView {
         );
         self._tasks.push(cx.spawn(async move |this, cx| {
             if answer.await == Ok(0) {
-                this.update(cx, |this, cx| this.execute(chunks, cx)).ok();
+                this.update(cx, |this, cx| this.execute(chunks, Operation::Query, cx))
+                    .ok();
             }
         }));
     }
@@ -476,10 +487,32 @@ impl QueryView {
     /// panel wrote, such as "Select Top 100".
     pub fn run_everything(&mut self, cx: &mut Context<Self>) {
         let text = self.editor.read(cx).text(cx);
-        self.execute(vec![text], cx);
+        self.execute(vec![text], Operation::Query, cx);
     }
 
-    fn execute(&mut self, chunks: Vec<String>, cx: &mut Context<Self>) {
+    /// Shows the plan of the selection, or of the statement under the cursor. Analyzing runs
+    /// the statement, so it is refused for anything that may write rather than asked about:
+    /// a plan is never worth an accidental DELETE.
+    fn explain(&mut self, analyze: bool, cx: &mut Context<Self>) {
+        let engine = self.config.engine;
+        let chunks = self.text_to_run(cx);
+        if analyze
+            && split_statements(&chunks, engine)
+                .iter()
+                .any(|statement| statements::may_write(statement, engine))
+        {
+            self.status = Status::Failed(
+                "Explain Analyze runs the statement to measure it, and this one may change data; \
+                 use Explain for its estimated plan"
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        self.execute(chunks, Operation::Explain { analyze }, cx);
+    }
+
+    fn execute(&mut self, chunks: Vec<String>, operation: Operation, cx: &mut Context<Self>) {
         let statements = split_statements(&chunks, self.config.engine);
         if statements.is_empty() {
             return;
@@ -498,8 +531,10 @@ impl QueryView {
             return;
         };
 
-        for chunk in &chunks {
-            record_query(&self.config, chunk.clone(), cx);
+        if operation == Operation::Query {
+            for chunk in &chunks {
+                record_query(&self.config, chunk.clone(), cx);
+            }
         }
 
         self.pending_edit = None;
@@ -519,10 +554,19 @@ impl QueryView {
         let batch = runtime.spawn(async move {
             let mut results = Vec::new();
             for (index, statement) in statements.iter().enumerate() {
-                match driver
-                    .query(statement, database.as_deref(), ROW_LIMIT)
-                    .await
-                {
+                let sets = match operation {
+                    Operation::Query => {
+                        driver
+                            .query(statement, database.as_deref(), ROW_LIMIT)
+                            .await
+                    }
+                    Operation::Explain { analyze } => {
+                        driver
+                            .explain(statement, database.as_deref(), analyze)
+                            .await
+                    }
+                };
+                match sets {
                     Ok(sets) => results.extend(sets),
                     Err(error) => {
                         let failure = if total > 1 {
@@ -545,7 +589,8 @@ impl QueryView {
                     .update(cx, |table, cx| table.set_loading(false, cx));
                 match outcome {
                     Ok((results, failure)) => {
-                        let changed_schema = results.iter().any(|result| result.columns.is_empty());
+                        let changed_schema = operation == Operation::Query
+                            && results.iter().any(|result| result.columns.is_empty());
                         if !results.is_empty() {
                             this.set_results(results, cx);
                         }
@@ -863,6 +908,9 @@ impl QueryView {
                         this.run_all(&RunAll, window, cx);
                     })),
             )
+            .when(self.config.engine != Engine::Redis, |toolbar| {
+                toolbar.child(self.render_explain_menu(this.clone(), running))
+            })
             .when(running, |toolbar| {
                 toolbar.child(
                     Button::new("quarry-cancel", "Cancel")
@@ -958,6 +1006,39 @@ impl QueryView {
                         }))
                     }),
             )
+            .into_any_element()
+    }
+
+    fn render_explain_menu(&self, this: WeakEntity<Self>, running: bool) -> AnyElement {
+        // ClickHouse has no way to measure a plan by running it.
+        let can_analyze = self.config.engine != Engine::ClickHouse;
+        PopoverMenu::new("quarry-explain")
+            .trigger(
+                IconButton::new("quarry-explain-trigger", IconName::ListTree)
+                    .icon_size(IconSize::Small)
+                    .disabled(running || self.driver.is_none())
+                    .tooltip(Tooltip::text("Explain")),
+            )
+            .menu(move |window, cx| {
+                let this = this.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    let estimated = this.clone();
+                    menu.entry("Explain", None, move |_, cx| {
+                        estimated
+                            .update(cx, |this, cx| this.explain(false, cx))
+                            .ok();
+                    })
+                    .when(can_analyze, |menu| {
+                        menu.entry(
+                            "Explain Analyze (runs the statement)",
+                            None,
+                            move |_, cx| {
+                                this.update(cx, |this, cx| this.explain(true, cx)).ok();
+                            },
+                        )
+                    })
+                }))
+            })
             .into_any_element()
     }
 

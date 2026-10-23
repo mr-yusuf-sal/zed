@@ -395,6 +395,29 @@ impl Driver for ClickHouseDriver {
         Ok(vec![result?])
     }
 
+    /// ClickHouse has no EXPLAIN ANALYZE: the closest it has, the query log, needs the query to
+    /// have finished and logging to be on, so only the estimated plan is offered.
+    async fn explain(
+        &self,
+        statement: &str,
+        database: Option<&str>,
+        analyze: bool,
+    ) -> Result<Vec<ResultSet>> {
+        if analyze {
+            bail!("ClickHouse cannot run a statement to measure its plan; use Explain");
+        }
+        let statement = strip_trailing_semicolons(statement);
+        let plan = self
+            .execute(
+                &format!("EXPLAIN indexes = 1 {statement}"),
+                database,
+                Some(METADATA_ROW_LIMIT),
+                None,
+            )
+            .await?;
+        Ok(vec![plan])
+    }
+
     async fn preview_page(
         &self,
         path: &[SharedString],
