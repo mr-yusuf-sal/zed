@@ -184,5 +184,9 @@ if ($Install) {
     }
     Get-ZedUi | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     for ($i = 0; $i -lt 30 -and (Get-ZedUi); $i++) { Start-Sleep -Milliseconds 500 }
-    Start-Process $target
+    # An elevated Zed sees an empty Windows Credential Manager, so git fetch/pull/push fall
+    # through to Zed's username prompt, and every host and restart it spawns stays elevated.
+    # explorer.exe starts it with the desktop user's normal token instead.
+    $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if ($elevated) { Start-Process explorer.exe -ArgumentList "`"$target`"" } else { Start-Process $target }
 }
