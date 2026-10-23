@@ -689,7 +689,8 @@ impl Dock {
     }
 
     /// This fork has no left dock. The project panel is kept in it only so that `Workspace::panel`
-    /// finds it; it is shown as a permanent tab in the center instead.
+    /// finds it, since it is shown as a permanent tab in the center instead, and the git panel only
+    /// for the actions it backs, such as push, pull and commit.
     pub fn can_open(&self) -> bool {
         self.position != DockPosition::Left
     }
@@ -1268,17 +1269,6 @@ impl Dock {
         }
     }
 
-    pub fn set_panel_size_state(
-        &mut self,
-        panel: &dyn PanelHandle,
-        size_state: PanelSizeState,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if let Some(entry) = self
-            .panel_entries
-            .iter_mut()
-            .find(|entry| entry.panel.panel_id() == panel.panel_id())
-        {
     pub(crate) fn panel_size_states(
         &self,
     ) -> impl Iterator<Item = (&'static str, PanelSizeState)> + '_ {
@@ -1300,6 +1290,17 @@ impl Dock {
         cx.notify();
     }
 
+    pub fn set_panel_size_state(
+        &mut self,
+        panel: &dyn PanelHandle,
+        size_state: PanelSizeState,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if let Some(entry) = self
+            .panel_entries
+            .iter_mut()
+            .find(|entry| entry.panel.panel_id() == panel.panel_id())
+        {
             entry.size_state = size_state;
             cx.notify();
             true
