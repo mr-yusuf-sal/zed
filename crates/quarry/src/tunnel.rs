@@ -6,6 +6,7 @@
 use crate::driver::{
     CatalogEntry, CellEdit, Driver, KeyAction, ObjectNode, ResultSet, RowKey, SshTunnel,
 };
+use crate::schema_diff::{SchemaSnapshot, TableChange};
 use anyhow::{Context as _, Result, bail};
 use std::{
     io::Read as _,
@@ -216,5 +217,29 @@ impl Driver for TunneledDriver {
 
     async fn update_cell(&self, edit: &CellEdit) -> Result<u64> {
         self.inner.update_cell(edit).await
+    }
+
+    fn supports_schema_compare(&self, path: &[SharedString]) -> bool {
+        self.inner.supports_schema_compare(path)
+    }
+
+    async fn schema_snapshot(&self, path: &[SharedString]) -> Result<SchemaSnapshot> {
+        self.inner.schema_snapshot(path).await
+    }
+
+    fn comment_prefix(&self) -> &'static str {
+        self.inner.comment_prefix()
+    }
+
+    fn alter_table(&self, schema: &[SharedString], change: &TableChange) -> Vec<String> {
+        self.inner.alter_table(schema, change)
+    }
+
+    fn drop_table(&self, schema: &[SharedString], table: &str) -> String {
+        self.inner.drop_table(schema, table)
+    }
+
+    fn retarget_script(&self, script: &str, from: &[SharedString], to: &[SharedString]) -> String {
+        self.inner.retarget_script(script, from, to)
     }
 }

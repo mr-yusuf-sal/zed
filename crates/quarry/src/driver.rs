@@ -1,3 +1,4 @@
+use crate::schema_diff::{SchemaSnapshot, TableChange};
 use anyhow::Result;
 use std::fmt;
 use ui::SharedString;
@@ -478,6 +479,43 @@ pub trait Driver: Send + Sync {
     /// anything else when the key matches no row or several.
     async fn delete_row(&self, path: &[SharedString], _key: &RowKey) -> Result<u64> {
         anyhow::bail!("deleting rows from {} is not supported", path.join("."))
+    }
+
+    /// Whether the node at `path` is a schema (or, where there are no schemas, a database)
+    /// whose tables can be compared with another's.
+    fn supports_schema_compare(&self, _path: &[SharedString]) -> bool {
+        false
+    }
+
+    /// The tables of the schema at `path` and their columns, for comparing it with another.
+    async fn schema_snapshot(&self, path: &[SharedString]) -> Result<SchemaSnapshot> {
+        anyhow::bail!("{} cannot be compared", path.join("."))
+    }
+
+    /// How a line comment starts in the engine's query language.
+    fn comment_prefix(&self) -> &'static str {
+        "--"
+    }
+
+    /// The statements making a table of the schema at `schema` match `change`. Any that would
+    /// lose data come back commented out.
+    fn alter_table(&self, _schema: &[SharedString], _change: &TableChange) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn drop_table(&self, _schema: &[SharedString], _table: &str) -> String {
+        String::new()
+    }
+
+    /// `script`, a CREATE script read from the schema at `from`, rewritten to create its
+    /// objects in the schema at `to` instead.
+    fn retarget_script(
+        &self,
+        script: &str,
+        _from: &[SharedString],
+        _to: &[SharedString],
+    ) -> String {
+        script.to_string()
     }
 
     /// Applies one cell change and returns how many rows it touched. Implementations must

@@ -1660,3 +1660,137 @@ fn tls_modes_reach_the_drivers() {
         println!("sql server verify: {refused:#}");
     });
 }
+
+/// Compares a scratch source schema with a scratch target, runs the script on the target, and
+/// compares again: what is left must be exactly what the script leaves commented out.
+async fn compare_and_apply(
+    driver: &dyn Driver,
+    engine: Engine,
+    database: &str,
+    source: &[SharedString],
+    target: &[SharedString],
+) -> quarry::schema_diff::SchemaDiff {
+    let script = quarry::schema_diff::compare(driver, source, "source", driver, target, "target")
+        .await
+        .expect("comparing");
+    println!("{script}");
+    run_script(driver, &script, engine, Some(database)).await;
+    let source_snapshot = driver.schema_snapshot(source).await.expect("source");
+    let target_snapshot = driver.schema_snapshot(target).await.expect("target");
+    quarry::schema_diff::diff(&source_snapshot, &target_snapshot)
+}
+
+fn only_commented_out_drops(remaining: &quarry::schema_diff::SchemaDiff) {
+    assert!(remaining.missing.is_empty(), "{remaining:#?}");
+    assert_eq!(remaining.extra, ["audit"], "{remaining:#?}");
+    let [change] = remaining.changed.as_slice() else {
+        panic!("only the dropped column should differ: {remaining:#?}");
+    };
+    assert!(change.added.is_empty() && change.changed.is_empty(), "{remaining:#?}");
+    let dropped: Vec<&str> = change.dropped.iter().map(|column| column.name.as_str()).collect();
+    assert_eq!(dropped, ["legacy"]);
+}
+
+#[test]
+#[ignore = "needs a live postgres"]
+fn postgres_schema_compare() {
+    runtime().block_on(async {
+        let driver = postgres().await;
+        driver
+            .query(
+                "DROP SCHEMA IF EXISTS quarry_cmp_a CASCADE;
+                 DROP SCHEMA IF EXISTS quarry_cmp_b CASCADE;
+                 CREATE SCHEMA quarry_cmp_a;
+                 CREATE SCHEMA quarry_cmp_b;
+                 CREATE TABLE quarry_cmp_a.customers (
+                     id int PRIMARY KEY, name text NOT NULL);
+                 CREATE INDEX customers_name_idx ON quarry_cmp_a.customers (name);
+                 CREATE TABLE quarry_cmp_a.orders (
+                     id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                     total numeric(12,2) NOT NULL DEFAULT 0, note text);
+                 CREATE TABLE quarry_cmp_b.orders (
+                     id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                     total numeric(10,2), legacy text);
+                 CREATE TABLE quarry_cmp_b.audit (id int)",
+                Some("app"),
+                10,
+            )
+            .await
+            .expect("creating the scratch schemas");
+        let remaining = compare_and_apply(
+            driver.as_ref(),
+            Engine::Postgres,
+            "app",
+            &path(&["app", "quarry_cmp_a"]),
+            &path(&["app", "quarry_cmp_b"]),
+        )
+        .await;
+        driver
+            .query(
+                "DROP SCHEMA quarry_cmp_a CASCADE; DROP SCHEMA quarry_cmp_b CASCADE",
+                Some("app"),
+                10,
+            )
+            .await
+            .expect("dropping the scratch schemas");
+        only_commented_out_drops(&remaining);
+    });
+}
+
+#[test]
+#[ignore = "needs a live sql server"]
+fn sqlserver_schema_compare() {
+    runtime().block_on(async {
+        let driver = sqlserver().await;
+        let drop = "DROP TABLE IF EXISTS quarry_cmp_a.orders, quarry_cmp_a.customers,
+                        quarry_cmp_b.orders, quarry_cmp_b.customers, quarry_cmp_b.audit;
+                    IF SCHEMA_ID('quarry_cmp_a') IS NOT NULL EXEC('DROP SCHEMA quarry_cmp_a');
+                    IF SCHEMA_ID('quarry_cmp_b') IS NOT NULL EXEC('DROP SCHEMA quarry_cmp_b');";
+        driver.query(drop, Some("app"), 10).await.expect("clearing");
+        for statement in [
+            "CREATE SCHEMA quarry_cmp_a",
+            "CREATE SCHEMA quarry_cmp_b",
+            "CREATE TABLE quarry_cmp_a.customers (id int PRIMARY KEY, name nvarchar(50) NOT NULL);
+             CREATE INDEX customers_name ON quarry_cmp_a.customers (name);
+             CREATE TABLE quarry_cmp_a.orders (
+                 id int IDENTITY PRIMARY KEY, total decimal(12, 2) NOT NULL DEFAULT 0,
+                 note nvarchar(max) NULL);
+             CREATE TABLE quarry_cmp_b.orders (
+                 id int IDENTITY PRIMARY KEY, total decimal(10, 2) NULL,
+                 legacy nvarchar(max) NULL);
+             CREATE TABLE quarry_cmp_b.audit (id int);",
+        ] {
+            driver.query(statement, Some("app"), 10).await.expect(statement);
+        }
+        let remaining = compare_and_apply(
+            driver.as_ref(),
+            Engine::SqlServer,
+            "app",
+            &path(&["app", "quarry_cmp_a"]),
+            &path(&["app", "quarry_cmp_b"]),
+        )
+        .await;
+        driver.query(drop, Some("app"), 10).await.expect("dropping");
+        // SQL Server cannot change a default with ALTER COLUMN; the script says so instead,
+        // so the default of `total` is the one difference besides the commented-out drops.
+        assert!(remaining.missing.is_empty(), "{remaining:#?}");
+        assert_eq!(remaining.extra, ["audit"], "{remaining:#?}");
+        let [change] = remaining.changed.as_slice() else {
+            panic!("only orders should differ: {remaining:#?}");
+        };
+        let dropped: Vec<&str> = change.dropped.iter().map(|column| column.name.as_str()).collect();
+        assert_eq!(dropped, ["legacy"]);
+        assert!(change.added.is_empty(), "{remaining:#?}");
+        let changed: Vec<&str> = change
+            .changed
+            .iter()
+            .map(|column| column.after.name.as_str())
+            .collect();
+        assert_eq!(changed, ["total"]);
+        let [total] = change.changed.as_slice() else {
+            unreachable!()
+        };
+        assert_eq!(total.before.data_type, total.after.data_type);
+        assert_eq!(total.before.nullable, total.after.nullable);
+    });
+}
