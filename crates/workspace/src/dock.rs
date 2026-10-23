@@ -1881,8 +1881,8 @@ impl Render for PanelButtons {
                 .aria_label(tooltip.clone())
                 .tooltip(Tooltip::text(tooltip))
                 .on_click(move |_, window, cx| {
-                    let closed_with_focus = dock_entity
-                        .update(cx, |dock, cx| dock.cycle_auto_hide_mode(window, cx));
+                    let closed_with_focus =
+                        dock_entity.update(cx, |dock, cx| dock.cycle_auto_hide_mode(window, cx));
                     if closed_with_focus {
                         workspace
                             .update(cx, |workspace, cx| {
