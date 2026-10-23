@@ -379,6 +379,12 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
         false
     }
 
+    /// Whether the item stays in the center for the workspace's whole life: its tab is pinned
+    /// first in its pane and cannot be closed, unpinned, or moved to another pane.
+    fn is_permanent(&self, _cx: &App) -> bool {
+        false
+    }
+
     fn include_in_nav_history() -> bool {
         true
     }
@@ -569,6 +575,7 @@ pub trait ItemHandle: 'static + Send {
     fn downgrade_item(&self) -> Box<dyn WeakItemHandle>;
     fn workspace_settings<'a>(&self, cx: &'a App) -> &'a WorkspaceSettings;
     fn preserve_preview(&self, cx: &App) -> bool;
+    fn is_permanent(&self, cx: &App) -> bool;
     fn include_in_nav_history(&self) -> bool;
     fn relay_action(&self, action: Box<dyn Action>, window: &mut Window, cx: &mut App);
     fn handle_drop(
@@ -1144,6 +1151,10 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn preserve_preview(&self, cx: &App) -> bool {
         self.read(cx).preserve_preview(cx)
+    }
+
+    fn is_permanent(&self, cx: &App) -> bool {
+        self.read(cx).is_permanent(cx)
     }
 
     fn include_in_nav_history(&self) -> bool {

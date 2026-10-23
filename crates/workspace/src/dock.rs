@@ -672,6 +672,7 @@ impl Dock {
     }
 
     fn set_open_internal(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let open = open && self.can_open();
         if open != self.is_open {
             self.is_open = open;
             self.hovered_since_open = false;
@@ -687,8 +688,15 @@ impl Dock {
         }
     }
 
+    /// This fork has no left dock. The project panel is shown as a permanent tab in the center
+    /// instead, and the panels that still sit on the left (git, collab) are only kept for the
+    /// actions they back, such as push, pull and commit.
+    pub fn can_open(&self) -> bool {
+        self.position != DockPosition::Left
+    }
+
     pub fn supports_auto_hide(&self) -> bool {
-        self.position == DockPosition::Left
+        self.position == DockPosition::Left && self.can_open()
     }
 
     pub fn auto_hide_mode(&self) -> AutoHideMode {
@@ -983,6 +991,9 @@ impl Dock {
                             .ok();
                     }
                     PanelEvent::Activate => {
+                        if !this.can_open() {
+                            return;
+                        }
                         if let Some(ix) = this
                             .panel_entries
                             .iter()

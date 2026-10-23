@@ -77,6 +77,7 @@ use workspace::{
     SelectedEntry, SplitDirection, Workspace, WorkspaceSettings, copy_file_permalink,
     dock::{DockPosition, Panel, PanelEvent},
     focus_follows_mouse::FocusFollowsMouse as _,
+    item::Item,
     notifications::{DetachAndPromptErr, NotifyResultExt, NotifyTaskExt},
     open_file_permalink,
 };
@@ -504,12 +505,10 @@ impl FoldedAncestors {
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-            workspace.toggle_panel_focus::<ProjectPanel>(window, cx);
+            ProjectPanel::activate_tab(workspace, window, cx);
         });
         workspace.register_action(|workspace, _: &Toggle, window, cx| {
-            if !workspace.toggle_panel_focus::<ProjectPanel>(window, cx) {
-                workspace.close_panel::<ProjectPanel>(window, cx);
-            }
+            ProjectPanel::activate_tab(workspace, window, cx);
         });
 
         workspace.register_action(|workspace, _: &ToggleHideGitIgnore, _, cx| {
@@ -555,8 +554,7 @@ pub fn init(cx: &mut App) {
         });
 
         workspace.register_action(|workspace, action: &Rename, window, cx| {
-            workspace.open_panel::<ProjectPanel>(window, cx);
-            if let Some(panel) = workspace.panel::<ProjectPanel>(cx) {
+            if let Some(panel) = ProjectPanel::activate_tab(workspace, window, cx) {
                 panel.update(cx, |panel, cx| {
                     if let Some(first_marked) = panel.marked_entries.first() {
                         let first_marked = *first_marked;
@@ -569,8 +567,7 @@ pub fn init(cx: &mut App) {
         });
 
         workspace.register_action(|workspace, action: &Duplicate, window, cx| {
-            workspace.open_panel::<ProjectPanel>(window, cx);
-            if let Some(panel) = workspace.panel::<ProjectPanel>(cx) {
+            if let Some(panel) = ProjectPanel::activate_tab(workspace, window, cx) {
                 panel.update(cx, |panel, cx| {
                     panel.duplicate(action, window, cx);
                 });
@@ -631,6 +628,7 @@ pub enum Event {
         split_direction: Option<SplitDirection>,
     },
     Focus,
+    Activate,
 }
 
 struct DraggedProjectEntryView {
@@ -759,11 +757,11 @@ impl ProjectPanel {
                             .reveal_entry(project.clone(), *entry_id, false, window, cx)
                             .log_err()
                         {
-                            cx.emit(PanelEvent::Activate);
+                            cx.emit(Event::Activate);
                         }
                     }
                     project::Event::ActivateProjectPanel => {
-                        cx.emit(PanelEvent::Activate);
+                        cx.emit(Event::Activate);
                     }
                     project::Event::DiskBasedDiagnosticsFinished { .. }
                     | project::Event::DiagnosticsUpdated { .. } => {
@@ -933,7 +931,7 @@ impl ProjectPanel {
             move |workspace, _, event, window, cx| match event {
                 &Event::OpenedEntry {
                     entry_id,
-                    focus_opened_item,
+                    focus_opened_item: _,
                     allow_preview,
                 } => {
                     if let Some(worktree) = project.read(cx).worktree_for_entry(entry_id, cx)
@@ -950,7 +948,9 @@ impl ProjectPanel {
                                         path: file_path.clone(),
                                     },
                                     None,
-                                    focus_opened_item,
+                                    // The opened item takes the place of the panel's tab, so
+                                    // focus has to follow it rather than stay on a hidden panel.
+                                    true,
                                     allow_preview,
                                     true,
                                     window, cx,
@@ -981,10 +981,6 @@ impl ProjectPanel {
                                     project_panel.marked_entries.push(entry);
                                     project_panel.selection = Some(entry);
                                 });
-                                if !focus_opened_item {
-                                    let focus_handle = project_panel.read(cx).focus_handle.clone();
-                                    window.focus(&focus_handle, cx);
-                                }
                             }
                         }
                 }
@@ -1008,6 +1004,11 @@ impl ProjectPanel {
                                 .detach_and_log_err(cx);
                         }
                 }
+                &Event::Activate => {
+                    if let Some(project_panel) = project_panel.upgrade() {
+                        workspace.activate_item(&project_panel, true, true, window, cx);
+                    }
+                }
 
                 _ => {}
             }
@@ -1022,8 +1023,21 @@ impl ProjectPanel {
         mut cx: AsyncWindowContext,
     ) -> Result<Entity<Self>> {
         workspace.update_in(&mut cx, |workspace, window, cx| {
-            ProjectPanel::new(workspace, window, cx)
+            let project_panel = ProjectPanel::new(workspace, window, cx);
+            workspace.add_permanent_item(Box::new(project_panel.clone()), window, cx);
+            project_panel
         })
+    }
+
+    /// Shows and focuses the panel's tab in the center, where it lives instead of a dock.
+    fn activate_tab(
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Option<Entity<Self>> {
+        let project_panel = workspace.panel::<ProjectPanel>(cx)?;
+        workspace.activate_item(&project_panel, true, true, window, cx);
+        Some(project_panel)
     }
 
     fn update_diagnostics(&mut self, cx: &mut Context<Self>) {
@@ -8204,16 +8218,35 @@ impl EventEmitter<Event> for ProjectPanel {}
 
 impl EventEmitter<PanelEvent> for ProjectPanel {}
 
+impl Item for ProjectPanel {
+    type Event = Event;
+
+    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        "Main".into()
+    }
+
+    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
+        Some(Icon::new(IconName::FileTree))
+    }
+
+    fn show_toolbar(&self) -> bool {
+        false
+    }
+
+    fn is_permanent(&self, _cx: &App) -> bool {
+        true
+    }
+}
+
+// The panel stays registered with the workspace so that `Workspace::panel` keeps finding it, but
+// it is shown as a permanent tab in the center; the left dock it is kept in never opens.
 impl Panel for ProjectPanel {
-    fn position(&self, _: &Window, cx: &App) -> DockPosition {
-        match ProjectPanelSettings::get_global(cx).dock {
-            DockSide::Left => DockPosition::Left,
-            DockSide::Right => DockPosition::Right,
-        }
+    fn position(&self, _: &Window, _: &App) -> DockPosition {
+        DockPosition::Left
     }
 
     fn position_is_valid(&self, position: DockPosition) -> bool {
-        matches!(position, DockPosition::Left | DockPosition::Right)
+        position == DockPosition::Left
     }
 
     fn set_position(&mut self, position: DockPosition, _: &mut Window, cx: &mut Context<Self>) {

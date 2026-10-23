@@ -5,10 +5,10 @@ use crate::{
         CUSTOM_GIT_COMMANDS_DOCS_SLUG, CommitContextMenuData, CommitContextMenuSource,
         CommitMenuEntries, commit_context_menu, git_context_menu_tasks, git_task_context,
     },
+    commit_modal::CommitModal,
     commit_tooltip::CommitAvatar,
     commit_view::CommitView,
     create_branch_at_commit,
-    git_panel::GitPanel,
     git_status_icon,
     project_diff::ProjectDiff,
     rename_branch_modal,
@@ -4059,11 +4059,11 @@ impl GitGraph {
                     )
                     .style(ButtonStyle::OutlinedGhost)
                     .label_size(LabelSize::Small)
-                    .tooltip(Tooltip::text("Stage and commit in the git panel"))
+                    .tooltip(Tooltip::text("Write a commit message and commit"))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.workspace
                             .update(cx, |workspace, cx| {
-                                workspace.focus_panel::<GitPanel>(window, cx);
+                                CommitModal::toggle(workspace, None, window, cx);
                             })
                             .log_err();
                     })),
