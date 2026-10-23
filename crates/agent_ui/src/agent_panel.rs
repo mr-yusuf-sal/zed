@@ -43,7 +43,9 @@ use crate::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,
     normalize_terminal_custom_title, terminal_title_without_prefix,
 };
-use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
+use crate::thread_metadata_store::{
+    ThreadId, ThreadMetadata, ThreadMetadataStore, ThreadMetadataStoreEvent,
+};
 use crate::{
     Agent, AgentInitialContent, AgentThreadSource, ExternalSourcePrompt, NewExternalAgentThread,
     NewNativeAgentThreadFromSummary,
@@ -345,6 +347,11 @@ struct SerializedAgentPanel {
     last_active_terminal_id: Option<String>,
     #[serde(default)]
     new_draft_thread_id: Option<ThreadId>,
+    /// Threads whose work was still running, loaded again when the panel is,
+    /// so that work an agent kept doing while Zed was closed shows as running
+    /// without opening each thread.
+    #[serde(default)]
+    busy_thread_ids: Vec<ThreadId>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -1157,6 +1164,9 @@ pub struct AgentPanel {
     _thread_metadata_store_subscription: Subscription,
     _settings_subscription: Subscription,
     retained_thread_subscriptions: HashMap<ThreadId, Subscription>,
+    /// The threads last saved as busy, so the panel is saved again only when
+    /// that changes.
+    busy_thread_ids: HashSet<ThreadId>,
     last_context_source: Option<AgentContextSource>,
 
     is_active: bool,
@@ -1227,6 +1237,7 @@ impl AgentPanel {
             .draft_thread
             .as_ref()
             .map(|draft| draft.read(cx).thread_id);
+        let busy_thread_ids = self.busy_thread_ids.iter().copied().collect();
 
         let kvp = KeyValueStore::global(cx);
         self.pending_serialization = Some(cx.background_spawn(async move {
@@ -1238,6 +1249,7 @@ impl AgentPanel {
                     last_active_thread,
                     last_active_terminal_id,
                     new_draft_thread_id,
+                    busy_thread_ids,
                 },
                 kvp,
             )
@@ -1375,6 +1387,40 @@ impl AgentPanel {
                 None
             };
 
+            let busy_threads_to_restore = match serialized_panel
+                .as_ref()
+                .filter(|panel| has_open_project && !panel.busy_thread_ids.is_empty())
+            {
+                Some(panel) => match cx.update(|_window, cx| {
+                    ThreadMetadataStore::try_global(cx).map(|store| {
+                        let reload_task = store.read(cx).reload_task();
+                        (store, reload_task)
+                    })
+                }) {
+                    Ok(Some((store, reload_task))) => {
+                        reload_task.await;
+                        store.read_with(cx, |store, _cx| {
+                            panel
+                                .busy_thread_ids
+                                .iter()
+                                .filter_map(|thread_id| store.entry(*thread_id))
+                                .filter(|entry| !entry.archived && !entry.is_draft())
+                                .cloned()
+                                .collect::<Vec<_>>()
+                        })
+                    }
+                    Ok(None) => {
+                        log::warn!("failed to restore busy threads: metadata store missing");
+                        Vec::new()
+                    }
+                    Err(err) => {
+                        log::warn!("failed to access thread metadata store: {err}");
+                        Vec::new()
+                    }
+                },
+                None => Vec::new(),
+            };
+
             let panel = workspace.update_in(cx, |workspace, window, cx| {
                 let panel = cx.new(|cx| Self::new(workspace, window, cx));
 
@@ -1455,6 +1501,7 @@ impl AgentPanel {
                     {
                         panel.restore_new_draft(new_draft_thread_id, window, cx);
                     }
+                    panel.restore_busy_threads(busy_threads_to_restore, window, cx);
                     cx.notify();
                 });
 
@@ -1578,6 +1625,7 @@ impl AgentPanel {
             _thread_metadata_store_subscription,
             _settings_subscription,
             retained_thread_subscriptions: HashMap::default(),
+            busy_thread_ids: HashSet::default(),
             last_context_source: None,
             is_active: false,
         };
@@ -4317,7 +4365,9 @@ impl AgentPanel {
                     return true;
                 };
                 let thread = thread_view.read(cx).thread.read(cx);
-                thread.connection().supports_load_session() && thread.is_idle_for_retention()
+                thread.connection().supports_load_session()
+                    && thread.is_idle_for_retention()
+                    && !thread.has_background_work(cx)
             })
             .collect::<Vec<_>>();
 
@@ -4333,6 +4383,71 @@ impl AgentPanel {
         for id in to_remove {
             self.remove_retained_thread(&id);
         }
+    }
+
+    fn save_busy_threads(&mut self, cx: &mut Context<Self>) {
+        let busy_thread_ids = self
+            .conversation_views()
+            .into_iter()
+            .filter_map(|conversation_view| {
+                let conversation_view = conversation_view.read(cx);
+                let thread_id = conversation_view.thread_id;
+                let is_busy = match conversation_view.root_thread(cx) {
+                    Some(thread) => {
+                        let thread = thread.read(cx);
+                        !thread.is_idle_for_retention() || thread.has_background_work(cx)
+                    }
+                    // A thread restored as busy is still loading, and saving it
+                    // as idle now would lose it if Zed quit before it loads.
+                    None => self.busy_thread_ids.contains(&thread_id),
+                };
+                is_busy.then_some(thread_id)
+            })
+            .collect::<HashSet<_>>();
+        if busy_thread_ids != self.busy_thread_ids {
+            self.busy_thread_ids = busy_thread_ids;
+            self.serialize(cx);
+        }
+    }
+
+    /// Loads the threads that were busy when Zed last saved the panel without
+    /// opening them, so that their sessions are loaded and work the agent kept
+    /// doing meanwhile shows as running.
+    fn restore_busy_threads(
+        &mut self,
+        threads: Vec<ThreadMetadata>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if threads.is_empty() {
+            return;
+        }
+        let selected_agent = self.selected_agent.clone();
+        let active_thread_id = self.active_thread_id(cx);
+        for metadata in threads {
+            let thread_id = metadata.thread_id;
+            self.busy_thread_ids.insert(thread_id);
+            if active_thread_id == Some(thread_id) || self.retained_threads.contains_key(&thread_id)
+            {
+                continue;
+            }
+            let thread = self.create_agent_thread_with_server(
+                Agent::from(metadata.agent_id.clone()),
+                None,
+                Some(thread_id),
+                Some(metadata.folder_paths().clone()),
+                metadata.title(),
+                None,
+                None,
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            );
+            self.insert_retained_thread(thread_id, thread.conversation_view, cx);
+        }
+        // Loading a thread selects its agent, which restoring in the
+        // background must not do.
+        self.set_selected_agent_and_persist(selected_agent, cx);
     }
 
     pub(crate) fn active_native_agent_thread(&self, cx: &App) -> Option<Entity<agent::Thread>> {
@@ -4710,6 +4825,7 @@ impl AgentPanel {
                 } else {
                     cx.emit(AgentPanelEvent::EntryChanged);
                 }
+                this.save_busy_threads(cx);
                 this.ensure_sibling_host_installed(&server_view, window, cx);
                 cx.notify();
             },

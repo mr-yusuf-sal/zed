@@ -3859,6 +3859,7 @@ impl AcpThread {
             .stopping_subagent_tool_calls
             .insert(tool_call_id.clone())
         {
+            cx.emit(AcpThreadEvent::StatusChanged);
             cx.notify();
         }
     }
@@ -3876,8 +3877,30 @@ impl AcpThread {
             self.running_subagent_tool_calls.remove(&tool_call_id) || stopped
         };
         if changed {
+            // Background work counts toward the thread's status.
+            cx.emit(AcpThreadEvent::StatusChanged);
             cx.notify();
         }
+    }
+
+    /// Whether work the agent started keeps running after its turn ended: a
+    /// subagent it reports as working, or a command that outlived its tool
+    /// call (Claude Code's `run_in_background`).
+    pub fn has_background_work(&self, cx: &App) -> bool {
+        let subagent_running = self
+            .running_subagent_tool_calls
+            .iter()
+            .any(|tool_call_id| !self.stopping_subagent_tool_calls.contains(tool_call_id));
+        subagent_running
+            || self.entries.iter().any(|entry| {
+                let AgentThreadEntry::ToolCall(tool_call) = entry else {
+                    return false;
+                };
+                matches!(tool_call.status(), ToolCallStatus::Completed)
+                    && tool_call
+                        .terminals()
+                        .any(|terminal| terminal.read(cx).output().is_none())
+            })
     }
 
     pub fn notices(&self) -> &[(usize, acp_v2::Notice)] {
@@ -7257,7 +7280,8 @@ impl AcpThread {
 
         cx.spawn(async move |this, cx| {
             let terminal = terminal_task.await?;
-            this.update(cx, |this, _cx| {
+            this.update(cx, |this, cx| {
+                this.notify_when_terminal_exits(&terminal, cx);
                 this.terminals.insert(terminal_id, terminal.clone());
                 terminal
             })
@@ -7346,8 +7370,24 @@ impl AcpThread {
                 cx,
             )
         });
+        self.notify_when_terminal_exits(&entity, cx);
         self.terminals.insert(terminal_id.clone(), entity.clone());
         entity
+    }
+
+    /// A command can outlive its tool call, and nothing else about the thread
+    /// changes when it exits, so those that count it as background work would
+    /// not hear of the exit otherwise.
+    fn notify_when_terminal_exits(&self, terminal: &Entity<Terminal>, cx: &mut Context<Self>) {
+        let mut exited = terminal.read(cx).output().is_some();
+        cx.observe(terminal, move |_, terminal, cx| {
+            if !exited && terminal.read(cx).output().is_some() {
+                exited = true;
+                cx.emit(AcpThreadEvent::StatusChanged);
+                cx.notify();
+            }
+        })
+        .detach();
     }
 
     pub fn mark_as_subagent_output(&mut self, cx: &mut Context<Self>) {
