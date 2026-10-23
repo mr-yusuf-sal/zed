@@ -1,11 +1,11 @@
 use crate::driver::{
-    CatalogEntry, CellEdit, Driver, EditTarget, ObjectKind, ObjectNode, ResultSet, RowKey,
+    CatalogEntry, CellEdit, Driver, EditTarget, ObjectKind, ObjectNode, ResultSet, RowKey, TlsMode,
 };
 use anyhow::{Context as _, Result, bail};
 use futures::{TryStreamExt as _, future::join_all};
 use mongodb::{
     bson::{Bson, DateTime, Document, doc, oid::ObjectId},
-    options::{ClientOptions, Credential},
+    options::{ClientOptions, Credential, Tls, TlsOptions},
     results::CollectionType,
 };
 use ui::SharedString;
@@ -43,6 +43,17 @@ impl MongoDriver {
         username: Option<&str>,
         password: Option<&str>,
     ) -> Result<Self> {
+        Self::connect_with(host, port, database, username, password, TlsMode::Default).await
+    }
+
+    pub async fn connect_with(
+        host: &str,
+        port: u16,
+        database: Option<&str>,
+        username: Option<&str>,
+        password: Option<&str>,
+        tls: TlsMode,
+    ) -> Result<Self> {
         let mut options = ClientOptions::parse(format!("mongodb://{host}:{port}"))
             .await
             .with_context(|| format!("connecting to mongodb at {host}:{port}"))?;
@@ -56,6 +67,16 @@ impl MongoDriver {
                     .build(),
             );
         }
+        options.tls = match tls {
+            TlsMode::Default => options.tls,
+            TlsMode::Disable => Some(Tls::Disabled),
+            TlsMode::Require => Some(Tls::Enabled(
+                TlsOptions::builder()
+                    .allow_invalid_certificates(true)
+                    .build(),
+            )),
+            TlsMode::Verify => Some(Tls::Enabled(TlsOptions::default())),
+        };
         let client = mongodb::Client::with_options(options)
             .with_context(|| format!("connecting to mongodb at {host}:{port}"))?;
 

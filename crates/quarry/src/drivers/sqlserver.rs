@@ -1,5 +1,5 @@
 use crate::driver::{
-    CatalogEntry, CellEdit, Driver, EditTarget, ObjectKind, ObjectNode, ResultSet, RowKey,
+    CatalogEntry, CellEdit, Driver, EditTarget, ObjectKind, ObjectNode, ResultSet, RowKey, TlsMode,
 };
 use anyhow::{Context as _, Result, bail};
 use futures::TryStreamExt as _;
@@ -61,6 +61,17 @@ impl SqlServerDriver {
         username: Option<&str>,
         password: Option<&str>,
     ) -> Result<Self> {
+        Self::connect_with(host, port, database, username, password, TlsMode::Default).await
+    }
+
+    pub async fn connect_with(
+        host: &str,
+        port: u16,
+        database: Option<&str>,
+        username: Option<&str>,
+        password: Option<&str>,
+        tls: TlsMode,
+    ) -> Result<Self> {
         let mut config = Config::new();
         config.host(host);
         config.port(port);
@@ -79,11 +90,17 @@ impl SqlServerDriver {
                 "SQL Server needs a username in the connection URL on this platform; integrated authentication is Windows-only"
             ),
         });
-        // Developer and container instances almost always present a self-signed certificate,
-        // and refusing it would make the driver unusable against exactly the servers it is
-        // most often pointed at. The connection is still encrypted.
-        config.trust_cert();
-        config.encryption(EncryptionLevel::Required);
+        match tls {
+            // Developer and container instances almost always present a self-signed
+            // certificate, and refusing it would make the driver unusable against exactly the
+            // servers it is most often pointed at. The connection is still encrypted.
+            TlsMode::Default | TlsMode::Require => {
+                config.trust_cert();
+                config.encryption(EncryptionLevel::Required);
+            }
+            TlsMode::Verify => config.encryption(EncryptionLevel::Required),
+            TlsMode::Disable => config.encryption(EncryptionLevel::NotSupported),
+        }
 
         let browse = Session::default();
         let connection = open(&config, &browse)

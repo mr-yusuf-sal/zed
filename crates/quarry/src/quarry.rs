@@ -15,6 +15,7 @@ pub mod result_table;
 pub mod runtime;
 pub mod statements;
 pub mod templates;
+pub mod tunnel;
 
 use anyhow::{Context as _, Result, anyhow};
 use driver::{ConnectionConfig, Driver, Engine};
@@ -75,7 +76,7 @@ pub async fn test_connection(
 }
 
 async fn open_driver(
-    config: ConnectionConfig,
+    mut config: ConnectionConfig,
     username: Option<String>,
     password: Option<String>,
     cx: &mut gpui::AsyncApp,
@@ -84,18 +85,39 @@ async fn open_driver(
         .update(|cx| QuarryRuntime::global(cx))
         .ok_or_else(|| anyhow!("the Quarry runtime failed to start; see the log"))?;
 
+    // Through a bastion, the driver connects to the tunnel's local end instead. The config is
+    // only a copy, so the saved host and port, which name the server as the bastion sees it
+    // and file its password, are left alone.
+    let tunnel = match config.ssh.clone() {
+        Some(ssh) => {
+            let host = config.host.clone();
+            let port = config.port;
+            let description = ssh.to_string();
+            let tunnel = runtime
+                .spawn(async move { tunnel::open(&ssh, &host, port).await })
+                .await
+                .with_context(|| format!("opening the SSH tunnel through {description}"))?;
+            config.host = "127.0.0.1".to_string();
+            config.port = tunnel.local_port;
+            Some(tunnel)
+        }
+        None => None,
+    };
+    let tls = config.tls;
+
     let driver: Arc<dyn Driver> = match config.engine {
         Engine::Postgres => {
             let host = config.host.clone();
             let database = config.database.clone();
             runtime
                 .spawn(async move {
-                    let driver = drivers::postgres::PostgresDriver::connect(
+                    let driver = drivers::postgres::PostgresDriver::connect_with(
                         &host,
                         config.port,
                         database.as_deref(),
                         username.as_deref(),
                         password.as_deref(),
+                        tls,
                     )
                     .await?;
                     Ok(Arc::new(driver) as Arc<dyn Driver>)
@@ -103,76 +125,107 @@ async fn open_driver(
                 .await?
         }
         Engine::SqlServer => {
-            open(&runtime, &config, username, password, |h, p, d, u, pw| {
-                Box::pin(async move {
-                    Ok(Arc::new(
-                        drivers::sqlserver::SqlServerDriver::connect(
-                            &h,
-                            p,
-                            d.as_deref(),
-                            u.as_deref(),
-                            pw.as_deref(),
-                        )
-                        .await?,
-                    ) as Arc<dyn Driver>)
-                })
-            })
+            open(
+                &runtime,
+                &config,
+                username,
+                password,
+                move |h, p, d, u, pw| {
+                    Box::pin(async move {
+                        Ok(Arc::new(
+                            drivers::sqlserver::SqlServerDriver::connect_with(
+                                &h,
+                                p,
+                                d.as_deref(),
+                                u.as_deref(),
+                                pw.as_deref(),
+                                tls,
+                            )
+                            .await?,
+                        ) as Arc<dyn Driver>)
+                    })
+                },
+            )
             .await?
         }
         Engine::MongoDb => {
-            open(&runtime, &config, username, password, |h, p, d, u, pw| {
-                Box::pin(async move {
-                    Ok(Arc::new(
-                        drivers::mongodb::MongoDriver::connect(
-                            &h,
-                            p,
-                            d.as_deref(),
-                            u.as_deref(),
-                            pw.as_deref(),
-                        )
-                        .await?,
-                    ) as Arc<dyn Driver>)
-                })
-            })
+            open(
+                &runtime,
+                &config,
+                username,
+                password,
+                move |h, p, d, u, pw| {
+                    Box::pin(async move {
+                        Ok(Arc::new(
+                            drivers::mongodb::MongoDriver::connect_with(
+                                &h,
+                                p,
+                                d.as_deref(),
+                                u.as_deref(),
+                                pw.as_deref(),
+                                tls,
+                            )
+                            .await?,
+                        ) as Arc<dyn Driver>)
+                    })
+                },
+            )
             .await?
         }
         Engine::Redis => {
-            open(&runtime, &config, username, password, |h, p, d, u, pw| {
-                Box::pin(async move {
-                    Ok(Arc::new(
-                        drivers::redis::RedisDriver::connect(
-                            &h,
-                            p,
-                            d.as_deref(),
-                            u.as_deref(),
-                            pw.as_deref(),
-                        )
-                        .await?,
-                    ) as Arc<dyn Driver>)
-                })
-            })
+            open(
+                &runtime,
+                &config,
+                username,
+                password,
+                move |h, p, d, u, pw| {
+                    Box::pin(async move {
+                        Ok(Arc::new(
+                            drivers::redis::RedisDriver::connect_with(
+                                &h,
+                                p,
+                                d.as_deref(),
+                                u.as_deref(),
+                                pw.as_deref(),
+                                tls,
+                            )
+                            .await?,
+                        ) as Arc<dyn Driver>)
+                    })
+                },
+            )
             .await?
         }
         Engine::ClickHouse => {
-            open(&runtime, &config, username, password, |h, p, d, u, pw| {
-                Box::pin(async move {
-                    Ok(Arc::new(
-                        drivers::clickhouse::ClickHouseDriver::connect(
-                            &h,
-                            p,
-                            d.as_deref(),
-                            u.as_deref(),
-                            pw.as_deref(),
-                        )
-                        .await?,
-                    ) as Arc<dyn Driver>)
-                })
-            })
+            open(
+                &runtime,
+                &config,
+                username,
+                password,
+                move |h, p, d, u, pw| {
+                    Box::pin(async move {
+                        Ok(Arc::new(
+                            drivers::clickhouse::ClickHouseDriver::connect_with(
+                                &h,
+                                p,
+                                d.as_deref(),
+                                u.as_deref(),
+                                pw.as_deref(),
+                                tls,
+                            )
+                            .await?,
+                        ) as Arc<dyn Driver>)
+                    })
+                },
+            )
             .await?
         }
     };
 
-    Ok(driver)
+    Ok(match tunnel {
+        Some(tunnel) => Arc::new(tunnel::TunneledDriver::new(driver, tunnel)),
+        None => driver,
+    })
 }
 
 /// Every engine connects the same way — move the owned config fields onto the Quarry runtime,

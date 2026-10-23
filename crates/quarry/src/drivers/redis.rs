@@ -1,6 +1,6 @@
 use crate::driver::{
     CatalogEntry, CellEdit, Driver, EditTarget, KeyAction, ObjectKind, ObjectNode, ResultSet,
-    RowKey,
+    RowKey, TlsMode,
 };
 use anyhow::{Context as _, Result, anyhow, bail};
 use collections::{BTreeMap, HashMap, HashSet};
@@ -38,6 +38,17 @@ impl RedisDriver {
         username: Option<&str>,
         password: Option<&str>,
     ) -> Result<Self> {
+        Self::connect_with(host, port, database, username, password, TlsMode::Default).await
+    }
+
+    pub async fn connect_with(
+        host: &str,
+        port: u16,
+        database: Option<&str>,
+        username: Option<&str>,
+        password: Option<&str>,
+        tls: TlsMode,
+    ) -> Result<Self> {
         let default_database = match database.filter(|database| !database.trim().is_empty()) {
             Some(database) => parse_database(database)?,
             None => 0,
@@ -45,7 +56,15 @@ impl RedisDriver {
         // Built directly rather than as a URL so a password with `@` or `/` in it needs no
         // escaping.
         let connection_info = ConnectionInfo {
-            addr: ConnectionAddr::Tcp(host.to_string(), port),
+            addr: match tls {
+                TlsMode::Default | TlsMode::Disable => ConnectionAddr::Tcp(host.to_string(), port),
+                TlsMode::Require | TlsMode::Verify => ConnectionAddr::TcpTls {
+                    host: host.to_string(),
+                    port,
+                    insecure: tls == TlsMode::Require,
+                    tls_params: None,
+                },
+            },
             redis: RedisConnectionInfo {
                 db: default_database,
                 username: username.map(str::to_string),
