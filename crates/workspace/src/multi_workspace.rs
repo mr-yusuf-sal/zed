@@ -2,9 +2,9 @@ use anyhow::{Context as _, Result};
 use fs::Fs;
 
 use gpui::{
-    AnyView, App, Context, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    ManagedView, MouseButton, Pixels, Render, Subscription, Task, TaskExt, WeakEntity, Window,
-    WindowId, actions, deferred, px,
+    AnyView, App, Bounds, Context, DispatchPhase, DragMoveEvent, Entity, EntityId, EventEmitter,
+    FocusHandle, Focusable, ManagedView, MouseButton, MouseMoveEvent, Pixels, Point, Render,
+    Subscription, Task, TaskExt, WeakEntity, Window, WindowId, actions, canvas, deferred, px,
 };
 pub use project::ProjectGroupKey;
 use project::{DisableAiSettings, Project};
@@ -24,7 +24,9 @@ use settings::SidebarDockPosition;
 use ui::{ContextMenu, right_click_menu};
 
 const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.0);
+const SIDEBAR_PINNED_KEY: &str = "sidebar_pinned";
 
+use crate::dock::{AUTO_HIDE_DELAY, AUTO_HIDE_REVEAL_EDGE};
 use crate::open_remote_project_with_existing_connection;
 use crate::{
     CloseIntent, CloseWindow, DockPosition, Event as WorkspaceEvent, Item, ModalView, OpenMode,
@@ -316,6 +318,12 @@ pub struct MultiWorkspace {
     sidebar: Option<Box<dyn SidebarHandle>>,
     sidebar_open: bool,
     sidebar_overlay: Option<AnyView>,
+    sidebar_pinned: bool,
+    // Same arming rule as `Dock`: a sidebar opened from the keyboard only auto-hides after the
+    // mouse has been over it once.
+    sidebar_hovered_since_open: bool,
+    sidebar_auto_hide_task: Option<Task<()>>,
+    root_bounds: Option<Bounds<Pixels>>,
     pending_removal_tasks: Vec<Task<()>>,
     _serialize_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -377,6 +385,14 @@ impl MultiWorkspace {
             sidebar: None,
             sidebar_open: false,
             sidebar_overlay: None,
+            sidebar_pinned: db::kvp::KeyValueStore::global(cx)
+                .read_kvp(SIDEBAR_PINNED_KEY)
+                .log_err()
+                .flatten()
+                .is_some_and(|value| value == "true"),
+            sidebar_hovered_since_open: false,
+            sidebar_auto_hide_task: None,
+            root_bounds: None,
             pending_removal_tasks: Vec::new(),
             _serialize_task: None,
             _subscriptions: vec![release_subscription, settings_subscription],
@@ -409,6 +425,107 @@ impl MultiWorkspace {
 
     pub fn sidebar_open(&self) -> bool {
         self.sidebar_open
+    }
+
+    pub fn sidebar_pinned(&self) -> bool {
+        self.sidebar_pinned
+    }
+
+    pub fn toggle_sidebar_pinned(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_pinned = !self.sidebar_pinned;
+        self.sidebar_auto_hide_task = None;
+        let pinned = self.sidebar_pinned;
+        let kvp = db::kvp::KeyValueStore::global(cx);
+        db::write_and_log(cx, move || async move {
+            kvp.write_kvp(SIDEBAR_PINNED_KEY.to_string(), pinned.to_string())
+                .await
+        });
+        cx.notify();
+    }
+
+    fn auto_hide_on_mouse_move(
+        &mut self,
+        mouse_position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if cx.has_active_drag() {
+            return;
+        }
+        self.auto_hide_sidebar_on_mouse_move(mouse_position, window, cx);
+        self.workspace().clone().update(cx, |workspace, cx| {
+            workspace.auto_hide_docks_on_mouse_move(mouse_position, window, cx);
+        });
+    }
+
+    fn auto_hide_sidebar_on_mouse_move(
+        &mut self,
+        mouse_position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.sidebar_pinned || !self.multi_workspace_enabled(cx) {
+            return;
+        }
+        let Some(root_bounds) = self.root_bounds else {
+            return;
+        };
+        let Some(sidebar_width) = self.sidebar.as_ref().map(|sidebar| sidebar.width(cx)) else {
+            return;
+        };
+        let on_right = self.sidebar_side(cx) == SidebarSide::Right;
+
+        if !self.sidebar_open {
+            // Only reveal beside the workspace body, so reaching for the window controls or the
+            // title bar near the edge doesn't pop the sidebar open.
+            let workspace_bounds = self.workspace().read(cx).bounds;
+            let within_height = mouse_position.y >= workspace_bounds.top()
+                && mouse_position.y <= workspace_bounds.bottom();
+            let at_edge = if on_right {
+                mouse_position.x >= root_bounds.right() - AUTO_HIDE_REVEAL_EDGE
+            } else {
+                mouse_position.x <= root_bounds.left() + AUTO_HIDE_REVEAL_EDGE
+            };
+            if within_height && at_edge {
+                self.previous_focus_handle = window.focused(cx);
+                self.apply_open_sidebar(cx);
+            }
+            return;
+        }
+
+        let reach = sidebar_width + SIDEBAR_RESIZE_HANDLE_SIZE;
+        let is_inside = if on_right {
+            mouse_position.x >= root_bounds.right() - reach
+        } else {
+            mouse_position.x <= root_bounds.left() + reach
+        };
+        if is_inside {
+            self.sidebar_hovered_since_open = true;
+            self.sidebar_auto_hide_task = None;
+        } else if self.sidebar_hovered_since_open && self.sidebar_auto_hide_task.is_none() {
+            self.sidebar_auto_hide_task = Some(cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor().timer(AUTO_HIDE_DELAY).await;
+                this.update_in(cx, |this, window, cx| {
+                    this.sidebar_auto_hide_task = None;
+                    this.hide_sidebar_after_mouse_left(window, cx);
+                })
+                .log_err();
+            }));
+        }
+    }
+
+    fn hide_sidebar_after_mouse_left(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The thread switcher overlay, a modal, or a drag out of the sidebar still needs it; the
+        // next mouse move after they end re-arms the timer.
+        if self.sidebar_pinned
+            || !self.sidebar_open
+            || cx.has_active_drag()
+            || self.sidebar_overlay.is_some()
+            || self.workspace().read(cx).modal_layer.read(cx).has_active_modal()
+        {
+            return;
+        }
+        self.close_sidebar(window, cx);
     }
 
     pub fn sidebar_has_notifications(&self, cx: &App) -> bool {
@@ -501,6 +618,8 @@ impl MultiWorkspace {
 
     fn apply_open_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar_open = true;
+        self.sidebar_hovered_since_open = false;
+        self.sidebar_auto_hide_task = None;
         self.retain_active_workspace(cx);
         let sidebar_focus_handle = self.sidebar.as_ref().map(|s| s.focus_handle(cx));
         for workspace in self.workspaces().cloned().collect::<Vec<_>>() {
@@ -519,6 +638,8 @@ impl MultiWorkspace {
         };
         telemetry::event!("Sidebar Toggled", action = "close", side = side);
         self.sidebar_open = false;
+        self.sidebar_hovered_since_open = false;
+        self.sidebar_auto_hide_task = None;
         for workspace in self.workspaces().cloned().collect::<Vec<_>>() {
             workspace.update(cx, |workspace, _cx| {
                 workspace.set_sidebar_focus_handle(None);
@@ -2206,6 +2327,36 @@ impl Render for MultiWorkspace {
                         ))
                     },
                 )
+                .child({
+                    let this = cx.weak_entity();
+                    canvas(
+                        {
+                            let this = this.clone();
+                            move |bounds, _, cx| {
+                                this.update(cx, |this, _| this.root_bounds = Some(bounds))
+                                    .ok();
+                            }
+                        },
+                        move |_, _, window, _| {
+                            window.on_mouse_event(
+                                move |event: &MouseMoveEvent, phase, window, cx| {
+                                    if phase == DispatchPhase::Bubble {
+                                        this.update(cx, |this, cx| {
+                                            this.auto_hide_on_mouse_move(
+                                                event.position,
+                                                window,
+                                                cx,
+                                            );
+                                        })
+                                        .ok();
+                                    }
+                                },
+                            );
+                        },
+                    )
+                    .absolute()
+                    .size_full()
+                })
                 .children(left_sidebar)
                 .child(
                     div()

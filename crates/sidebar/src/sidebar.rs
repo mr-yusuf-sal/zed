@@ -7537,6 +7537,32 @@ impl Sidebar {
             })
     }
 
+    fn render_sidebar_pin_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_pinned = self
+            .multi_workspace
+            .upgrade()
+            .is_some_and(|multi_workspace| multi_workspace.read(cx).sidebar_pinned());
+        let tooltip = if is_pinned {
+            "Unpin Sidebar (Auto-Hide)"
+        } else {
+            "Pin Sidebar"
+        };
+
+        IconButton::new("sidebar-pin", IconName::Pin)
+            .icon_size(IconSize::Small)
+            .toggle_state(is_pinned)
+            .aria_label(tooltip)
+            .tooltip(Tooltip::text(tooltip))
+            .on_click(cx.listener(|this, _, _, cx| {
+                if let Some(multi_workspace) = this.multi_workspace.upgrade() {
+                    multi_workspace.update(cx, |multi_workspace, cx| {
+                        multi_workspace.toggle_sidebar_pinned(cx);
+                    });
+                }
+                cx.notify();
+            }))
+    }
+
     fn render_sidebar_bottom_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_archive = matches!(self.view, SidebarView::Archive(..));
         let is_archived_only = matches!(
@@ -7557,6 +7583,7 @@ impl Sidebar {
             .border_t_1()
             .border_color(cx.theme().colors().border)
             .child(self.render_sidebar_toggle_button(cx))
+            .child(self.render_sidebar_pin_button(cx))
             .child(
                 IconButton::new("history", IconName::Clock)
                     .icon_size(IconSize::Small)
