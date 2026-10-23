@@ -3471,6 +3471,10 @@ pub struct AcpThread {
     plans: HashMap<PlanIdentity, Plan>,
     visible_plan: Option<PlanIdentity>,
     project: Entity<Project>,
+    /// Where this session last read or edited. The project keeps a single
+    /// agent location that every session overwrites, so each session keeps
+    /// its own to be followed apart from the others.
+    agent_location: Option<AgentLocation>,
     action_log: Entity<ActionLog>,
     _git_store_subscription: Subscription,
     update_last_checkpoint_if_changed_task: Option<Task<Result<()>>>,
@@ -3667,6 +3671,8 @@ pub enum AcpThreadEvent {
     ModeUpdated(acp_v2::SessionConfigValueId),
     ConfigOptionsUpdated(Vec<acp_v2::SessionConfigOption>),
     WorkingDirectoriesUpdated,
+    /// The session moved to another spot in a file, see [`AcpThread::agent_location`].
+    AgentLocationChanged,
 }
 
 impl EventEmitter<AcpThreadEvent> for AcpThread {}
@@ -3811,7 +3817,8 @@ impl AcpThread {
                 | AcpThreadEvent::AvailableCommandsUpdated(_)
                 | AcpThreadEvent::ModeUpdated(_)
                 | AcpThreadEvent::ConfigOptionsUpdated(_)
-                | AcpThreadEvent::WorkingDirectoriesUpdated => {}
+                | AcpThreadEvent::WorkingDirectoriesUpdated
+                | AcpThreadEvent::AgentLocationChanged => {}
             });
 
         let git_store = project.read(cx).git_store().clone();
@@ -3856,6 +3863,7 @@ impl AcpThread {
             stopping_subagent_tool_calls: HashSet::default(),
             provisional_title: None,
             project,
+            agent_location: None,
             running_turn: None,
             turn_id: 0,
             submissions: SessionSubmissions::new(
@@ -4091,7 +4099,19 @@ impl AcpThread {
         }
     }
 
-    pub fn session_id(&self) -> &acp_v2::SessionId {
+    pub fn agent_location(&self) -> Option<&AgentLocation> {
+        self.agent_location.as_ref()
+    }
+
+    fn move_agent_location(&mut self, location: AgentLocation, cx: &mut Context<Self>) {
+        self.project.update(cx, |project, cx| {
+            project.set_agent_location(Some(location.clone()), cx)
+        });
+        self.agent_location = Some(location);
+        cx.emit(AcpThreadEvent::AgentLocationChanged);
+    }
+
+    pub fn session_id(&self) -> &acp_v1::SessionId {
         &self.session_info.session_id
     }
 
@@ -6060,38 +6080,39 @@ impl AcpThread {
                 {
                     return;
                 }
-                let project = this.project.clone();
-
                 for location in resolved_locations.iter().flatten() {
                     this.shared_buffers
                         .insert(location.buffer.clone(), location.buffer.read(cx).snapshot());
                 }
+                if let Some(Some(location)) = resolved_locations.last()
+                    && should_update_agent_location
+                {
+                    let location = AgentLocation::from(location);
+                    let should_ignore = if let Some(agent_location) = this
+                        .agent_location
+                        .as_ref()
+                        .filter(|agent_location| agent_location.buffer == location.buffer)
+                        && let Some(buffer) = location.buffer.upgrade()
+                    {
+                        let snapshot = buffer.read(cx).snapshot();
+                        let old_position = agent_location.position.to_point(&snapshot);
+                        let new_position = location.position.to_point(&snapshot);
+
+                        // ignore this so that when we get updates from the edit tool
+                        // the position doesn't reset to the startof line
+                        old_position.row == new_position.row
+                            && old_position.column > new_position.column
+                    } else {
+                        false
+                    };
+                    if !should_ignore {
+                        this.move_agent_location(location, cx);
+                    }
+                }
+
                 let Some((ix, tool_call)) = this.tool_call_mut(&id) else {
                     return;
                 };
-
-                if let Some(Some(location)) = resolved_locations.last() {
-                    project.update(cx, |project, cx| {
-                        let should_ignore = if let Some(agent_location) = project
-                            .agent_location()
-                            .filter(|agent_location| agent_location.buffer == location.buffer)
-                        {
-                            let snapshot = location.buffer.read(cx).snapshot();
-                            let old_position = agent_location.position.to_point(&snapshot);
-                            let new_position = location.position.to_point(&snapshot);
-
-                            // ignore this so that when we get updates from the edit tool
-                            // the position doesn't reset to the startof line
-                            old_position.row == new_position.row
-                                && old_position.column > new_position.column
-                        } else {
-                            false
-                        };
-                        if !should_ignore && should_update_agent_location {
-                            project.set_agent_location(Some(location.into()), cx);
-                        }
-                    });
-                }
 
                 let resolved_locations = resolved_locations
                     .iter()
@@ -7669,15 +7690,16 @@ impl AcpThread {
             let end = snapshot.anchor_before(Point::new(line.saturating_add(limit), 0));
 
             if should_update_agent_location {
-                project.update(cx, |project, cx| {
-                    project.set_agent_location(
-                        Some(AgentLocation {
+                this.update(cx, |this, cx| {
+                    this.move_agent_location(
+                        AgentLocation {
                             buffer: buffer.downgrade(),
                             position: start,
-                        }),
+                        },
                         cx,
                     );
-                });
+                })
+                .log_err();
             }
 
             Ok(snapshot.text_for_range(start..end).collect::<String>())
@@ -7721,18 +7743,19 @@ impl AcpThread {
                 .await;
 
             if should_update_agent_location {
-                project.update(cx, |project, cx| {
-                    project.set_agent_location(
-                        Some(AgentLocation {
+                this.update(cx, |this, cx| {
+                    let position = edits
+                        .last()
+                        .map(|(range, _)| range.end)
+                        .unwrap_or(Anchor::min_for_buffer(buffer.read(cx).remote_id()));
+                    this.move_agent_location(
+                        AgentLocation {
                             buffer: buffer.downgrade(),
-                            position: edits
-                                .last()
-                                .map(|(range, _)| range.end)
-                                .unwrap_or(Anchor::min_for_buffer(buffer.read(cx).remote_id())),
-                        }),
+                            position,
+                        },
                         cx,
                     );
-                });
+                })?;
             }
 
             let format_on_save = cx.update(|cx| {

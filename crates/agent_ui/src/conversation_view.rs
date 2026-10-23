@@ -73,9 +73,7 @@ use util::{
     size::format_file_size,
     time::duration_alt_display,
 };
-use workspace::{
-    CollaboratorId, MultiWorkspace, NewTerminal, PathList, Workspace, path_link::sanitize_path_text,
-};
+use workspace::{MultiWorkspace, NewTerminal, PathList, Workspace, path_link::sanitize_path_text};
 use zed_actions::agent::{Chat, ToggleModelSelector};
 
 use super::config_options::ConfigOptionsView;
@@ -364,6 +362,7 @@ impl Conversation {
                     | AcpThreadEvent::ModeUpdated(_)
                     | AcpThreadEvent::ConfigOptionsUpdated(_)
                     | AcpThreadEvent::WorkingDirectoriesUpdated
+                    | AcpThreadEvent::AgentLocationChanged
                     | AcpThreadEvent::PromptUpdated => {}
                 }
                 this.updated_at = Some(Instant::now());
@@ -790,6 +789,7 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
         | AcpThreadEvent::ConfigOptionsUpdated(_)
         | AcpThreadEvent::SubagentSpawned(_)
         | AcpThreadEvent::NoticesUpdated
+        | AcpThreadEvent::AgentLocationChanged
         | AcpThreadEvent::PromptUpdated => false,
     }
 }
@@ -2305,6 +2305,13 @@ impl ConversationView {
             }
             AcpThreadEvent::WorkingDirectoriesUpdated => {
                 cx.notify();
+            }
+            AcpThreadEvent::AgentLocationChanged => {
+                if let Some(thread_view) = self.thread_view(&session_id) {
+                    thread_view.update(cx, |thread_view, cx| {
+                        thread_view.open_follow_tab_once(window, cx)
+                    });
+                }
             }
             AcpThreadEvent::NoticesUpdated => {
                 if let Some(thread_view) = self.thread_view(&session_id) {
