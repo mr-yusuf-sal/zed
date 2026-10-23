@@ -19,7 +19,10 @@ use agent_ui::AgentPanel;
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use cli::FORCE_CLI_MODE_ENV_VAR_NAME;
-use client::{Client, ProxySettings, RefreshLlmTokenListener, UserStore, parse_zed_link};
+use client::{
+    Client, INITIAL_RECONNECTION_DELAY, MAX_RECONNECTION_DELAY, ProxySettings,
+    RefreshLlmTokenListener, Status, UserStore, parse_zed_link,
+};
 use collab_ui::channel_view::ChannelView;
 use collections::HashMap;
 use crashes::InitCrashHandler;
@@ -54,7 +57,7 @@ use settings::{BaseKeymap, Settings, SettingsStore, watch_config_file};
 use smol::future::poll_once;
 use std::{
     cell::RefCell,
-    env,
+    cmp, env,
     io::{self, IsTerminal},
     path::{Path, PathBuf},
     process,
@@ -1404,17 +1407,37 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
 }
 
 async fn authenticate(client: Arc<Client>, cx: &AsyncApp) -> Result<()> {
-    if stdout_is_a_pty() {
-        if client::IMPERSONATE_LOGIN.is_some() {
-            client.sign_in_with_optional_connect(false, cx).await?;
-        } else if client.has_credentials(cx).await {
-            client.sign_in_with_optional_connect(true, cx).await?;
-        }
-    } else if client.has_credentials(cx).await {
-        client.sign_in_with_optional_connect(true, cx).await?;
+    if stdout_is_a_pty() && client::IMPERSONATE_LOGIN.is_some() {
+        return client.sign_in_with_optional_connect(false, cx).await;
     }
 
-    Ok(())
+    if !client.has_credentials(cx).await {
+        return Ok(());
+    }
+
+    let mut delay = INITIAL_RECONNECTION_DELAY;
+    loop {
+        let error = match client.sign_in_with_optional_connect(true, cx).await {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        // Validating stored credentials fails with `AuthenticationError` when
+        // the server can't be reached, e.g. Zed was launched before the network
+        // came up. Nothing else retries this sign-in, so without retrying here
+        // everything that needs the Zed account (hosted models, the agent's LLM
+        // token, the cloud connection) stays broken until Zed is restarted.
+        if !matches!(*client.status().borrow(), Status::AuthenticationError)
+            || !client.has_credentials(cx).await
+        {
+            return Err(error);
+        }
+        log::warn!("signing in at startup failed: {error:#}; retrying in {delay:?}");
+        cx.background_executor().timer(delay).await;
+        if !matches!(*client.status().borrow(), Status::AuthenticationError) {
+            return Ok(());
+        }
+        delay = cmp::min(delay * 2, MAX_RECONNECTION_DELAY);
+    }
 }
 
 async fn system_id() -> Result<IdType> {

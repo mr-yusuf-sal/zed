@@ -1,3 +1,4 @@
+use std::cmp;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,6 +20,11 @@ use crate::{AgentId, DisableAiSettings};
 
 const REGISTRY_URL: &str = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json";
 const REFRESH_THROTTLE_DURATION: Duration = Duration::from_secs(60 * 60);
+// A fetch that fails (typically because Zed started without network access)
+// is retried on a backoff instead of waiting out the hourly throttle, so
+// registry agents become usable once connectivity returns.
+const FAILED_REFRESH_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(5);
+const FAILED_REFRESH_RETRY_MAX_DELAY: Duration = Duration::from_secs(5 * 60);
 // Bound the full request lifecycle, including response body reads; the shared
 // HTTP client only has a connect timeout.
 const REGISTRY_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -126,6 +132,8 @@ pub struct AgentRegistryStore {
     fetch_error: Option<SharedString>,
     pending_refresh: Option<Task<()>>,
     last_refresh: Option<Instant>,
+    retry_delay: Duration,
+    retry_task: Option<Task<()>>,
 }
 
 impl AgentRegistryStore {
@@ -176,6 +184,8 @@ impl AgentRegistryStore {
             fetch_error: None,
             pending_refresh: None,
             last_refresh: None,
+            retry_delay: FAILED_REFRESH_RETRY_INITIAL_DELAY,
+            retry_task: None,
         });
         cx.set_global(GlobalAgentRegistryStore(store.clone()));
         store
@@ -250,9 +260,17 @@ impl AgentRegistryStore {
                     Ok(agents) => {
                         this.agents = agents;
                         this.fetch_error = None;
+                        this.retry_delay = FAILED_REFRESH_RETRY_INITIAL_DELAY;
+                        this.retry_task = None;
                     }
                     Err(error) => {
                         this.fetch_error = Some(SharedString::from(format!("{error:#}")));
+                        let delay = this.retry_delay;
+                        this.retry_delay = cmp::min(delay * 2, FAILED_REFRESH_RETRY_MAX_DELAY);
+                        this.retry_task = Some(cx.spawn(async move |this, cx| {
+                            cx.background_executor().timer(delay).await;
+                            this.update(cx, |this, cx| this.refresh(cx)).ok();
+                        }));
                     }
                 }
                 cx.notify();
@@ -267,9 +285,17 @@ impl AgentRegistryStore {
     /// updates without making too many network requests. The refresh is
     /// throttled to at most once per hour.
     pub fn refresh_if_stale(&mut self, cx: &mut Context<Self>) {
+        // Still throttle after a failure: a failed refresh notifies observers
+        // that call back into this method, which would otherwise refetch in a
+        // tight loop while offline.
+        let throttle = if self.fetch_error.is_some() {
+            FAILED_REFRESH_RETRY_INITIAL_DELAY
+        } else {
+            REFRESH_THROTTLE_DURATION
+        };
         let should_refresh = self
             .last_refresh
-            .map(|last| last.elapsed() >= REFRESH_THROTTLE_DURATION)
+            .map(|last| last.elapsed() >= throttle)
             .unwrap_or(true);
 
         if should_refresh {
@@ -286,6 +312,8 @@ impl AgentRegistryStore {
             fetch_error: None,
             pending_refresh: None,
             last_refresh: None,
+            retry_delay: FAILED_REFRESH_RETRY_INITIAL_DELAY,
+            retry_task: None,
         };
 
         store.load_cached_registry(fs, store.http_client.clone(), cx);
