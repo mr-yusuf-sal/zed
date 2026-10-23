@@ -9506,12 +9506,13 @@ impl Panel for GitPanel {
         GIT_PANEL_KEY
     }
 
-    fn position(&self, _: &Window, cx: &App) -> DockPosition {
-        GitPanelSettings::get_global(cx).dock
+    // This fork has no left dock, so the panel sits on the right whatever `git_panel.dock` says.
+    fn position(&self, _: &Window, _: &App) -> DockPosition {
+        DockPosition::Right
     }
 
     fn position_is_valid(&self, position: DockPosition) -> bool {
-        matches!(position, DockPosition::Left | DockPosition::Right)
+        position == DockPosition::Right
     }
 
     fn set_position(&mut self, position: DockPosition, _: &mut Window, cx: &mut Context<Self>) {

@@ -1164,11 +1164,8 @@ impl CollabPanel {
         ))
     }
 
-    fn dock_side(&self, cx: &App) -> DockSide {
-        match CollaborationPanelSettings::get_global(cx).dock {
-            DockPosition::Right => DockSide::Right,
-            _ => DockSide::Left,
-        }
+    fn dock_side(&self, _cx: &App) -> DockSide {
+        DockSide::Right
     }
 
     fn render_call_participant(
@@ -3943,12 +3940,14 @@ impl Panel for CollabPanel {
         }
     }
 
-    fn position(&self, _window: &Window, cx: &App) -> DockPosition {
-        CollaborationPanelSettings::get_global(cx).dock
+    // This fork has no left dock, so the panel sits on the right whatever
+    // `collaboration_panel.dock` says.
+    fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
+        DockPosition::Right
     }
 
     fn position_is_valid(&self, position: DockPosition) -> bool {
-        matches!(position, DockPosition::Left | DockPosition::Right)
+        position == DockPosition::Right
     }
 
     fn set_position(
