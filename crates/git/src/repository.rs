@@ -779,6 +779,70 @@ pub struct SearchCommitArgs {
     pub case_sensitive: bool,
 }
 
+/// A commit search query split into `git log` filters and the text matched
+/// against commit messages. `author:`, `since:` and `until:` take one word or a
+/// double-quoted phrase, so `author:"Ada Lovelace" since:2024-01-01 fix` finds
+/// Ada's commits since 2024 whose message contains "fix". The dates are passed
+/// to git as written, so anything `git log --since` accepts works.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CommitSearchFilters {
+    pub author: Option<String>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub message: String,
+}
+
+impl CommitSearchFilters {
+    pub fn parse(query: &str) -> Self {
+        let mut filters = Self::default();
+        let mut message_words = Vec::new();
+        let mut rest = query.trim();
+        while !rest.is_empty() {
+            let (token, remaining) = split_search_token(rest);
+            rest = remaining.trim_start();
+
+            let qualifier = [
+                ("author:", &mut filters.author),
+                ("since:", &mut filters.since),
+                ("until:", &mut filters.until),
+            ]
+            .into_iter()
+            .find_map(|(prefix, slot)| Some((token.strip_prefix(prefix)?, slot)));
+            match qualifier {
+                Some((value, slot)) if !value.trim_matches('"').is_empty() => {
+                    *slot = Some(value.trim_matches('"').to_string());
+                }
+                _ => message_words.push(token),
+            }
+        }
+
+        // Without qualifiers the query is kept exactly as typed, spacing included.
+        filters.message = if filters.has_qualifiers() {
+            message_words.join(" ")
+        } else {
+            query.to_string()
+        };
+        filters
+    }
+
+    pub fn has_qualifiers(&self) -> bool {
+        self.author.is_some() || self.since.is_some() || self.until.is_some()
+    }
+}
+
+/// Splits off the first whitespace-separated token, keeping a double-quoted
+/// phrase inside it together.
+fn split_search_token(input: &str) -> (&str, &str) {
+    let mut in_quotes = false;
+    for (index, character) in input.char_indices() {
+        if character == '"' {
+            in_quotes = !in_quotes;
+        } else if character.is_whitespace() && !in_quotes {
+            return input.split_at(index);
+        }
+    }
+    (input, "")
+}
 pub fn commit_hash_search_query(query: &str) -> Option<&str> {
     let query = query.trim();
     (SHORT_SHA_LENGTH..=SHA256_HEX_LENGTH)
@@ -3504,19 +3568,44 @@ impl GitRepository for RealGitRepository {
 
         async move {
             let log_source_args = log_source.get_args();
+            let filters = CommitSearchFilters::parse(search_args.query.as_str());
             let mut args = vec!["log", SEARCH_COMMIT_FORMAT];
-            let hash_query = commit_hash_search_query(search_args.query.as_str())
+            let hash_query = (!filters.has_qualifiers())
+                .then(|| commit_hash_search_query(&filters.message))
+                .flatten()
                 .map(|query| query.to_ascii_lowercase());
+            let author_arg = filters
+                .author
+                .as_ref()
+                .map(|author| format!("--author={author}"));
+            let since_arg = filters
+                .since
+                .as_ref()
+                .map(|since| format!("--since={since}"));
+            let until_arg = filters
+                .until
+                .as_ref()
+                .map(|until| format!("--until={until}"));
 
             if hash_query.is_none() {
+                // `--fixed-strings` and `--regexp-ignore-case` apply to `--author`
+                // as well as `--grep`.
                 args.push("--fixed-strings");
 
                 if !search_args.case_sensitive {
                     args.push("--regexp-ignore-case");
                 }
 
-                args.push("--grep");
-                args.push(search_args.query.as_str());
+                if !filters.message.is_empty() || !filters.has_qualifiers() {
+                    args.push("--grep");
+                    args.push(filters.message.as_str());
+                }
+                args.extend(
+                    [&author_arg, &since_arg, &until_arg]
+                        .into_iter()
+                        .flatten()
+                        .map(String::as_str),
+                );
             }
 
             args.extend(log_source_args.iter().map(|arg| arg.as_ref()));
@@ -4343,6 +4432,42 @@ mod tests {
 
     use super::*;
     use gpui::TestAppContext;
+
+    #[test]
+    fn test_commit_search_filters() {
+        assert_eq!(
+            CommitSearchFilters::parse("  fix  the bug "),
+            CommitSearchFilters {
+                message: "  fix  the bug ".to_string(),
+                ..Default::default()
+            },
+            "a query without qualifiers is matched exactly as typed"
+        );
+        assert_eq!(
+            CommitSearchFilters::parse(r#"author:"Ada Lovelace" fix since:2024-01-01 parser"#),
+            CommitSearchFilters {
+                author: Some("Ada Lovelace".to_string()),
+                since: Some("2024-01-01".to_string()),
+                until: None,
+                message: "fix parser".to_string(),
+            }
+        );
+        assert_eq!(
+            CommitSearchFilters::parse(r#"until:"2 weeks ago""#),
+            CommitSearchFilters {
+                until: Some("2 weeks ago".to_string()),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            CommitSearchFilters::parse("author: fix"),
+            CommitSearchFilters {
+                message: "author: fix".to_string(),
+                ..Default::default()
+            },
+            "a qualifier without a value is searched for as text"
+        );
+    }
 
     #[test]
     fn test_create_ref_requires_ref_to_not_exist() {
