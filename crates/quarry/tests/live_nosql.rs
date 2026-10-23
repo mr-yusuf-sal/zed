@@ -8,7 +8,7 @@
 //! cargo test -p quarry --test live_nosql -- --ignored --nocapture --test-threads=1
 //! ```
 
-use quarry::driver::{CellEdit, Driver, ObjectKind, ObjectNode, ResultSet};
+use quarry::driver::{CellEdit, Driver, KeyAction, ObjectKind, ObjectNode, ResultSet};
 use quarry::drivers::{clickhouse::ClickHouseDriver, mongodb::MongoDriver, redis::RedisDriver};
 use std::time::{Duration, Instant};
 use ui::SharedString;
@@ -1302,5 +1302,62 @@ fn clickhouse_and_mongodb_explain() {
         let text: Vec<&str> = plan.rows.iter().filter_map(|row| row[0].as_deref()).collect();
         assert!(text.iter().any(|line| line.contains("queryPlanner")));
         assert!(text.iter().any(|line| line.contains("executionStats")));
+    });
+}
+
+#[test]
+#[ignore = "needs the quarry redis on :6380"]
+fn redis_find_and_change_keys() {
+    runtime().block_on(async {
+        let driver = redis_driver().await;
+        for statement in [
+            "DEL quarry_live_keys:a quarry_live_keys:b quarry_live_keys:c quarry_live_keys:other",
+            "SET quarry_live_keys:a 1",
+            "SET quarry_live_keys:b 2",
+            "SET quarry_live_keys:other 3",
+        ] {
+            driver.query(statement, Some("db0"), 10).await.expect(statement);
+        }
+
+        let found = driver
+            .search(&path(&["db0", "quarry_live_keys"]), "?")
+            .await
+            .expect("searching");
+        let keys: Vec<&str> = found.rows.iter().filter_map(|row| row[0].as_deref()).collect();
+        assert_eq!(keys, ["quarry_live_keys:a", "quarry_live_keys:b"]);
+
+        let a = path(&["db0", "quarry_live_keys", "a"]);
+        driver
+            .key_action(&a, &KeyAction::Expire(Some(600)))
+            .await
+            .expect("expiring");
+        let ttl = single(driver.query("TTL quarry_live_keys:a", Some("db0"), 10).await.unwrap());
+        assert!(cell(&ttl, 0, "reply").is_some_and(|seconds| seconds != "-1"));
+        driver
+            .key_action(&a, &KeyAction::Expire(None))
+            .await
+            .expect("persisting");
+        let ttl = single(driver.query("TTL quarry_live_keys:a", Some("db0"), 10).await.unwrap());
+        assert_eq!(cell(&ttl, 0, "reply"), Some("-1"));
+
+        // Renaming onto an existing key is refused rather than overwriting it.
+        assert!(
+            driver
+                .key_action(&a, &KeyAction::Rename("quarry_live_keys:b".to_string()))
+                .await
+                .is_err()
+        );
+        driver
+            .key_action(&a, &KeyAction::Rename("quarry_live_keys:c".to_string()))
+            .await
+            .expect("renaming");
+        let c = path(&["db0", "quarry_live_keys", "c"]);
+        driver.key_action(&c, &KeyAction::Delete).await.expect("deleting");
+        assert!(driver.key_action(&c, &KeyAction::Delete).await.is_err());
+
+        driver
+            .query("DEL quarry_live_keys:b quarry_live_keys:other", Some("db0"), 10)
+            .await
+            .expect("cleaning up");
     });
 }

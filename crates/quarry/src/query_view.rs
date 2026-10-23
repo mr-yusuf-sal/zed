@@ -332,6 +332,16 @@ impl QueryView {
         });
     }
 
+    /// Replaces the grid with `result`, for something the panel read on the tab's behalf that is
+    /// not a page of one object, such as the keys a pattern matched.
+    pub fn show_result(&mut self, result: ResultSet, cx: &mut Context<Self>) {
+        self.status = Status::Succeeded {
+            statements: 1,
+            elapsed: Duration::ZERO,
+        };
+        self.set_results(vec![result], cx);
+    }
+
     /// Reads the page after the rows the preview shows and adds it to them.
     fn load_more(&mut self, cx: &mut Context<Self>) {
         let Some(preview) = self.preview.as_mut() else {
