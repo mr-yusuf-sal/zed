@@ -6225,7 +6225,8 @@ impl AgentPanel {
         });
 
         let toolbar_content = {
-            let new_thread_tooltip = SharedString::from(format!("New {} Thread", selected_agent_label));
+            let new_thread_tooltip =
+                SharedString::from(format!("New {} Thread", selected_agent_label));
             let new_thread_button = IconButton::new("new_thread_btn", IconName::Plus)
                 .icon_size(IconSize::Small)
                 .tooltip(move |_window, cx| {
