@@ -35,6 +35,17 @@ actions!(
 
 const SELECT_ROW_LIMIT: usize = 100;
 
+/// The schema picked with "Select for Compare", which the next "Compare" makes another
+/// schema match. It keeps its own driver, so the two can be on different connections.
+#[derive(Clone)]
+struct CompareSource {
+    driver: Arc<dyn Driver>,
+    engine: Engine,
+    path: Vec<SharedString>,
+    /// The connection's name and the schema's path, as the script's header names it.
+    label: String,
+}
+
 /// What the one-line prompt under the header is asking for.
 #[derive(Clone)]
 enum PromptKind {
@@ -239,6 +250,7 @@ pub struct QuarryPanel {
     discovering: Option<Task<()>>,
     /// A one-line message under the header, such as why Docker discovery found nothing.
     notice: Option<(SharedString, Color)>,
+    compare_source: Option<CompareSource>,
     /// Folders whose connections are hidden. Not persisted: a restart opens every folder.
     collapsed_folders: HashSet<String>,
     _tasks: Vec<Task<()>>,
@@ -289,6 +301,7 @@ impl QuarryPanel {
             position: DockPosition::Left,
             context_menu: None,
             collapsed_folders: HashSet::default(),
+            compare_source: None,
             discovering: None,
             notice: None,
             _tasks: Vec::new(),
@@ -1481,6 +1494,14 @@ impl QuarryPanel {
         let is_key = is_redis && node.kind == ObjectKind::Key;
         let can_find_keys =
             is_redis && matches!(node.kind, ObjectKind::Database | ObjectKind::Folder);
+        let comparable = driver.supports_schema_compare(&node.path);
+        let engine = self.store.read(cx).get(index).map(|config| config.engine);
+        let compare_with = self
+            .compare_source
+            .as_ref()
+            .filter(|source| comparable && Some(source.engine) == engine)
+            .filter(|source| !(Arc::ptr_eq(&source.driver, &driver) && source.path == node.path))
+            .map(|source| source.label.clone());
         let panel = cx.entity().downgrade();
 
         let menu = ContextMenu::build(window, cx, move |menu, _, _| {
@@ -1583,6 +1604,26 @@ impl QuarryPanel {
                     cx.write_to_clipboard(ClipboardItem::new_string(qualified_name.clone()))
                 })
             })
+            .when(comparable, |menu| {
+                let node = node.clone();
+                menu.separator().entry(
+                    "Select for Compare",
+                    None,
+                    update(Box::new(move |this, _, cx| {
+                        this.select_for_compare(index, &node, cx)
+                    })),
+                )
+            })
+            .when_some(compare_with, |menu, source| {
+                let node = node.clone();
+                menu.entry(
+                    format!("Compare: Make This Match {source}"),
+                    None,
+                    update(Box::new(move |this, window, cx| {
+                        this.compare_into(index, &node, window, cx)
+                    })),
+                )
+            })
             .when(can_find_keys, |menu| {
                 let node = node.clone();
                 menu.separator().entry(
@@ -1640,6 +1681,117 @@ impl QuarryPanel {
             })
         });
         self.deploy_context_menu(position, menu, window, cx);
+    }
+
+    fn select_for_compare(&mut self, index: usize, node: &ObjectNode, cx: &mut Context<Self>) {
+        let Some(driver) = self
+            .states
+            .get(index)
+            .and_then(|state| state.driver.clone())
+        else {
+            return;
+        };
+        let Some(config) = self.store.read(cx).get(index) else {
+            return;
+        };
+        let label = format!("{} · {}", config.name, node.path.join("."));
+        self.notice = Some((
+            format!("{label} is selected; right-click another schema to compare").into(),
+            Color::Muted,
+        ));
+        self.compare_source = Some(CompareSource {
+            driver,
+            engine: config.engine,
+            path: node.path.clone(),
+            label,
+        });
+        cx.notify();
+    }
+
+    /// Writes the script that makes the schema at `node` match the one selected for compare,
+    /// and opens it in a query tab on `node`'s connection. It is not run.
+    fn compare_into(
+        &mut self,
+        index: usize,
+        node: &ObjectNode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(source) = self.compare_source.clone() else {
+            return;
+        };
+        let Some((state_id, target)) = self
+            .states
+            .get(index)
+            .and_then(|state| state.driver.clone().map(|driver| (state.id, driver)))
+        else {
+            return;
+        };
+        let Some(runtime) = QuarryRuntime::global(cx) else {
+            return;
+        };
+        let Some(name) = self
+            .store
+            .read(cx)
+            .get(index)
+            .map(|config| config.name.clone())
+        else {
+            return;
+        };
+        let target_path = node.path.clone();
+        let target_label = format!("{name} · {}", target_path.join("."));
+        self.notice = Some((
+            format!("Comparing with {}…", source.label).into(),
+            Color::Muted,
+        ));
+        cx.notify();
+        let script = {
+            let target_path = target_path.clone();
+            let target_label = target_label.clone();
+            let source = source.clone();
+            runtime.spawn(async move {
+                crate::schema_diff::compare(
+                    source.driver.as_ref(),
+                    &source.path,
+                    &source.label,
+                    target.as_ref(),
+                    &target_path,
+                    &target_label,
+                )
+                .await
+            })
+        };
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let script = script.await;
+            this.update_in(cx, |this, window, cx| {
+                this.notice = None;
+                let Some(index) = this.index_of(state_id) else {
+                    return;
+                };
+                match script {
+                    Ok(script) => {
+                        let title = SharedString::from(format!("compare → {target_label}"));
+                        this.open_tab(
+                            index,
+                            target_path.first().cloned(),
+                            title,
+                            Some(script),
+                            window,
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        this.notice = Some((
+                            format!("Comparing with {} failed: {error:#}", source.label).into(),
+                            Color::Error,
+                        ));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self._tasks.push(task);
     }
 
     /// Forgets what was loaded under `path` and loads it again, so a table created since the

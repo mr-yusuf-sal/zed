@@ -1539,3 +1539,54 @@ fn redis_insert_and_delete_items() {
             .unwrap();
     });
 }
+
+#[test]
+#[ignore = "needs the quarry clickhouse on :18123"]
+fn clickhouse_schema_compare() {
+    runtime().block_on(async {
+        let driver = clickhouse_driver().await;
+        for statement in [
+            "DROP DATABASE IF EXISTS quarry_cmp_a",
+            "DROP DATABASE IF EXISTS quarry_cmp_b",
+            "CREATE DATABASE quarry_cmp_a",
+            "CREATE DATABASE quarry_cmp_b",
+            "CREATE TABLE quarry_cmp_a.customers (id UInt32, name String) ENGINE = MergeTree ORDER BY id",
+            "CREATE TABLE quarry_cmp_a.orders (id UInt64, total Decimal(12, 2) DEFAULT 0, note Nullable(String)) ENGINE = MergeTree ORDER BY id",
+            "CREATE TABLE quarry_cmp_b.orders (id UInt64, total Decimal(10, 2), legacy String) ENGINE = MergeTree ORDER BY id",
+            "CREATE TABLE quarry_cmp_b.audit (id UInt32) ENGINE = MergeTree ORDER BY id",
+        ] {
+            driver.query(statement, None, 10).await.expect(statement);
+        }
+        let source = path(&["quarry_cmp_a"]);
+        let target = path(&["quarry_cmp_b"]);
+        let script =
+            quarry::schema_diff::compare(&driver, &source, "source", &driver, &target, "target")
+                .await
+                .expect("comparing");
+        println!("{script}");
+        for range in quarry::statements::split(&script, quarry::driver::Engine::ClickHouse) {
+            driver
+                .query(&script[range], None, 10)
+                .await
+                .expect("running the script");
+        }
+        let remaining = quarry::schema_diff::diff(
+            &driver.schema_snapshot(&source).await.unwrap(),
+            &driver.schema_snapshot(&target).await.unwrap(),
+        );
+        for statement in [
+            "DROP DATABASE quarry_cmp_a",
+            "DROP DATABASE quarry_cmp_b",
+        ] {
+            driver.query(statement, None, 10).await.expect(statement);
+        }
+        assert!(remaining.missing.is_empty(), "{remaining:#?}");
+        assert_eq!(remaining.extra, ["audit"], "{remaining:#?}");
+        let [change] = remaining.changed.as_slice() else {
+            panic!("only the dropped column should differ: {remaining:#?}");
+        };
+        assert!(change.added.is_empty() && change.changed.is_empty(), "{remaining:#?}");
+        assert_eq!(change.dropped.len(), 1);
+        assert_eq!(change.dropped[0].name, "legacy");
+    });
+}
