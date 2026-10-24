@@ -832,8 +832,11 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
                     .update_in(&mut cx, |workspace, window, cx| {
                         workspace.add_panel(panel.clone(), window, cx);
                         let weak_workspace = workspace.weak_handle();
+                        let git_store = workspace.project().read(cx).git_store().clone();
                         let main_page =
-                            cx.new(|cx| main_page::MainPage::new(weak_workspace, panel, window, cx));
+                            cx.new(|cx| {
+                            main_page::MainPage::new(weak_workspace, panel, git_store, window, cx)
+                        });
                         workspace.add_permanent_item(Box::new(main_page), window, cx);
                     })
                     .log_err();
