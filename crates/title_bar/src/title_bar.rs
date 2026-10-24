@@ -31,7 +31,11 @@ use gpui::{
     pulsating_between,
 };
 use onboarding_banner::OnboardingBanner;
-use project::{Project, git_store::GitStoreEvent, trusted_worktrees::TrustedWorktrees};
+use project::{
+    Project,
+    git_store::{GitStoreEvent, RepositoryEvent},
+    trusted_worktrees::TrustedWorktrees,
+};
 use remote::RemoteConnectionOptions;
 use settings::{Settings as _, SettingsStore};
 
@@ -372,6 +376,7 @@ impl TitleBar {
         subscriptions.push(cx.observe(&active_call, |this, _, cx| this.active_call_changed(cx)));
         subscriptions.push(
             cx.subscribe(&git_store, move |_, _, event, cx| match event {
+                GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::GraphEvent(..), _) => {}
                 GitStoreEvent::ActiveRepositoryChanged(_)
                 | GitStoreEvent::RepositoryUpdated(_, _, true) => {
                     cx.notify();

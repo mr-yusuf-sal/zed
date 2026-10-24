@@ -48,7 +48,7 @@ use project::{
 };
 use smallvec::{SmallVec, smallvec};
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
@@ -249,7 +249,7 @@ struct ChangedFileEntry {
 }
 
 impl ChangedFileEntry {
-    fn from_commit_file(file: &CommitFile, _cx: &App) -> Self {
+    fn from_commit_file(file: &CommitFile) -> Self {
         let file_name: SharedString = file
             .path
             .file_name()
@@ -708,12 +708,32 @@ fn timestamp_format() -> &'static [BorrowedFormatItem<'static>] {
     })
 }
 
+/// Every visible row formats its date on every render, and asking the OS for
+/// the time zone each time adds up. Re-read once a minute to follow DST and
+/// time zone changes.
+fn local_utc_offset() -> UtcOffset {
+    const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+    thread_local! {
+        static CACHED: Cell<Option<(Instant, UtcOffset)>> = const { Cell::new(None) };
+    }
+    CACHED.with(|cached| {
+        if let Some((read_at, offset)) = cached.get()
+            && read_at.elapsed() < REFRESH_INTERVAL
+        {
+            return offset;
+        }
+        let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+        cached.set(Some((Instant::now(), offset)));
+        offset
+    })
+}
+
 fn format_timestamp(timestamp: i64) -> String {
     let Ok(datetime) = OffsetDateTime::from_unix_timestamp(timestamp) else {
         return "Unknown".to_string();
     };
 
-    let local_offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+    let local_offset = local_utc_offset();
     let local_datetime = datetime.to_offset(local_offset);
 
     local_datetime
@@ -985,7 +1005,14 @@ struct GraphData {
     /// have to re-scan on every commit. The actual pixel width is computed
     /// lazily in `ref_label_gutter_width`.
     widest_ref_label: Option<(SharedString, usize)>,
+    /// Appended as each line's parent row is reached, so ordered by
+    /// `full_interval.end`.
     lines: Vec<Rc<CommitLine>>,
+    /// The most rows any line in `lines` spans.
+    longest_line_rows: usize,
+    /// The lines last painted, with the rows they were picked for and how many
+    /// lines there were then. Lines are only ever appended until `clear`.
+    visible_lines: RefCell<Option<(Range<usize>, usize, Rc<[Rc<CommitLine>]>)>>,
     active_commit_lines: HashMap<CommitLineKey, usize>,
     active_commit_lines_by_parent: HashMap<Oid, SmallVec<[usize; 1]>>,
     /// When set, the graph starts with a row for the working tree's uncommitted
@@ -1009,6 +1036,8 @@ impl GraphData {
             max_lanes: 0,
             widest_ref_label: None,
             lines: Vec::default(),
+            longest_line_rows: 0,
+            visible_lines: RefCell::new(None),
             active_commit_lines: HashMap::default(),
             active_commit_lines_by_parent: HashMap::default(),
             uncommitted_parent: None,
@@ -1022,6 +1051,8 @@ impl GraphData {
         self.parent_to_lanes.clear();
         self.commits.clear();
         self.lines.clear();
+        self.longest_line_rows = 0;
+        self.visible_lines.replace(None);
         self.active_commit_lines.clear();
         self.active_commit_lines_by_parent.clear();
         self.next_color = BranchColor(0);
@@ -1029,6 +1060,35 @@ impl GraphData {
         self.max_lanes = 0;
         self.widest_ref_label = None;
         self.has_uncommitted_row = false;
+    }
+
+    /// The lines that cross `rows`, without scanning every line in the graph:
+    /// the canvas is repainted on every hover and scroll.
+    fn lines_crossing(&self, rows: &Range<usize>) -> Rc<[Rc<CommitLine>]> {
+        let mut visible_lines = self.visible_lines.borrow_mut();
+        if let Some((cached_rows, line_count, lines)) = visible_lines.as_ref()
+            && cached_rows == rows
+            && *line_count == self.lines.len()
+        {
+            return lines.clone();
+        }
+        // A line crossing `rows` ends at or after their start, and no later
+        // than the longest line could reach from their end.
+        let first = self
+            .lines
+            .partition_point(|line| line.full_interval.end < rows.start);
+        let last_end = rows.end.saturating_add(self.longest_line_rows);
+        let end = self
+            .lines
+            .partition_point(|line| line.full_interval.end <= last_end)
+            .max(first);
+        let lines: Rc<[Rc<CommitLine>]> = self.lines[first..end]
+            .iter()
+            .filter(|line| line.full_interval.start <= rows.end)
+            .cloned()
+            .collect();
+        *visible_lines = Some((rows.clone(), self.lines.len(), lines.clone()));
+        lines
     }
 
     fn first_empty_lane_idx(&mut self) -> ActiveLaneIdx {
@@ -1124,6 +1184,15 @@ impl GraphData {
                     if let Some(commit_line) =
                         state.to_commit_lines(commit_row, lane_column, commit_lane, commit_color)
                     {
+                        debug_assert!(self.lines.last().is_none_or(|last| {
+                            last.full_interval.end <= commit_line.full_interval.end
+                        }));
+                        self.longest_line_rows = self.longest_line_rows.max(
+                            commit_line
+                                .full_interval
+                                .end
+                                .saturating_sub(commit_line.full_interval.start),
+                        );
                         self.lines.push(Rc::new(commit_line));
                     }
                 }
@@ -1519,6 +1588,62 @@ fn draw_commit_circle(
     );
 }
 
+/// The selected commit's diff with what the detail panel shows of it worked out
+/// once, since the panel is rebuilt on every render of the graph.
+struct SelectedCommitChanges {
+    diff: CommitDiff,
+    lines_added: usize,
+    lines_removed: usize,
+    files_by_status: Rc<Vec<ChangedFileEntry>>,
+    /// The tree view's rows and the folder states they were laid out with.
+    tree_entries: RefCell<Option<(HashMap<RepoPath, bool>, Rc<Vec<ChangedFileTreeEntry>>)>>,
+}
+
+impl SelectedCommitChanges {
+    /// Runs off the foreground: the line counts diff every file in the commit.
+    fn compute(diff: CommitDiff) -> (CommitDiff, (usize, usize), Vec<ChangedFileEntry>) {
+        let stats = compute_diff_stats(&diff);
+        let mut files = diff.files.iter().collect::<Vec<_>>();
+        files.sort_by_key(|file| file.status());
+        let files_by_status = files
+            .into_iter()
+            .map(ChangedFileEntry::from_commit_file)
+            .collect();
+        (diff, stats, files_by_status)
+    }
+
+    fn new(
+        (diff, (lines_added, lines_removed), files_by_status): (
+            CommitDiff,
+            (usize, usize),
+            Vec<ChangedFileEntry>,
+        ),
+    ) -> Self {
+        Self {
+            diff,
+            lines_added,
+            lines_removed,
+            files_by_status: Rc::new(files_by_status),
+            tree_entries: RefCell::new(None),
+        }
+    }
+
+    fn tree_entries(&self, expanded_dirs: &HashMap<RepoPath, bool>) -> Rc<Vec<ChangedFileTreeEntry>> {
+        let mut cached = self.tree_entries.borrow_mut();
+        if let Some((cached_expanded_dirs, entries)) = cached.as_ref()
+            && cached_expanded_dirs == expanded_dirs
+        {
+            return entries.clone();
+        }
+        let entries = Rc::new(build_changed_file_tree_entries(
+            self.files_by_status.as_ref().clone(),
+            expanded_dirs,
+        ));
+        *cached = Some((expanded_dirs.clone(), entries.clone()));
+        entries
+    }
+}
+
 fn compute_diff_stats(diff: &CommitDiff) -> (usize, usize) {
     diff.files.iter().fold((0, 0), |(added, removed), file| {
         let old_text = file.old_text.as_deref().unwrap_or("");
@@ -1746,8 +1871,8 @@ pub struct GitGraph {
     graph_canvas_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     log_source: LogSource,
     log_order: LogOrder,
-    selected_commit_diff: Option<CommitDiff>,
-    selected_commit_diff_stats: Option<(usize, usize)>,
+    selected_commit_changes: Option<SelectedCommitChanges>,
+    git_remote_cache: RefCell<Option<(Option<String>, Option<GitRemote>)>>,
     _commit_diff_task: Option<Task<()>>,
     selected_commit_message: Option<DetailPanelCommitMessage>,
     _selected_commit_message_task: Option<Task<()>>,
@@ -2032,8 +2157,8 @@ impl GitGraph {
             multi_selected_idxs: Rc::default(),
             hovered_entry_idx: None,
             graph_canvas_bounds: Rc::new(Cell::new(None)),
-            selected_commit_diff: None,
-            selected_commit_diff_stats: None,
+            selected_commit_changes: None,
+            git_remote_cache: RefCell::new(None),
             selected_commit_message: None,
             _selected_commit_message_task: None,
             log_source,
@@ -2282,8 +2407,14 @@ impl GitGraph {
         cx: &mut Context<Self>,
     ) {
         // Starting, stopping and finishing a merge or rebase all show up as
-        // status, head or branch changes; graph loading progress never does.
-        if !matches!(event, RepositoryEvent::GraphEvent(..)) {
+        // status, head or branch changes, and those are also the only events
+        // that move HEAD or dirty the tree for the uncommitted row.
+        if matches!(
+            event,
+            RepositoryEvent::StatusesChanged
+                | RepositoryEvent::HeadChanged
+                | RepositoryEvent::BranchListChanged
+        ) {
             self.refresh_operation_in_progress(cx);
             self.sync_uncommitted_row(cx);
             self.select_uncommitted_by_default(cx);
@@ -2371,13 +2502,8 @@ impl GitGraph {
                 // Only invalidate if we scanned atleast once,
                 // meaning we are not inside the initial repo loading state
                 // NOTE: this fixes an loading performance regression
-                if repository.read(cx).scan_id > 1 {
-                    self.pending_select_sha = None;
-                    self.invalidate_state(cx);
-                }
-            }
-            RepositoryEvent::StashEntriesChanged if self.log_source == LogSource::All => {
-                // Stash entries initial's scan id is 2, so we don't want to invalidate the graph before that
+                // The threshold matches the one `Repository` clears its cached
+                // graph data at; below it the reload would rebuild the same data.
                 if repository.read(cx).scan_id > 2 {
                     self.pending_select_sha = None;
                     self.invalidate_state(cx);
@@ -2405,6 +2531,31 @@ impl GitGraph {
         git_store.repositories().get(&self.repo_id).cloned()
     }
 
+    /// The hosting provider of the repository's default remote. Parsing the
+    /// URL tries every registered provider, and the table and detail panel
+    /// both need it on every render, so it is kept until the URL changes.
+    fn git_remote(&self, cx: &App) -> Option<GitRemote> {
+        let remote_url = self.get_repository(cx)?.read(cx).default_remote_url();
+        let mut cached = self.git_remote_cache.borrow_mut();
+        if let Some((cached_url, remote)) = cached.as_ref()
+            && *cached_url == remote_url
+        {
+            return remote.clone();
+        }
+        let remote = remote_url.as_ref().and_then(|remote_url| {
+            // Without a registry, which only tests lack, no provider would match.
+            let provider_registry = GitHostingProviderRegistry::try_global(cx)?;
+            let (provider, parsed) = parse_git_remote_url(provider_registry, remote_url)?;
+            Some(GitRemote {
+                host: provider,
+                owner: parsed.owner.into(),
+                repo: parsed.repo.into(),
+            })
+        });
+        *cached = Some((remote_url, remote.clone()));
+        remote
+    }
+
     /// Groups the repository's other worktrees (its linked worktrees, plus the
     /// main checkout when the graph is open in a linked worktree) by the commit
     /// they have checked out, so that worktrees created outside of Zed, e.g. by
@@ -2414,9 +2565,9 @@ impl GitGraph {
         let Some(repository) = self.get_repository(cx) else {
             return worktrees_by_commit;
         };
-        let snapshot = repository.read(cx).snapshot();
-        let name_anchor_path = snapshot.main_worktree_abs_path();
-        for worktree in snapshot.linked_worktrees() {
+        let repository = repository.read(cx);
+        let name_anchor_path = repository.main_worktree_abs_path();
+        for worktree in repository.linked_worktrees() {
             if worktree.is_bare {
                 continue;
             }
@@ -2693,16 +2844,7 @@ Checked out in worktree {}",
 
         let row_height = Self::row_height(window, cx);
 
-        let remote = repository.as_ref().and_then(|repository| {
-            let remote_url = repository.read(cx).default_remote_url()?;
-            let provider_registry = GitHostingProviderRegistry::default_global(cx);
-            let (provider, parsed) = parse_git_remote_url(provider_registry, &remote_url)?;
-            Some(GitRemote {
-                host: provider,
-                owner: parsed.owner.into(),
-                repo: parsed.repo.into(),
-            })
-        });
+        let remote = self.git_remote(cx);
 
         // We fetch data outside the visible viewport to avoid loading entries when
         // users scroll through the git graph
@@ -2845,8 +2987,7 @@ Checked out in worktree {}",
         self.uncommitted_default_applied = true;
         self.selection_anchor_idx = None;
         self.multi_selected_idxs = Rc::default();
-        self.selected_commit_diff = None;
-        self.selected_commit_diff_stats = None;
+        self.selected_commit_changes = None;
         self.selected_commit_message = None;
         self._selected_commit_message_task = None;
         self.changed_files_expanded_dirs.clear();
@@ -3207,8 +3348,7 @@ Checked out in worktree {}",
         self.uncommitted_selected = false;
         self.uncommitted_default_applied = true;
         self.selected_entry_idx = Some(idx);
-        self.selected_commit_diff = None;
-        self.selected_commit_diff_stats = None;
+        self.selected_commit_changes = None;
         self.changed_files_expanded_dirs.clear();
         self.changed_files_scroll_handle
             .scroll_to_item(0, ScrollStrategy::Top);
@@ -3235,10 +3375,11 @@ Checked out in worktree {}",
 
         self._commit_diff_task = Some(cx.spawn(async move |this, cx| {
             if let Ok(diff) = diff_task.await {
+                let computed = cx
+                    .background_spawn(async move { SelectedCommitChanges::compute(diff) })
+                    .await;
                 this.update(cx, |this, cx| {
-                    let stats = compute_diff_stats(&diff);
-                    this.selected_commit_diff = Some(diff);
-                    this.selected_commit_diff_stats = Some(stats);
+                    this.selected_commit_changes = Some(SelectedCommitChanges::new(computed));
                     cx.notify();
                 })
                 .ok();
@@ -3927,19 +4068,7 @@ Checked out in worktree {}",
         if matches!(self.log_source, LogSource::Path(_)) {
             return None;
         }
-        let repository = self.get_repository(cx)?;
-        let snapshot = repository.read(cx).snapshot();
-        let mut branch_names = snapshot
-            .branch_list
-            .iter()
-            .filter(|branch| !branch.is_remote())
-            .map(|branch| SharedString::from(branch.name().to_string()))
-            .collect::<Vec<_>>();
-        branch_names.sort();
-        let current_branch = snapshot
-            .branch
-            .as_ref()
-            .map(|branch| SharedString::from(branch.name().to_string()));
+        let repository = self.get_repository(cx)?.downgrade();
         let selected_branch = match &self.log_source {
             LogSource::Branch(branch) => Some(branch.clone()),
             _ => None,
@@ -3972,8 +4101,21 @@ Checked out in worktree {}",
                 .anchor(Anchor::TopRight)
                 .menu(move |window, cx| {
                     let git_graph = git_graph.clone();
-                    let branch_names = branch_names.clone();
-                    let current_branch = current_branch.clone();
+                    // Listed only when the menu opens: the button is rendered
+                    // with the graph, on every hover and scroll.
+                    let repository = repository.upgrade()?;
+                    let repository = repository.read(cx);
+                    let mut branch_names = repository
+                        .branch_list
+                        .iter()
+                        .filter(|branch| !branch.is_remote())
+                        .map(|branch| SharedString::from(branch.name().to_string()))
+                        .collect::<Vec<_>>();
+                    branch_names.sort();
+                    let current_branch = repository
+                        .branch
+                        .as_ref()
+                        .map(|branch| SharedString::from(branch.name().to_string()));
                     let selected_branch = selected_branch.clone();
                     Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                         let select = |log_source: LogSource| {
@@ -4168,15 +4310,22 @@ Checked out in worktree {}",
             .into_any_element()
     }
 
+    #[cfg(test)]
     fn uncommitted_entries(&self, cx: &App) -> Vec<StatusEntry> {
-        let Some(repository) = self.get_repository(cx) else {
-            return Vec::new();
-        };
-        repository
-            .read(cx)
-            .cached_status()
-            .filter(|entry| entry.status.has_changes())
-            .collect()
+        self.uncommitted_changes(cx).collect()
+    }
+
+    /// Runs on every repository event and on every render of the uncommitted
+    /// row, so callers count or test it rather than collecting every status.
+    fn uncommitted_changes<'a>(&self, cx: &'a App) -> impl Iterator<Item = StatusEntry> + 'a {
+        self.get_repository(cx)
+            .into_iter()
+            .flat_map(move |repository| {
+                repository
+                    .read(cx)
+                    .cached_status()
+                    .filter(|entry| entry.status.has_changes())
+            })
     }
 
     fn is_uncommitted_row(&self, idx: usize) -> bool {
@@ -4188,7 +4337,7 @@ Checked out in worktree {}",
     /// history may not contain HEAD, and the row would then have a line running
     /// to the bottom of the graph without ever reaching its parent.
     fn wanted_uncommitted_parent(&self, cx: &App) -> Option<Oid> {
-        if self.log_source != LogSource::All || self.uncommitted_entries(cx).is_empty() {
+        if self.log_source != LogSource::All || self.uncommitted_changes(cx).next().is_none() {
             return None;
         }
         let repository = self.get_repository(cx)?;
@@ -4287,14 +4436,14 @@ Checked out in worktree {}",
         row_height: Pixels,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
-        let entries = self.uncommitted_entries(cx);
-        let (added, deleted) = entries
-            .iter()
-            .filter_map(|entry| entry.diff_stat)
-            .fold((0, 0), |(added, deleted), stat| {
-                (added + stat.added as usize, deleted + stat.deleted as usize)
-            });
-        let file_count = entries.len();
+        let (file_count, added, deleted) =
+            self.uncommitted_changes(cx)
+                .fold((0, 0, 0), |(file_count, added, deleted), entry| {
+                    let (entry_added, entry_deleted) = entry
+                        .diff_stat
+                        .map_or((0, 0), |stat| (stat.added as usize, stat.deleted as usize));
+                    (file_count + 1, added + entry_added, deleted + entry_deleted)
+                });
         let is_selected = self.selected_rows().contains(idx);
 
         vec![
@@ -4327,7 +4476,7 @@ Checked out in worktree {}",
     }
 
     fn render_uncommitted_panel(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let file_count = self.uncommitted_entries(cx).len();
+        let file_count = self.uncommitted_changes(cx).count();
         let graph_repository_is_active = self
             .git_store
             .read(cx)
@@ -6020,7 +6169,6 @@ Checked out in worktree {}",
 
         let head_branch_name: Option<SharedString> = repository
             .read(cx)
-            .snapshot()
             .branch
             .as_ref()
             .map(|branch| SharedString::from(branch.name().to_string()));
@@ -6043,16 +6191,7 @@ Checked out in worktree {}",
 
         let date_string = commit_timestamp.map(format_timestamp).unwrap_or_default();
 
-        let remote = repository.update(cx, |repo, cx| {
-            let remote_url = repo.default_remote_url()?;
-            let provider_registry = GitHostingProviderRegistry::default_global(cx);
-            let (provider, parsed) = parse_git_remote_url(provider_registry, &remote_url)?;
-            Some(GitRemote {
-                host: provider,
-                owner: parsed.owner.into(),
-                repo: parsed.repo.into(),
-            })
-        });
+        let remote = self.git_remote(cx);
 
         let avatar = {
             let author_email_for_avatar = if author_email.is_empty() {
@@ -6066,38 +6205,18 @@ Checked out in worktree {}",
                 .render(window, cx)
         };
 
-        let changed_files_count = self
-            .selected_commit_diff
-            .as_ref()
-            .map(|diff| diff.files.len())
-            .unwrap_or(0);
-
-        let (total_lines_added, total_lines_removed) =
-            self.selected_commit_diff_stats.unwrap_or((0, 0));
-
-        let changed_file_entries: Vec<ChangedFileEntry> = self
-            .selected_commit_diff
-            .as_ref()
-            .map(|diff| {
-                let mut files = diff.files.iter().collect::<Vec<_>>();
-                if !self.changed_files_view_mode.is_tree() {
-                    files.sort_by_key(|file| file.status());
-                }
-                files
-                    .into_iter()
-                    .map(|file| ChangedFileEntry::from_commit_file(file, cx))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let changed_file_entries = Rc::new(changed_file_entries);
-        let tree_entries: Rc<Vec<ChangedFileTreeEntry>> = if self.changed_files_view_mode.is_tree()
-        {
-            Rc::new(build_changed_file_tree_entries(
-                changed_file_entries.as_ref().clone(),
-                &self.changed_files_expanded_dirs,
-            ))
-        } else {
-            Rc::default()
+        let changes = self.selected_commit_changes.as_ref();
+        let changed_files_count = changes.map_or(0, |changes| changes.diff.files.len());
+        let (total_lines_added, total_lines_removed) = changes.map_or((0, 0), |changes| {
+            (changes.lines_added, changes.lines_removed)
+        });
+        let changed_file_entries =
+            changes.map_or_else(Rc::default, |changes| changes.files_by_status.clone());
+        let tree_entries: Rc<Vec<ChangedFileTreeEntry>> = match changes {
+            Some(changes) if self.changed_files_view_mode.is_tree() => {
+                changes.tree_entries(&self.changed_files_expanded_dirs)
+            }
+            _ => Rc::default(),
         };
 
         let is_tree_view = self.changed_files_view_mode.is_tree();
@@ -6581,16 +6700,7 @@ Checked out in worktree {}",
             ..(last_visible_row).min(loaded_commit_count);
         let rows = self.graph_data.commits[viewport_range.clone()].to_vec();
         let worktree_commits: HashSet<Oid> = self.worktrees_by_commit(cx).into_keys().collect();
-        let commit_lines: Vec<_> = self
-            .graph_data
-            .lines
-            .iter()
-            .filter(|line| {
-                line.full_interval.start <= viewport_range.end
-                    && line.full_interval.end >= viewport_range.start
-            })
-            .cloned()
-            .collect();
+        let commit_lines = self.graph_data.lines_crossing(&viewport_range);
 
         let mut lines: BTreeMap<usize, Vec<_>> = BTreeMap::new();
 
@@ -6647,7 +6757,7 @@ Checked out in worktree {}",
                         }
                     }
 
-                    for line in commit_lines {
+                    for line in commit_lines.iter() {
                         let Some((start_segment_idx, start_column)) =
                             line.get_first_visible_segment_idx(first_visible_row)
                         else {
@@ -6895,7 +7005,6 @@ Checked out in worktree {}",
 
         let head_branch_name: Option<SharedString> = self.get_repository(cx).and_then(|repo| {
             repo.read(cx)
-                .snapshot()
                 .branch
                 .as_ref()
                 .map(|branch| SharedString::from(branch.name().to_string()))
@@ -10070,142 +10179,6 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_graph_data_reloaded_after_stash_change(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            Path::new("/project"),
-            json!({
-                ".git": {},
-                "file.txt": "content",
-            }),
-        )
-        .await;
-
-        let initial_head = Oid::from_bytes(&[1; 20]).unwrap();
-        let initial_stash = Oid::from_bytes(&[2; 20]).unwrap();
-        let updated_head = Oid::from_bytes(&[3; 20]).unwrap();
-        let updated_stash = Oid::from_bytes(&[4; 20]).unwrap();
-
-        fs.set_graph_commits(
-            Path::new("/project/.git"),
-            vec![
-                Arc::new(InitialGraphCommitData {
-                    sha: initial_head,
-                    parents: smallvec![initial_stash],
-                    ref_names: vec!["HEAD".into(), "refs/heads/main".into()],
-                }),
-                Arc::new(InitialGraphCommitData {
-                    sha: initial_stash,
-                    parents: smallvec![],
-                    ref_names: vec!["refs/stash".into()],
-                }),
-            ],
-        );
-        fs.with_git_state(Path::new("/project/.git"), true, |state| {
-            state.stash_entries = git::stash::GitStash {
-                entries: vec![git::stash::StashEntry {
-                    index: 0,
-                    oid: initial_stash,
-                    message: "initial stash".to_string(),
-                    branch: Some("main".to_string()),
-                    timestamp: 1,
-                }]
-                .into(),
-            };
-        })
-        .unwrap();
-
-        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
-        cx.run_until_parked();
-
-        let repository = project.read_with(cx, |project, cx| {
-            project
-                .active_repository(cx)
-                .expect("should have a repository")
-        });
-
-        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
-            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
-        });
-        let workspace_weak =
-            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
-        let git_graph = cx.new_window_entity(|window, cx| {
-            GitGraph::new(
-                repository.read(cx).id,
-                project.read(cx).git_store().clone(),
-                workspace_weak,
-                None,
-                window,
-                cx,
-            )
-        });
-        cx.run_until_parked();
-
-        let initial_shas = git_graph.read_with(&*cx, |graph, _| {
-            graph
-                .graph_data
-                .commits
-                .iter()
-                .map(|commit| commit.data.sha)
-                .collect::<Vec<_>>()
-        });
-        assert_eq!(initial_shas, vec![initial_head, initial_stash]);
-
-        fs.set_graph_commits(
-            Path::new("/project/.git"),
-            vec![
-                Arc::new(InitialGraphCommitData {
-                    sha: updated_head,
-                    parents: smallvec![updated_stash],
-                    ref_names: vec!["HEAD".into(), "refs/heads/main".into()],
-                }),
-                Arc::new(InitialGraphCommitData {
-                    sha: updated_stash,
-                    parents: smallvec![],
-                    ref_names: vec!["refs/stash".into()],
-                }),
-            ],
-        );
-        fs.with_git_state(Path::new("/project/.git"), true, |state| {
-            state.stash_entries = git::stash::GitStash {
-                entries: vec![git::stash::StashEntry {
-                    index: 0,
-                    oid: updated_stash,
-                    message: "updated stash".to_string(),
-                    branch: Some("main".to_string()),
-                    timestamp: 1,
-                }]
-                .into(),
-            };
-        })
-        .unwrap();
-
-        project
-            .update(cx, |project, cx| project.git_scans_complete(cx))
-            .await;
-        cx.run_until_parked();
-
-        cx.draw(
-            point(px(0.), px(0.)),
-            gpui::size(px(1200.), px(800.)),
-            |_, _| git_graph.clone().into_any_element(),
-        );
-        cx.run_until_parked();
-
-        let reloaded_shas = git_graph.read_with(&*cx, |graph, _| {
-            graph
-                .graph_data
-                .commits
-                .iter()
-                .map(|commit| commit.data.sha)
-                .collect::<Vec<_>>()
-        });
-        assert_eq!(reloaded_shas, vec![updated_head, updated_stash]);
-    }
-
-    #[gpui::test]
     async fn test_graph_data_reloaded_after_tag_created(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -12112,16 +12085,17 @@ mod tests {
         cx.run_until_parked();
 
         git_graph.update(cx, |graph, cx| {
-            graph.selected_commit_diff = Some(CommitDiff {
-                files: vec![CommitFile {
-                    path: RepoPath::new("file.txt").expect("repository path should be valid"),
-                    old_text: Some("content".into()),
-                    new_text: Some("updated content".into()),
-                    is_binary: false,
-                }],
-                is_shallow_boundary: false,
-            });
-            graph.selected_commit_diff_stats = Some((1, 1));
+            graph.selected_commit_changes = Some(SelectedCommitChanges::new(
+                SelectedCommitChanges::compute(CommitDiff {
+                    files: vec![CommitFile {
+                        path: RepoPath::new("file.txt").expect("repository path should be valid"),
+                        old_text: Some("content".into()),
+                        new_text: Some("updated content".into()),
+                        is_binary: false,
+                    }],
+                    is_shallow_boundary: false,
+                }),
+            ));
             cx.notify();
         });
 
