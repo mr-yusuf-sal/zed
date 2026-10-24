@@ -11,7 +11,7 @@ use gpui::{
 };
 use project::{
     Project, ProjectPath,
-    git_store::{GitStore, GitStoreEvent, Repository, RepositoryId},
+    git_store::{GitStore, GitStoreEvent, Repository, RepositoryEvent, RepositoryId},
 };
 use ui::{DiffStat, ListItem, ListItemSpacing, Tooltip, prelude::*};
 use util::ResultExt as _;
@@ -77,6 +77,7 @@ impl WorkingTreeChanges {
             editor
         });
         let git_store_subscription = cx.subscribe(&git_store, |this, _, event, cx| match event {
+            GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::GraphEvent(..), _) => {}
             GitStoreEvent::ActiveRepositoryChanged(_)
             | GitStoreEvent::RepositoryUpdated(..)
             | GitStoreEvent::RepositoryAdded

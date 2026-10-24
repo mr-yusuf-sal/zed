@@ -124,6 +124,10 @@ pub struct GitStore {
 const MIN_PARKED_REPOSITORY_DEPTH: usize = 2;
 
 pub const MAX_CONCURRENT_OBJECT_READS: usize = 16;
+/// How long the `git cat-file` process behind commit details stays alive
+/// without requests. Starting one again is a visible delay on Windows, where
+/// spawning git is slow, so it outlives a pause in scrolling the graph.
+const COMMIT_DATA_READER_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Debug)]
 pub struct ParkedRepository {
@@ -2558,6 +2562,16 @@ impl GitStore {
         cx: &mut Context<Self>,
     ) {
         let id = repo.read(cx).id;
+        // Graph loading progress fires once per batch of commits and changes
+        // nothing a buffer's conflicts or diff base depend on.
+        if matches!(event, RepositoryEvent::GraphEvent(..)) {
+            cx.emit(GitStoreEvent::RepositoryUpdated(
+                id,
+                event.clone(),
+                self.active_repo_id == Some(id),
+            ));
+            return;
+        }
         let repo_snapshot = repo.read(cx).snapshot.clone();
         for (buffer_id, diff) in self.diffs.iter() {
             if let Some((buffer_repo, repo_path)) =
@@ -6708,12 +6722,6 @@ impl Repository {
             RepositoryEvent::TagsChanged => {
                 self.initial_graph_data.clear();
             }
-            RepositoryEvent::StashEntriesChanged => {
-                if self.scan_id > 2 {
-                    self.initial_graph_data
-                        .retain(|(log_source, _), _| *log_source != LogSource::All);
-                }
-            }
             _ => {}
         }
     }
@@ -7294,10 +7302,16 @@ impl Repository {
         cx.spawn(async move |cx| {
             let _permit = object_read_limiter.acquire_arc().await;
             match repository_state.await.map_err(|err| anyhow::anyhow!(err))? {
-                RepositoryState::Local(LocalRepositoryState { backend, .. }) => backend
-                    .load_commit(commit, ignore_shallow_boundary, cx.clone())
-                    .await
-                    .map(decode_commit_diff),
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    let diff = backend
+                        .load_commit(commit, ignore_shallow_boundary, cx.clone())
+                        .await?;
+                    // Decoding sniffs the encoding of every file's old and new
+                    // contents, which is too slow for the foreground on big commits.
+                    Ok(cx
+                        .background_spawn(async move { decode_commit_diff(diff) })
+                        .await)
+                }
                 RepositoryState::Remote(RemoteRepositoryState {
                     client, project_id, ..
                 }) => {
@@ -7586,7 +7600,12 @@ impl Repository {
 
         let graph_data_key = (log_source, log_order);
 
-        while let Ok(initial_graph_commit_data) = request_rx.recv().await {
+        while let Ok(mut initial_graph_commit_data) = request_rx.recv().await {
+            // Every append notifies the graph's listeners, so batches that queued
+            // up while the foreground was busy are applied together.
+            while let Ok(more_commit_data) = request_rx.try_recv() {
+                initial_graph_commit_data.extend(more_commit_data);
+            }
             Self::append_initial_graph_commits(
                 &this,
                 &graph_data_key,
@@ -7711,24 +7730,38 @@ impl Repository {
         let (request_tx, request_rx) = async_channel::unbounded::<Oid>();
 
         let foreground_task = cx.spawn(async move |this, cx| {
-            while let Ok((sha, commit_data)) = result_rx.recv().await {
+            while let Ok(first_result) = result_rx.recv().await {
+                // Scrolling requests a screenful of commits at once; applying the
+                // ones that are already waiting together notifies once for all.
+                let mut results = vec![first_result];
+                while let Ok(result) = result_rx.try_recv() {
+                    results.push(result);
+                }
                 let result = this.update(cx, |this, cx| {
-                    let data = Arc::new(commit_data);
+                    for (sha, commit_data) in results {
+                        let data = Arc::new(commit_data);
 
-                    if let CommitDataHandlerState::Open(handler) = &mut this.commit_data_handler {
-                        handler.pending_requests.remove(&sha);
-                        if let Some(completion_sender) = handler.completion_senders.remove(&sha) {
-                            completion_sender.send(data.clone()).ok();
+                        if let CommitDataHandlerState::Open(handler) = &mut this.commit_data_handler
+                        {
+                            handler.pending_requests.remove(&sha);
+                            if let Some(completion_sender) =
+                                handler.completion_senders.remove(&sha)
+                            {
+                                completion_sender.send(data.clone()).ok();
+                            }
+                        } else {
+                            debug_panic!(
+                                "The handler state has to be open for this task to exist"
+                            );
                         }
-                    } else {
-                        debug_panic!("The handler state has to be open for this task to exist");
-                    }
 
-                    let old_value = this.commit_data.insert(sha, CommitDataState::Loaded(data));
-                    debug_assert!(
-                        !matches!(old_value, Some(CommitDataState::Loaded(_))),
-                        "We should never overwrite commit data"
-                    );
+                        let old_value =
+                            this.commit_data.insert(sha, CommitDataState::Loaded(data));
+                        debug_assert!(
+                            !matches!(old_value, Some(CommitDataState::Loaded(_))),
+                            "We should never overwrite commit data"
+                        );
+                    }
 
                     cx.notify();
                 });
@@ -7824,7 +7857,7 @@ impl Repository {
 
         loop {
             if read_futures.is_empty() {
-                let timeout = background_executor.timer(Duration::from_secs(10));
+                let timeout = background_executor.timer(COMMIT_DATA_READER_IDLE_TIMEOUT);
 
                 futures::select_biased! {
                     sha = futures::FutureExt::fuse(receive_commit_data_request(&request_rx)) => {
@@ -12784,9 +12817,18 @@ async fn compute_snapshot(
         let backend = backend.clone();
         async move { backend.worktrees().await.log_err().unwrap_or_default() }
     };
-    let (branches, head_commit, all_worktrees) =
-        futures::future::join3(branches_future, head_commit_future, worktrees_future).await;
-    log::debug!("fetched branches, head commit, worktrees");
+    let remote_urls_future = {
+        let backend = backend.clone();
+        async move { backend.remote_urls().await }
+    };
+    let (branches, head_commit, all_worktrees, mut remote_urls) = futures::future::join4(
+        branches_future,
+        head_commit_future,
+        worktrees_future,
+        remote_urls_future,
+    )
+    .await;
+    log::debug!("fetched branches, head commit, worktrees, remotes");
 
     let BranchesScanResult {
         branches,
@@ -12800,11 +12842,8 @@ async fn compute_snapshot(
         .filter(|wt| wt.path != *work_directory_abs_path)
         .collect();
 
-    let mut remote_urls = backend.remote_urls().await;
     let remote_origin_url = remote_urls.remove("origin");
     let remote_upstream_url = remote_urls.remove("upstream");
-
-    log::debug!("fetched remotes");
 
     let snapshot = this.update(cx, |this, cx| {
         let head_changed =

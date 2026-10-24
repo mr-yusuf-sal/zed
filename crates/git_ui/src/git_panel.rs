@@ -5347,7 +5347,6 @@ impl GitPanel {
         }
         self.active_repository = new_active_repository;
         self.reopen_commit_buffer(window, cx);
-        self.preload_commit_history(cx);
         if self.active_tab == GitPanelTab::History {
             self.load_commit_history(cx);
         }
@@ -7405,23 +7404,6 @@ impl GitPanel {
         cx.notify();
     }
 
-    fn preload_commit_history(&mut self, cx: &mut Context<Self>) {
-        let Some(active_repository) = self.active_repository.as_ref() else {
-            return;
-        };
-
-        let Some(log_source) = Self::commit_history_log_source(active_repository, cx) else {
-            return;
-        };
-        let log_order = LogOrder::DateOrder;
-
-        // Kick off the git log fetch so data is ready when the user switches to History.
-        // graph_data() is idempotent — if already loading/loaded, this is a no-op.
-        active_repository.update(cx, |repository, cx| {
-            repository.graph_data(log_source, log_order, 0..0, cx);
-        });
-    }
-
     fn load_commit_history(&mut self, cx: &mut Context<Self>) {
         let Some(active_repository) = self.active_repository.clone() else {
             return;
@@ -7430,14 +7412,21 @@ impl GitPanel {
         if self._repo_subscriptions.is_empty() {
             self._repo_subscriptions.push(cx.subscribe(
                 &active_repository,
-                |this, _repo, event, cx| {
-                    if matches!(
-                        event,
-                        RepositoryEvent::GraphEvent(_, _) | RepositoryEvent::TagsChanged
-                    ) {
-                        if this.active_tab == GitPanelTab::History {
-                            this.fetch_commit_history_entries(cx);
+                |this, repository, event, cx| {
+                    if this.active_tab != GitPanelTab::History {
+                        return;
+                    }
+                    let is_relevant = match event {
+                        RepositoryEvent::GraphEvent((log_source, log_order), _) => {
+                            *log_order == LogOrder::DateOrder
+                                && Self::commit_history_log_source(&repository, cx).as_ref()
+                                    == Some(log_source)
                         }
+                        RepositoryEvent::TagsChanged => true,
+                        _ => false,
+                    };
+                    if is_relevant {
+                        this.fetch_commit_history_entries(cx);
                     }
                 },
             ));

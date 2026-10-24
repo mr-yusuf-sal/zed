@@ -18,7 +18,7 @@ use markdown::Markdown;
 use multi_buffer::{MultiBuffer, RowInfo};
 use project::{
     Project, ProjectItem as _,
-    git_store::{GitStoreEvent, Repository},
+    git_store::{GitStoreEvent, Repository, RepositoryEvent},
 };
 use smallvec::SmallVec;
 use std::{sync::Arc, time::Duration};
@@ -278,6 +278,7 @@ impl GitBlame {
         let git_store = project.read(cx).git_store().clone();
         let git_store_subscription =
             cx.subscribe(&git_store, move |this, _, event, cx| match event {
+                GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::GraphEvent(..), _) => {}
                 GitStoreEvent::RepositoryUpdated(_, _, _)
                 | GitStoreEvent::RepositoryAdded
                 | GitStoreEvent::RepositoryRemoved(_) => {
