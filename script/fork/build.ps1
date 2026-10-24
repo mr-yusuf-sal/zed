@@ -28,8 +28,8 @@
     left behind by every rebase, toolchain update and profile or feature change, which cargo
     never removes on its own. Needs cargo-sweep (cargo install cargo-sweep).
 
-    -Install also caps target\ at -SweepMaxSizeGB (default 50, 0 turns it off) once the exe is
-    in place, deleting the least recently used build output first.
+    Every build then caps target\ at -SweepMaxSizeGB (default 50, 0 turns it off), deleting
+    the least recently used build output first.
 
     The script lives in the checkout it builds (script\fork), so it is versioned with the
     stack and rebased along with it. -Update rewrites this file mid-run, which is safe:
@@ -162,6 +162,19 @@ if ($Sweep) {
     Remove-StaleIncremental $SweepDays
 }
 
+if ($SweepMaxSizeGB -gt 0) {
+    if (Get-Command cargo-sweep -ErrorAction SilentlyContinue) {
+        # cargo-sweep --maxsize measures all of target\ but only deletes outside incremental\,
+        # so with incremental\ near the cap it would delete the build just made to fit.
+        # Holding incremental\ to half the cap leaves the other half for the rest.
+        Remove-StaleIncremental $SweepDays ($SweepMaxSizeGB * 1GB / 2)
+        cargo sweep --maxsize "$($SweepMaxSizeGB)GB" $Repo
+        if ($LASTEXITCODE -ne 0) { Write-Warning "cargo sweep failed" }
+    } else {
+        Write-Warning "target\ was not capped at $SweepMaxSizeGB GB: cargo-sweep is not installed (cargo install cargo-sweep)."
+    }
+}
+
 if ($Publish) {
     $sha = (git -C $Repo rev-parse HEAD).Trim()
     $tag = "custom-$sha"
@@ -221,20 +234,6 @@ if ($Install) {
     Move-Item $target $previous -ErrorAction Stop
     Copy-Item $built $target -ErrorAction Stop
     Write-Host "Installed the fork to $target"
-
-    # Before the restart below, which can take this script down with it.
-    if ($SweepMaxSizeGB -gt 0) {
-        if (Get-Command cargo-sweep -ErrorAction SilentlyContinue) {
-            # cargo-sweep --maxsize measures all of target\ but only deletes outside incremental\,
-            # so with incremental\ near the cap it would delete the build just made to fit.
-            # Holding incremental\ to half the cap leaves the other half for the rest.
-            Remove-StaleIncremental $SweepDays ($SweepMaxSizeGB * 1GB / 2)
-            cargo sweep --maxsize "$($SweepMaxSizeGB)GB" $Repo
-            if ($LASTEXITCODE -ne 0) { Write-Warning "cargo sweep failed" }
-        } else {
-            Write-Warning "target\ was not capped at $SweepMaxSizeGB GB: cargo-sweep is not installed (cargo install cargo-sweep)."
-        }
-    }
 
     # Agent hosts (`zed --agent-host`) run Claude Code turns, and terminal hosts
     # (`zed --terminal-host`) run terminal shells, that must outlive Zed. They keep
