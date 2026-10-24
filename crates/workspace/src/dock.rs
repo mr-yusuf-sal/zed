@@ -692,8 +692,8 @@ impl Dock {
         }
     }
 
-    /// The right dock is only revealed by hovering the window's right edge, and then shows the
-    /// project panel, which otherwise lives in the Main tab. It also keeps the git panel, which is
+    /// The right dock is only revealed by hovering the window's left edge, and then shows the
+    /// project panel over the left side of the window, which otherwise lives in the Main tab. It also keeps the git panel, which is
     /// never shown, only for the actions it backs, such as push, pull and commit. Nothing else
     /// opens it.
     pub fn can_open(&self) -> bool {
@@ -765,8 +765,10 @@ impl Dock {
                 DockPosition::Left => {
                     mouse_position.x <= workspace_bounds.left() + AUTO_HIDE_REVEAL_EDGE
                 }
+                // The right dock holds the project panel, which is revealed on the left like an
+                // explorer usually is (see `Workspace::render_dock`).
                 DockPosition::Right => {
-                    mouse_position.x >= workspace_bounds.right() - AUTO_HIDE_REVEAL_EDGE
+                    mouse_position.x <= workspace_bounds.left() + AUTO_HIDE_REVEAL_EDGE
                 }
                 DockPosition::Bottom => false,
             };
@@ -1605,7 +1607,7 @@ impl Render for Dock {
                         handle
                             .absolute()
                             .top(px(0.))
-                            .left(-RESIZE_HANDLE_SIZE / 2.)
+                            .right(-RESIZE_HANDLE_SIZE / 2.)
                             .h_full()
                             .w(RESIZE_HANDLE_SIZE)
                             .cursor_col_resize(),
@@ -1630,7 +1632,7 @@ impl Render for Dock {
                 })
                 .map(|this| match self.position() {
                     DockPosition::Left => this.border_r_1(),
-                    DockPosition::Right => this.border_l_1(),
+                    DockPosition::Right => this.border_r_1(),
                     DockPosition::Bottom => this.border_t_1(),
                 })
                 .child(
