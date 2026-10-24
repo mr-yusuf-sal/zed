@@ -14,7 +14,7 @@ use crate::{
 };
 use anyhow::Context as _;
 use askpass::AskPassDelegate;
-use collections::{BTreeMap, BTreeSet, HashMap, IndexSet};
+use collections::{BTreeMap, BTreeSet, HashMap, HashSet, IndexSet};
 use db::kvp::KeyValueStore;
 use editor::Editor;
 use file_icons::FileIcons;
@@ -50,7 +50,7 @@ use smallvec::{SmallVec, smallvec};
 use std::{
     cell::Cell,
     ops::Range,
-    path::Path,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
@@ -1651,6 +1651,25 @@ impl OperationInProgress {
     }
 }
 
+/// A worktree of the graph's repository, other than the one the graph is
+/// open in.
+#[derive(Clone)]
+struct GraphWorktree {
+    name: SharedString,
+    branch_name: Option<SharedString>,
+    path: PathBuf,
+}
+
+/// A local branch that a context menu offers to delete.
+#[derive(Clone)]
+struct BranchDeletion {
+    name: String,
+    is_current: bool,
+    /// A linked worktree that has the branch checked out. Git refuses to delete
+    /// the branch until that worktree is removed.
+    worktree_path: Option<PathBuf>,
+}
+
 /// A branch chip being dragged onto another commit.
 #[derive(Clone)]
 struct DraggedRef {
@@ -2364,6 +2383,7 @@ impl GitGraph {
                     self.invalidate_state(cx);
                 }
             }
+            RepositoryEvent::GitWorktreeListChanged => cx.notify(),
             RepositoryEvent::GraphEvent(_, _) => {}
             _ => {}
         }
@@ -2383,6 +2403,50 @@ impl GitGraph {
     fn get_repository(&self, cx: &App) -> Option<Entity<Repository>> {
         let git_store = self.git_store.read(cx);
         git_store.repositories().get(&self.repo_id).cloned()
+    }
+
+    /// Groups the repository's other worktrees (its linked worktrees, plus the
+    /// main checkout when the graph is open in a linked worktree) by the commit
+    /// they have checked out, so that worktrees created outside of Zed, e.g. by
+    /// an agent, can be found in the graph.
+    fn worktrees_by_commit(&self, cx: &App) -> HashMap<Oid, Vec<GraphWorktree>> {
+        let mut worktrees_by_commit: HashMap<Oid, Vec<GraphWorktree>> = HashMap::default();
+        let Some(repository) = self.get_repository(cx) else {
+            return worktrees_by_commit;
+        };
+        let snapshot = repository.read(cx).snapshot();
+        let name_anchor_path = snapshot.main_worktree_abs_path();
+        for worktree in snapshot.linked_worktrees() {
+            if worktree.is_bare {
+                continue;
+            }
+            let Some(sha) = worktree.sha.parse::<Oid>().log_err() else {
+                continue;
+            };
+            worktrees_by_commit
+                .entry(sha)
+                .or_default()
+                .push(GraphWorktree {
+                    name: worktree.directory_name(name_anchor_path).into(),
+                    branch_name: worktree
+                        .branch_name()
+                        .map(|branch| SharedString::from(branch.to_string())),
+                    path: worktree.path.clone(),
+                });
+        }
+        worktrees_by_commit
+    }
+
+    /// Returns the worktree, if any, that has the branch named by a `%D`
+    /// decoration checked out.
+    fn worktree_for_ref<'a>(
+        ref_name: &str,
+        worktrees: &'a [GraphWorktree],
+    ) -> Option<&'a GraphWorktree> {
+        let branch_name = Self::ref_name_from_decoration(ref_name)?;
+        worktrees
+            .iter()
+            .find(|worktree| worktree.branch_name.as_ref() == Some(&branch_name))
     }
 
     /// Checks whether a ref name from git's `%D` decoration
@@ -2414,11 +2478,21 @@ impl GitGraph {
         name: SharedString,
         accent_color: gpui::Hsla,
         is_head: bool,
+        worktree: Option<&GraphWorktree>,
         commit_idx: usize,
         background: gpui::Hsla,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let tooltip_text = name.clone();
+        let tooltip_text: SharedString = match worktree {
+            Some(worktree) => format!(
+                "{name}
+Checked out in worktree {}",
+                worktree.path.display()
+            )
+            .into(),
+            None => name.clone(),
+        };
+        let is_in_worktree = worktree.is_some();
         let chip_id = SharedString::from(format!("git-graph-ref-chip-{commit_idx}-{name}"));
         let is_branch =
             !name.starts_with("tag: ") && Self::ref_name_from_decoration(&name).is_some();
@@ -2442,6 +2516,11 @@ impl GitGraph {
                             chip.icon(IconName::Check)
                                 .bg_color(background.blend(accent_color.opacity(0.25)))
                                 .border_color(accent_color.opacity(0.5))
+                        } else if is_in_worktree {
+                            chip.icon(IconName::GitWorktree)
+                                .icon_color(Color::Custom(accent_color))
+                                .bg_color(background.blend(accent_color.opacity(0.08)))
+                                .border_color(accent_color.opacity(0.25))
                         } else {
                             chip.icon(IconName::GitBranch)
                                 .icon_color(Color::Custom(accent_color))
@@ -2510,6 +2589,76 @@ impl GitGraph {
                 }),
             )
             .into_any_element()
+    }
+
+    /// Renders a chip for worktrees whose checkout isn't already shown by a
+    /// branch chip (e.g. a detached worktree). Clicking it switches to the
+    /// first worktree; the tooltip lists all of them.
+    fn render_worktree_chip(
+        worktrees: Vec<GraphWorktree>,
+        accent_color: gpui::Hsla,
+        background: gpui::Hsla,
+        commit_idx: usize,
+    ) -> Option<AnyElement> {
+        let first_worktree = worktrees.first()?.clone();
+        let label: SharedString = if worktrees.len() > 1 {
+            format!("{} +{}", first_worktree.name, worktrees.len() - 1).into()
+        } else {
+            first_worktree.name.clone()
+        };
+        let tooltip_text = worktrees
+            .iter()
+            .map(|worktree| match &worktree.branch_name {
+                Some(branch_name) => format!(
+                    "Worktree {} ({branch_name})
+{}",
+                    worktree.name,
+                    worktree.path.display()
+                ),
+                None => format!(
+                    "Worktree {}
+{}",
+                    worktree.name,
+                    worktree.path.display()
+                ),
+            })
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        let chip_id = SharedString::from(format!(
+            "git-graph-worktree-chip-{commit_idx}-{}",
+            first_worktree.path.display()
+        ));
+
+        Some(
+            div()
+                .id(chip_id)
+                .min_w_0()
+                .overflow_hidden()
+                .cursor_pointer()
+                .child(
+                    Chip::new(label)
+                        .label_size(LabelSize::Small)
+                        .truncate()
+                        .icon(IconName::GitWorktree)
+                        .icon_color(Color::Custom(accent_color))
+                        .bg_color(background.blend(accent_color.opacity(0.08)))
+                        .border_color(accent_color.opacity(0.25)),
+                )
+                .tooltip(move |_window, cx| Tooltip::simple(tooltip_text.clone(), cx))
+                .on_click(move |_, window, cx| {
+                    window.dispatch_action(
+                        Box::new(zed_actions::SwitchWorktree {
+                            path: first_worktree.path.clone(),
+                            display_name: first_worktree.name.to_string(),
+                        }),
+                        cx,
+                    );
+                })
+                .into_any_element(),
+        )
     }
 
     /// A horizontal dashed line that grows to fill the space between a ref badge
@@ -3462,7 +3611,24 @@ impl GitGraph {
             return;
         }
 
-        let extra_entries = self.git_operation_menu_entries(index, ref_name.clone(), cx);
+        let git_operations = self.git_operation_menu_entries(index, ref_name.clone(), cx);
+        let branch_deletions = self.branch_deletions_at(index, cx);
+        let extra_entries: Option<CommitMenuEntries> = if branch_deletions.is_empty() {
+            git_operations
+        } else {
+            let git_graph = cx.entity();
+            Some(Box::new(move |menu: ContextMenu, window: &mut Window| {
+                let mut menu = match git_operations {
+                    Some(add_entries) => add_entries(menu, window).separator(),
+                    None => menu,
+                };
+                for deletion in branch_deletions {
+                    menu =
+                        Self::add_branch_deletion_entries(menu, deletion, true, &git_graph, window);
+                }
+                menu
+            }))
+        };
         let Some(commit) = self.graph_data.commits.get(index) else {
             return;
         };
@@ -5150,6 +5316,167 @@ impl GitGraph {
         ))
     }
 
+    fn branch_deletion(&self, name: &str, cx: &App) -> Option<BranchDeletion> {
+        let snapshot = self.get_repository(cx)?.read(cx).snapshot();
+        let is_current = snapshot
+            .branch
+            .as_ref()
+            .is_some_and(|branch| branch.name() == name);
+        let worktree_path = snapshot
+            .linked_worktrees()
+            .iter()
+            .find(|worktree| !worktree.is_main && worktree.branch_name() == Some(name))
+            .map(|worktree| worktree.path.clone());
+        Some(BranchDeletion {
+            name: name.to_string(),
+            is_current,
+            worktree_path,
+        })
+    }
+
+    /// The local branches pointing at the commit at `index`, so the commit's
+    /// own menu can delete them without going through their ref chips.
+    fn branch_deletions_at(&self, index: usize, cx: &App) -> Vec<BranchDeletion> {
+        let Some(commit) = self.graph_data.commits.get(index) else {
+            return Vec::new();
+        };
+        let Some(repository) = self.get_repository(cx) else {
+            return Vec::new();
+        };
+        let snapshot = repository.read(cx).snapshot();
+        commit
+            .data
+            .ref_names
+            .iter()
+            .filter(|decoration| !decoration.starts_with("tag: "))
+            .filter_map(|decoration| Self::ref_name_from_decoration(decoration))
+            .filter(|name| {
+                !snapshot
+                    .branch_list
+                    .iter()
+                    .any(|branch| branch.is_remote() && branch.name() == name.as_ref())
+            })
+            .filter_map(|name| self.branch_deletion(&name, cx))
+            .collect()
+    }
+
+    /// Adds the entries that delete `deletion`'s branch. `include_name` puts the
+    /// branch name in the labels, for menus that aren't about a single branch.
+    fn add_branch_deletion_entries(
+        menu: ContextMenu,
+        deletion: BranchDeletion,
+        include_name: bool,
+        git_graph: &Entity<GitGraph>,
+        window: &mut Window,
+    ) -> ContextMenu {
+        let BranchDeletion {
+            name,
+            is_current,
+            worktree_path,
+        } = deletion;
+        let label = |label: &str| -> String {
+            if include_name {
+                format!("{label} {name}")
+            } else {
+                label.to_string()
+            }
+        };
+        let delete_label = label("Delete Branch");
+        let force_delete_label = format!("{}…", label("Force Delete Branch"));
+        let remove_worktree_label = format!("{}…", label("Remove Worktree and Delete Branch"));
+
+        // Git refuses to delete the checked-out branch, or one checked out in
+        // another worktree, so offer those disabled rather than let the
+        // command fail in a terminal.
+        let is_blocked = is_current || worktree_path.is_some();
+        let delete_args = vec!["branch".to_string(), "-d".to_string(), name.clone()];
+        let force_delete_args = vec!["branch".to_string(), "-D".to_string(), name.clone()];
+        let force_delete_message = format!("Force delete branch {name}?");
+        let menu = menu
+            .item(
+                ContextMenuEntry::new(delete_label)
+                    .disabled(is_blocked)
+                    .handler(window.handler_for(git_graph, move |this, window, cx| {
+                        this.run_git_in_terminal(delete_args.clone(), window, cx);
+                    })),
+            )
+            .item(
+                ContextMenuEntry::new(force_delete_label)
+                    .disabled(is_blocked)
+                    .handler(window.handler_for(git_graph, move |this, window, cx| {
+                        this.confirm_and_run_git_in_terminal(
+                            force_delete_message.clone(),
+                            FORCE_DELETE_BRANCH_DETAIL,
+                            "Delete",
+                            force_delete_args.clone(),
+                            window,
+                            cx,
+                        );
+                    })),
+            );
+        match worktree_path {
+            Some(worktree_path) if !is_current => menu.entry(
+                remove_worktree_label,
+                None,
+                window.handler_for(git_graph, move |this, window, cx| {
+                    this.remove_worktree_and_delete_branch(
+                        name.clone(),
+                        worktree_path.clone(),
+                        window,
+                        cx,
+                    );
+                }),
+            ),
+            _ => menu,
+        }
+    }
+
+    fn remove_worktree_and_delete_branch(
+        &mut self,
+        branch_name: String,
+        worktree_path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let detail = format!(
+            "The worktree at {} is deleted along with any uncommitted changes in it, and the \
+             branch is deleted even if it hasn't been merged.",
+            worktree_path.display()
+        );
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Remove the worktree and delete branch {branch_name}?"),
+            Some(&detail),
+            &["Delete", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |_, cx| {
+            if answer.await != Ok(0) {
+                return anyhow::Ok(());
+            }
+            repository
+                .update(cx, |repository, _| {
+                    repository.remove_worktree(worktree_path, true)
+                })
+                .await??;
+            repository
+                .update(cx, |repository, _| {
+                    repository.delete_branch(false, branch_name, true)
+                })
+                .await??;
+            anyhow::Ok(())
+        })
+        .detach_and_prompt_err(
+            "Failed to remove the worktree and delete its branch",
+            window,
+            cx,
+            |error, _, _| Some(format!("{error:#}")),
+        );
+    }
+
     /// Branch and tag management for the ref chip `decoration`: rename, delete,
     /// push and set the upstream of a branch, and push or delete a tag. Remote
     /// branches can only be deleted on their remote.
@@ -5160,10 +5487,6 @@ impl GitGraph {
     ) -> Option<CommitMenuEntries> {
         let repository = self.get_repository(cx)?;
         let snapshot = repository.read(cx).snapshot();
-        let current_branch = snapshot
-            .branch
-            .as_ref()
-            .map(|branch| branch.name().to_string());
         let remotes: Vec<String> = snapshot
             .branch_list
             .iter()
@@ -5209,6 +5532,10 @@ impl GitGraph {
             .map(|branch| branch.name().to_string())
             .collect();
 
+        let branch_deletion = match &kind {
+            RefKind::LocalBranch { name, .. } => self.branch_deletion(name, cx),
+            RefKind::Tag(_) | RefKind::RemoteBranch { .. } => None,
+        };
         let weak_git_graph = cx.weak_entity();
         let workspace = self.workspace.clone();
 
@@ -5270,7 +5597,6 @@ impl GitGraph {
                         }
                     }
                     RefKind::LocalBranch { name, upstream } => {
-                        let is_current = current_branch.as_deref() == Some(name.as_str());
                         menu = menu.entry("Rename Branch…", None, {
                             let name = name.clone();
                             move |window, cx| {
@@ -5311,23 +5637,11 @@ impl GitGraph {
                                 ])),
                             );
                         }
-                        // Git refuses to delete the checked-out branch, so offer it
-                        // disabled rather than let the command fail in a terminal.
-                        menu = menu
-                            .item(
-                                ContextMenuEntry::new("Delete Branch")
-                                    .disabled(is_current)
-                                    .handler(run(strings(&["branch", "-d", &name]))),
-                            )
-                            .item(
-                                ContextMenuEntry::new("Force Delete Branch…")
-                                    .disabled(is_current)
-                                    .handler(confirm(
-                                        format!("Force delete branch {name}?"),
-                                        FORCE_DELETE_BRANCH_DETAIL,
-                                        strings(&["branch", "-D", &name]),
-                                    )),
+                        if let Some(deletion) = branch_deletion {
+                            menu = Self::add_branch_deletion_entries(
+                                menu, deletion, false, &git_graph, window,
                             );
+                        }
                     }
                     RefKind::RemoteBranch { remote, name } => {
                         menu = menu.entry(
@@ -5548,6 +5862,19 @@ impl GitGraph {
         let full_sha: SharedString = commit_entry.data.sha.to_string().into();
         let short_sha: SharedString = full_sha.chars().take(7).collect::<String>().into();
         let ref_names = commit_entry.data.ref_names.clone();
+        let commit_worktrees = self
+            .worktrees_by_commit(cx)
+            .remove(&commit_entry.data.sha)
+            .unwrap_or_default();
+        let unmatched_worktrees = commit_worktrees
+            .iter()
+            .filter(|worktree| {
+                !ref_names.iter().any(|name| {
+                    Self::worktree_for_ref(name, std::slice::from_ref(*worktree)).is_some()
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
 
         let head_branch_name: Option<SharedString> = repository
             .read(cx)
@@ -5715,22 +6042,34 @@ impl GitGraph {
                 .gap_2()
                 .child(header)
                 .when(!metadata_collapsed, |this| {
-                    this.children((!ref_names.is_empty()).then(|| {
-                        h_flex()
-                            .gap_1()
-                            .flex_wrap()
-                            .children(ref_names.iter().map(|name| {
-                                let is_head = Self::is_head_ref(name.as_ref(), &head_branch_name);
-                                self.render_ref_chip(
-                                    name.clone(),
-                                    accent_color,
-                                    is_head,
-                                    selected_idx,
-                                    cx.theme().colors().editor_background,
-                                    cx,
-                                )
-                            }))
-                    }))
+                    this.children(
+                        (!ref_names.is_empty() || !unmatched_worktrees.is_empty()).then(|| {
+                            h_flex()
+                                .gap_1()
+                                .flex_wrap()
+                                .children(ref_names.iter().map(|name| {
+                                    let is_head =
+                                        Self::is_head_ref(name.as_ref(), &head_branch_name);
+                                    self.render_ref_chip(
+                                        name.clone(),
+                                        accent_color,
+                                        is_head,
+                                        Self::worktree_for_ref(name, &commit_worktrees),
+                                        selected_idx,
+                                        cx.theme().colors().editor_background,
+                                        cx,
+                                    )
+                                }))
+                                .children(unmatched_worktrees.iter().filter_map(|worktree| {
+                                    Self::render_worktree_chip(
+                                        vec![worktree.clone()],
+                                        accent_color,
+                                        cx.theme().colors().editor_background,
+                                        selected_idx,
+                                    )
+                                }))
+                        }),
+                    )
                     .child(
                         // A wrapping row rather than a column: each of these is a short
                         // button, and stacking them cost three rows of panel height.
@@ -6098,6 +6437,7 @@ impl GitGraph {
         let viewport_range = first_visible_row.min(loaded_commit_count.saturating_sub(1))
             ..(last_visible_row).min(loaded_commit_count);
         let rows = self.graph_data.commits[viewport_range.clone()].to_vec();
+        let worktree_commits: HashSet<Oid> = self.worktrees_by_commit(cx).into_keys().collect();
         let commit_lines: Vec<_> = self
             .graph_data
             .lines
@@ -6339,7 +6679,9 @@ impl GitGraph {
 
                         let commit_x = lane_center_x(bounds, row.lane as f32);
 
-                        if !row.data.ref_names.is_empty() {
+                        if !row.data.ref_names.is_empty()
+                            || worktree_commits.contains(&row.data.sha)
+                        {
                             paint_dashed_connector(
                                 bounds.origin.x,
                                 commit_x - COMMIT_CIRCLE_RADIUS,
@@ -6464,11 +6806,15 @@ impl GitGraph {
             );
         }
 
+        let mut worktrees_by_commit = self.worktrees_by_commit(cx);
         for absolute_idx in viewport_range {
             let Some(commit) = self.graph_data.commits.get(absolute_idx) else {
                 continue;
             };
-            if commit.data.ref_names.is_empty() {
+            let worktrees = worktrees_by_commit
+                .remove(&commit.data.sha)
+                .unwrap_or_default();
+            if commit.data.ref_names.is_empty() && worktrees.is_empty() {
                 continue;
             }
 
@@ -6481,33 +6827,48 @@ impl GitGraph {
             // (preferring the checked-out branch, falling back to the first ref)
             // plus a "+N" counter, so the gutter stays legible instead of
             // cramming several truncated chips together.
-            let (primary_name, is_head) = match ref_names
+            let primary_ref = match ref_names
                 .iter()
                 .find(|name| Self::is_head_ref(name.as_ref(), &head_branch_name))
             {
-                Some(head_ref) => (head_ref.clone(), true),
-                None => match ref_names.first() {
-                    Some(first) => (first.clone(), false),
-                    None => continue,
-                },
+                Some(head_ref) => Some((head_ref.clone(), true)),
+                None => ref_names.first().map(|first| (first.clone(), false)),
             };
 
-            let primary_chip = self.render_ref_chip(
-                primary_name.clone(),
-                accent_color,
-                is_head,
-                absolute_idx,
-                background,
-                cx,
-            );
+            let primary_worktree = primary_ref
+                .as_ref()
+                .and_then(|(name, _)| Self::worktree_for_ref(name, &worktrees));
+            let primary_chip = primary_ref.as_ref().map(|(name, is_head)| {
+                self.render_ref_chip(
+                    name.clone(),
+                    accent_color,
+                    *is_head,
+                    primary_worktree,
+                    absolute_idx,
+                    background,
+                    cx,
+                )
+            });
 
             let hidden_refs = ref_names
                 .iter()
-                .filter(|name| *name != &primary_name)
+                .filter(|name| {
+                    primary_ref
+                        .as_ref()
+                        .is_none_or(|(primary, _)| *name != primary)
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             let count_chip = (!hidden_refs.is_empty())
                 .then(|| self.render_ref_count_chip(hidden_refs, accent_color, absolute_idx, cx));
+
+            let primary_worktree_path = primary_worktree.map(|worktree| worktree.path.clone());
+            let other_worktrees = worktrees
+                .into_iter()
+                .filter(|worktree| primary_worktree_path.as_ref() != Some(&worktree.path))
+                .collect::<Vec<_>>();
+            let worktree_chip =
+                Self::render_worktree_chip(other_worktrees, accent_color, background, absolute_idx);
 
             elements.push(
                 div()
@@ -6525,8 +6886,9 @@ impl GitGraph {
                             .justify_start()
                             .gap_1()
                             .pl_1p5()
-                            .child(primary_chip)
+                            .children(primary_chip)
                             .children(count_chip)
+                            .children(worktree_chip)
                             .child(Self::render_dashed_connector(accent_color.opacity(0.5))),
                     )
                     .into_any_element(),
