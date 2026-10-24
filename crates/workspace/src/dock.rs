@@ -29,6 +29,9 @@ pub(crate) const RESIZE_HANDLE_SIZE: Pixels = px(6.);
 pub(crate) const AUTO_HIDE_REVEAL_EDGE: Pixels = px(4.);
 /// Grace period before an auto-hidden panel closes, so brushing past its edge doesn't close it.
 pub(crate) const AUTO_HIDE_DELAY: Duration = Duration::from_millis(300);
+/// How long the mouse has to stay at the editor's left edge to reveal the project panel. The mouse
+/// crosses that edge whenever it goes from the left dock to the editor, which shouldn't reveal it.
+const PROJECT_PANEL_REVEAL_DELAY: Duration = Duration::from_millis(150);
 const DOCK_PINNED_KEY_PREFIX: &str = "dock_pinned";
 
 /// How an edge panel (the left dock or the thread sidebar) shows itself.
@@ -376,6 +379,10 @@ pub struct Dock {
     // auto-hiding once the mouse has been inside, so it doesn't vanish on the next mouse move.
     hovered_since_open: bool,
     auto_hide_task: Option<Task<()>>,
+    /// Where the right dock is drawn, over the left of the center, kept up to date even while the
+    /// dock is closed so that hovering its left edge can reveal it.
+    reveal_area: Option<Bounds<Pixels>>,
+    reveal_task: Option<Task<()>>,
     _subscriptions: [Subscription; 2],
 }
 
@@ -548,6 +555,8 @@ impl Dock {
                 bounds: None,
                 hovered_since_open: false,
                 auto_hide_task: None,
+                reveal_area: None,
+                reveal_task: None,
             }
         });
 
@@ -681,6 +690,7 @@ impl Dock {
             self.is_open = open;
             self.hovered_since_open = false;
             self.auto_hide_task = None;
+            self.reveal_task = None;
             if !open {
                 self.bounds = None;
             }
@@ -692,10 +702,10 @@ impl Dock {
         }
     }
 
-    /// The right dock is only revealed by hovering the window's left edge, and then shows the
-    /// project panel over the left side of the window, which otherwise lives in the Main tab. It also keeps the git panel, which is
-    /// never shown, only for the actions it backs, such as push, pull and commit. Nothing else
-    /// opens it.
+    /// The right dock is only revealed by hovering the left edge of the center, and then shows the
+    /// project panel over the left of the center, which otherwise lives in the Main tab. It also
+    /// keeps the git panel, which is never shown, only for the actions it backs, such as push, pull
+    /// and commit. Nothing else opens it.
     pub fn can_open(&self) -> bool {
         self.position != DockPosition::Right
     }
@@ -759,18 +769,17 @@ impl Dock {
         }
 
         if !self.is_open {
+            if self.position == DockPosition::Right {
+                self.reveal_project_panel_on_mouse_move(mouse_position, window, cx);
+                return;
+            }
             let within_height = mouse_position.y >= workspace_bounds.top()
                 && mouse_position.y <= workspace_bounds.bottom();
             let at_edge = match self.position {
                 DockPosition::Left => {
                     mouse_position.x <= workspace_bounds.left() + AUTO_HIDE_REVEAL_EDGE
                 }
-                // The right dock holds the project panel, which is revealed on the left like an
-                // explorer usually is (see `Workspace::render_dock`).
-                DockPosition::Right => {
-                    mouse_position.x <= workspace_bounds.left() + AUTO_HIDE_REVEAL_EDGE
-                }
-                DockPosition::Bottom => false,
+                DockPosition::Right | DockPosition::Bottom => false,
             };
             if within_height && at_edge {
                 self.reveal_on_hover(window, cx);
@@ -794,6 +803,53 @@ impl Dock {
                 .log_err();
             }));
         }
+    }
+
+    pub(crate) fn reveal_area(&self) -> Option<Bounds<Pixels>> {
+        self.reveal_area
+    }
+
+    pub(crate) fn set_reveal_area(&mut self, reveal_area: Bounds<Pixels>) {
+        self.reveal_area = Some(reveal_area);
+    }
+
+    fn is_at_reveal_edge(&self, mouse_position: Point<Pixels>) -> bool {
+        let Some(area) = self.reveal_area else {
+            return false;
+        };
+        // The left dock's resize handle straddles the center's left edge.
+        let edge_start = area.left() + RESIZE_HANDLE_SIZE / 2.;
+        mouse_position.y >= area.top()
+            && mouse_position.y <= area.bottom()
+            && mouse_position.x >= edge_start
+            && mouse_position.x <= edge_start + AUTO_HIDE_REVEAL_EDGE
+    }
+
+    fn reveal_project_panel_on_mouse_move(
+        &mut self,
+        mouse_position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_at_reveal_edge(mouse_position) {
+            self.reveal_task = None;
+            return;
+        }
+        if self.reveal_task.is_some() {
+            return;
+        }
+        self.reveal_task = Some(cx.spawn_in(window, async move |dock, cx| {
+            cx.background_executor()
+                .timer(PROJECT_PANEL_REVEAL_DELAY)
+                .await;
+            dock.update_in(cx, |dock, window, cx| {
+                dock.reveal_task = None;
+                if !dock.is_open && dock.is_at_reveal_edge(window.mouse_position()) {
+                    dock.reveal_on_hover(window, cx);
+                }
+            })
+            .log_err();
+        }));
     }
 
     /// Shows the first enabled panel, whichever panel was activated in the dock before, since the
