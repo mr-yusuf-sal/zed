@@ -8998,12 +8998,12 @@ impl Workspace {
             .overflow_hidden()
             .flex_none()
             // The right dock is only revealed while hovered (see `Dock::can_open`), so it is drawn
-            // over the center instead of pushing it aside.
+            // over the left of the window instead of pushing anything aside.
             .when(position == DockPosition::Right, |this| {
                 this.absolute()
                     .top_0()
                     .bottom_0()
-                    .right_0()
+                    .left_0()
                     .occlude()
                     .when(dock_is_open, |this| this.shadow_lg())
             })
@@ -10043,8 +10043,8 @@ impl Render for Workspace {
                                                 }
                                                 DockPosition::Right => {
                                                     workspace.resize_right_dock(
-                                                        workspace.bounds.right()
-                                                            - e.event.position.x,
+                                                        e.event.position.x
+                                                            - workspace.bounds.left(),
                                                         window,
                                                         cx,
                                                     );
