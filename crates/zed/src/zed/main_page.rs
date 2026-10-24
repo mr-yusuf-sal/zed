@@ -5,8 +5,8 @@ use agent_client_protocol::schema::v1 as acp;
 use agent_ui::{AgentPanel, ConversationView};
 use git_ui::working_tree_changes::WorkingTreeChanges;
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels, Render, SharedString, Task,
-    WeakEntity, Window, WindowHandle, canvas, px,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, SharedString, Task,
+    WeakEntity, Window, WindowHandle,
 };
 use project::{Project, git_store::GitStore};
 use project_panel::ProjectPanel;
@@ -22,15 +22,13 @@ use workspace::{
 /// The statuses come from entities spread over every window, which appear and go away on their
 /// own, so they are polled instead of tracked through subscriptions.
 const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
-const THREE_COLUMN_MIN_WIDTH: Pixels = px(1100.);
 
-/// The permanent "Main" tab: what every agent and terminal is doing, the project's uncommitted
-/// and staged changes with a commit form, and the project panel, side by side.
+/// The permanent "Main" tab: the project panel, the project's uncommitted and staged changes
+/// with a commit form, and what every agent and terminal is doing, side by side.
 pub struct MainPage {
     project_panel: Entity<ProjectPanel>,
     working_tree_changes: Entity<WorkingTreeChanges>,
     activity: Vec<ProjectActivity>,
-    three_columns: bool,
     nav_history: Option<ItemNavHistory>,
     _refresh_task: Task<()>,
 }
@@ -98,7 +96,6 @@ impl MainPage {
             project_panel,
             working_tree_changes,
             activity: Vec::new(),
-            three_columns: false,
             nav_history: None,
             _refresh_task: refresh_task,
         }
@@ -512,24 +509,6 @@ fn is_shell(program: &str) -> bool {
 
 impl Render for MainPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let this = cx.weak_entity();
-        let measure = canvas(
-            move |bounds, _, cx| {
-                let three_columns = bounds.size.width >= THREE_COLUMN_MIN_WIDTH;
-                if let Some(this) = this.upgrade() {
-                    this.update(cx, |this, cx| {
-                        if this.three_columns != three_columns {
-                            this.three_columns = three_columns;
-                            cx.notify();
-                        }
-                    });
-                }
-            },
-            |_, _, _, _| {},
-        )
-        .absolute()
-        .size_full();
-
         let border_color = cx.theme().colors().border;
         let activity = Self::render_section(
             "main-page-activity",
@@ -537,42 +516,16 @@ impl Render for MainPage {
             self.render_activity(),
             cx,
         );
-        let changes = self.working_tree_changes.clone();
 
         h_flex()
-            .relative()
             .size_full()
-            .child(measure)
-            .map(|this| {
-                if self.three_columns {
-                    this.child(div().flex_1().min_w_0().h_full().child(activity))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .h_full()
-                                .border_l_1()
-                                .border_color(border_color)
-                                .child(changes),
-                        )
-                } else {
-                    this.child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .child(div().flex_1().min_h_0().child(activity))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_h_0()
-                                    .border_t_1()
-                                    .border_color(border_color)
-                                    .child(changes),
-                            ),
-                    )
-                }
-            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .child(self.project_panel.clone()),
+            )
             .child(
                 div()
                     .flex_1()
@@ -580,7 +533,16 @@ impl Render for MainPage {
                     .h_full()
                     .border_l_1()
                     .border_color(border_color)
-                    .child(self.project_panel.clone()),
+                    .child(self.working_tree_changes.clone()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .border_l_1()
+                    .border_color(border_color)
+                    .child(activity),
             )
     }
 }
