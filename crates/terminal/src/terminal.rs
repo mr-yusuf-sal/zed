@@ -3448,8 +3448,10 @@ impl Terminal {
         self.vi_mode_enabled
     }
 
+    /// Builds a terminal like this one, started in `cwd`, or in this
+    /// terminal's directory when `cwd` is `None`.
     pub fn clone_builder(&self, cx: &App, cwd: Option<PathBuf>) -> Task<Result<TerminalBuilder>> {
-        let working_directory = self.working_directory().or_else(|| cwd);
+        let working_directory = cwd.or_else(|| self.working_directory());
         TerminalBuilder::new(
             working_directory,
             TerminalMode::interactive(),

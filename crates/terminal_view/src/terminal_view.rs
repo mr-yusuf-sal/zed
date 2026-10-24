@@ -1920,11 +1920,13 @@ impl Item for TerminalView {
             };
             let terminal = project
                 .update(cx, |project, cx| {
-                    let cwd = picked.or_else(|| {
-                        project
-                            .active_project_directory(cx)
-                            .map(|it| it.to_path_buf())
-                    });
+                    let cwd = picked
+                        .or_else(|| source.read(cx).working_directory())
+                        .or_else(|| {
+                            project
+                                .active_project_directory(cx)
+                                .map(|it| it.to_path_buf())
+                        });
                     project.clone_terminal(&source, cx, cwd)
                 })
                 .ok()?
