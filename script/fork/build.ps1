@@ -28,6 +28,9 @@
     left behind by every rebase, toolchain update and profile or feature change, which cargo
     never removes on its own. Needs cargo-sweep (cargo install cargo-sweep).
 
+    -Install also caps target\ at -SweepMaxSizeGB (default 50, 0 turns it off) once the exe is
+    in place, deleting the least recently used build output first.
+
     The script lives in the checkout it builds (script\fork), so it is versioned with the
     stack and rebased along with it. -Update rewrites this file mid-run, which is safe:
     PowerShell has parsed the whole script before the first line runs.
@@ -48,6 +51,7 @@ param(
     [switch]$Publish,
     [switch]$Sweep,
     [int]$SweepDays = 7,
+    [int]$SweepMaxSizeGB = 50,
     [string]$GitHubRepo = "mr-yusuf-sal/zed",
     [int]$KeepReleases = 3
 )
@@ -63,6 +67,28 @@ $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
 function Invoke-Git {
     git -C $Repo @args
     if ($LASTEXITCODE -ne 0) { throw "git $($args -join ' ') failed" }
+}
+
+# Deletes target\*\incremental crate directories, oldest first: every one untouched for $Days
+# days, then more until the rest fits in $BudgetBytes. cargo-sweep skips incremental\, which is
+# not named by fingerprint hash, and rustc never deletes the directory of a crate hash it no
+# longer builds. rustc rewrites a crate's directory on every compile, so deleting one only
+# costs that crate its cache the next time it changes.
+function Remove-StaleIncremental([int]$Days, [long]$BudgetBytes = [long]::MaxValue) {
+    $cutoff = (Get-Date).AddDays(-$Days)
+    $dirs = Get-ChildItem (Join-Path $Repo "target\*\incremental\*") -Directory -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime |
+        ForEach-Object {
+            $size = (Get-ChildItem $_.FullName -Recurse -File -Force -ErrorAction SilentlyContinue |
+                Measure-Object Length -Sum).Sum
+            [pscustomobject]@{ Dir = $_; Size = [long]$size }
+        }
+    $total = [long]($dirs | Measure-Object Size -Sum).Sum
+    foreach ($d in $dirs) {
+        if ($d.Dir.LastWriteTime -ge $cutoff -and $total -le $BudgetBytes) { break }
+        Remove-Item $d.Dir.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        $total -= $d.Size
+    }
 }
 
 if (-not (Test-Path $Repo)) {
@@ -133,14 +159,7 @@ if ($Sweep) {
     # artifacts agents' `cargo check/test --release` build without this script's profile env.
     cargo sweep --time $SweepDays $Repo
     if ($LASTEXITCODE -ne 0) { Write-Warning "cargo sweep failed" }
-
-    # cargo-sweep skips incremental\, which is not named by fingerprint hash, and rustc never
-    # deletes the directory of a crate hash it no longer builds. rustc rewrites a crate's
-    # directory on every compile, so one untouched for days only costs that crate's cache.
-    $cutoff = (Get-Date).AddDays(-$SweepDays)
-    Get-ChildItem (Join-Path $Repo "target\*\incremental\*") -Directory |
-        Where-Object LastWriteTime -lt $cutoff |
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-StaleIncremental $SweepDays
 }
 
 if ($Publish) {
@@ -202,6 +221,20 @@ if ($Install) {
     Move-Item $target $previous -ErrorAction Stop
     Copy-Item $built $target -ErrorAction Stop
     Write-Host "Installed the fork to $target"
+
+    # Before the restart below, which can take this script down with it.
+    if ($SweepMaxSizeGB -gt 0) {
+        if (Get-Command cargo-sweep -ErrorAction SilentlyContinue) {
+            # cargo-sweep --maxsize measures all of target\ but only deletes outside incremental\,
+            # so with incremental\ near the cap it would delete the build just made to fit.
+            # Holding incremental\ to half the cap leaves the other half for the rest.
+            Remove-StaleIncremental $SweepDays ($SweepMaxSizeGB * 1GB / 2)
+            cargo sweep --maxsize "$($SweepMaxSizeGB)GB" $Repo
+            if ($LASTEXITCODE -ne 0) { Write-Warning "cargo sweep failed" }
+        } else {
+            Write-Warning "target\ was not capped at $SweepMaxSizeGB GB: cargo-sweep is not installed (cargo install cargo-sweep)."
+        }
+    }
 
     # Agent hosts (`zed --agent-host`) run Claude Code turns, and terminal hosts
     # (`zed --terminal-host`) run terminal shells, that must outlive Zed. They keep
