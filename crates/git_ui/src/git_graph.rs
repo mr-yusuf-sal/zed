@@ -285,20 +285,55 @@ impl ChangedFileEntry {
     fn open_in_commit_view(
         &self,
         commit_sha: &SharedString,
+        git_graph: &WeakEntity<GitGraph>,
         repository: &WeakEntity<Repository>,
         workspace: &WeakEntity<Workspace>,
         window: &mut Window,
         cx: &mut App,
     ) {
-        CommitView::open(
-            commit_sha.to_string(),
-            repository.clone(),
-            workspace.clone(),
-            None,
-            Some(self.repo_path.clone()),
-            window,
-            cx,
-        );
+        // The graph already loaded this file's contents to list the commit's
+        // changes; reading the whole commit from git again is what made
+        // opening a file slow.
+        let loaded_file = git_graph.upgrade().and_then(|git_graph| {
+            let changes = git_graph.read(cx).selected_commit_changes.as_ref()?;
+            if commit_sha.parse::<Oid>().ok()? != changes.sha {
+                return None;
+            }
+            let file = changes
+                .diff
+                .files
+                .iter()
+                .find(|file| file.path == self.repo_path)?;
+            Some(CommitDiff {
+                files: vec![CommitFile {
+                    path: file.path.clone(),
+                    old_text: file.old_text.clone(),
+                    new_text: file.new_text.clone(),
+                    is_binary: file.is_binary,
+                }],
+                is_shallow_boundary: changes.diff.is_shallow_boundary,
+            })
+        });
+        match loaded_file {
+            Some(commit_diff) => CommitView::open_with_diff(
+                commit_sha.to_string(),
+                commit_diff,
+                repository.clone(),
+                workspace.clone(),
+                Some(self.repo_path.clone()),
+                window,
+                cx,
+            ),
+            None => CommitView::open(
+                commit_sha.to_string(),
+                repository.clone(),
+                workspace.clone(),
+                None,
+                Some(self.repo_path.clone()),
+                window,
+                cx,
+            ),
+        }
     }
 
     fn render(
@@ -307,6 +342,7 @@ impl ChangedFileEntry {
         depth: usize,
         directory_label: Option<SharedString>,
         commit_sha: SharedString,
+        git_graph: WeakEntity<GitGraph>,
         repository: WeakEntity<Repository>,
         workspace: WeakEntity<Workspace>,
         _cx: &App,
@@ -343,7 +379,14 @@ impl ChangedFileEntry {
             .on_click({
                 let entry = self.clone();
                 move |_, window, cx| {
-                    entry.open_in_commit_view(&commit_sha, &repository, &workspace, window, cx);
+                    entry.open_in_commit_view(
+                        &commit_sha,
+                        &git_graph,
+                        &repository,
+                        &workspace,
+                        window,
+                        cx,
+                    );
                 }
             })
             .into_any_element()
@@ -1591,6 +1634,7 @@ fn draw_commit_circle(
 /// The selected commit's diff with what the detail panel shows of it worked out
 /// once, since the panel is rebuilt on every render of the graph.
 struct SelectedCommitChanges {
+    sha: Oid,
     diff: CommitDiff,
     lines_added: usize,
     lines_removed: usize,
@@ -1613,6 +1657,7 @@ impl SelectedCommitChanges {
     }
 
     fn new(
+        sha: Oid,
         (diff, (lines_added, lines_removed), files_by_status): (
             CommitDiff,
             (usize, usize),
@@ -1620,6 +1665,7 @@ impl SelectedCommitChanges {
         ),
     ) -> Self {
         Self {
+            sha,
             diff,
             lines_added,
             lines_removed,
@@ -1628,7 +1674,10 @@ impl SelectedCommitChanges {
         }
     }
 
-    fn tree_entries(&self, expanded_dirs: &HashMap<RepoPath, bool>) -> Rc<Vec<ChangedFileTreeEntry>> {
+    fn tree_entries(
+        &self,
+        expanded_dirs: &HashMap<RepoPath, bool>,
+    ) -> Rc<Vec<ChangedFileTreeEntry>> {
         let mut cached = self.tree_entries.borrow_mut();
         if let Some((cached_expanded_dirs, entries)) = cached.as_ref()
             && cached_expanded_dirs == expanded_dirs
@@ -1899,11 +1948,15 @@ pub struct GitGraph {
     commit_details_message_collapsed: bool,
     changed_files_expanded_dirs: HashMap<RepoPath, bool>,
     pending_select_sha: Option<Oid>,
+    /// Set while the repository reloads the graph after a ref change and the
+    /// previous graph is still shown, see `reload_after_ref_change`.
+    reload_pending: bool,
     nav_history: Option<ItemNavHistory>,
 }
 
 impl GitGraph {
     fn invalidate_state(&mut self, cx: &mut Context<Self>) {
+        self.reload_pending = false;
         self.graph_data.clear();
         self.selection_anchor_idx = None;
         self.multi_selected_idxs = Rc::default();
@@ -2181,6 +2234,7 @@ impl GitGraph {
             commit_details_message_collapsed: false,
             changed_files_expanded_dirs: HashMap::default(),
             pending_select_sha: None,
+            reload_pending: false,
             nav_history: None,
         };
 
@@ -2423,6 +2477,9 @@ impl GitGraph {
             RepositoryEvent::GraphEvent((source, order), event)
                 if source == &self.log_source && order == &self.log_order =>
             {
+                if self.reload_pending {
+                    self.finish_pending_reload(cx);
+                }
                 match event {
                     GitGraphEvent::FullyLoaded => {
                         if let Some(pending_sha_index) =
@@ -2468,7 +2525,12 @@ impl GitGraph {
                                     old_count..*commit_count,
                                     cx,
                                 );
-                                self.graph_data.add_commits(commits);
+                                // Finishing a pending reload already added every
+                                // loaded commit, and `graph_data` clamps an empty
+                                // range at the end to the last commit.
+                                if old_count < *commit_count {
+                                    self.graph_data.add_commits(commits);
+                                }
 
                                 let pending_sha_index = self.pending_select_sha.and_then(|oid| {
                                     repository
@@ -2495,8 +2557,7 @@ impl GitGraph {
                 }
             }
             RepositoryEvent::TagsChanged => {
-                self.pending_select_sha = None;
-                self.invalidate_state(cx);
+                self.reload_after_ref_change(cx);
             }
             RepositoryEvent::HeadChanged | RepositoryEvent::BranchListChanged => {
                 // Only invalidate if we scanned atleast once,
@@ -2505,14 +2566,42 @@ impl GitGraph {
                 // The threshold matches the one `Repository` clears its cached
                 // graph data at; below it the reload would rebuild the same data.
                 if repository.read(cx).scan_id > 2 {
-                    self.pending_select_sha = None;
-                    self.invalidate_state(cx);
+                    self.reload_after_ref_change(cx);
                 }
             }
             RepositoryEvent::GitWorktreeListChanged => cx.notify(),
             RepositoryEvent::GraphEvent(_, _) => {}
             _ => {}
         }
+    }
+
+    /// Refs changed, so the repository threw its graph away and loads it again.
+    /// The rows on screen stay until the first batch of the new graph arrives,
+    /// rather than the graph going blank, and the selected commit is selected
+    /// again once it is loaded.
+    fn reload_after_ref_change(&mut self, cx: &mut Context<Self>) {
+        self.pending_select_sha = self
+            .selected_entry_idx
+            .filter(|idx| !self.is_uncommitted_row(*idx))
+            .and_then(|idx| self.graph_data.commits.get(idx))
+            .map(|commit| commit.data.sha);
+        if self.graph_data.commits.is_empty() {
+            self.invalidate_state(cx);
+            return;
+        }
+        let Some(repository) = self.get_repository(cx) else {
+            self.invalidate_state(cx);
+            return;
+        };
+        self.reload_pending = true;
+        repository.update(cx, |repository, cx| {
+            repository.graph_data(self.log_source.clone(), self.log_order, 0..0, cx);
+        });
+    }
+
+    fn finish_pending_reload(&mut self, cx: &mut Context<Self>) {
+        self.invalidate_state(cx);
+        self.fetch_initial_graph_data(cx);
     }
 
     fn fetch_initial_graph_data(&mut self, cx: &mut App) {
@@ -3365,6 +3454,7 @@ Checked out in worktree {}",
             return;
         };
 
+        let commit_sha = commit.data.sha;
         let commit_message_handle = commit.data.sha;
         let diff_handle = commit.data.sha.to_string();
 
@@ -3379,7 +3469,8 @@ Checked out in worktree {}",
                     .background_spawn(async move { SelectedCommitChanges::compute(diff) })
                     .await;
                 this.update(cx, |this, cx| {
-                    this.selected_commit_changes = Some(SelectedCommitChanges::new(computed));
+                    this.selected_commit_changes =
+                        Some(SelectedCommitChanges::new(commit_sha, computed));
                     cx.notify();
                 })
                 .ok();
@@ -5555,29 +5646,39 @@ Checked out in worktree {}",
         // another worktree, so offer those disabled rather than let the
         // command fail in a terminal.
         let is_blocked = is_current || worktree.is_some();
-        let delete_args = vec!["branch".to_string(), "-d".to_string(), name.clone()];
-        let force_delete_args = vec!["branch".to_string(), "-D".to_string(), name.clone()];
+        let delete_name = name.clone();
+        let force_delete_name = name.clone();
         let force_delete_message = format!("Force delete branch {name}?");
         let menu = menu
             .item(
                 ContextMenuEntry::new(delete_label)
                     .disabled(is_blocked)
                     .handler(window.handler_for(git_graph, move |this, window, cx| {
-                        this.run_git_in_terminal(delete_args.clone(), window, cx);
+                        this.delete_branch(delete_name.clone(), false, window, cx);
                     })),
             )
             .item(
                 ContextMenuEntry::new(force_delete_label)
                     .disabled(is_blocked)
-                    .handler(window.handler_for(git_graph, move |this, window, cx| {
-                        this.confirm_and_run_git_in_terminal(
-                            force_delete_message.clone(),
-                            FORCE_DELETE_BRANCH_DETAIL,
-                            "Delete",
-                            force_delete_args.clone(),
-                            window,
+                    .handler(window.handler_for(git_graph, move |_, window, cx| {
+                        let answer = window.prompt(
+                            PromptLevel::Warning,
+                            &force_delete_message,
+                            Some(FORCE_DELETE_BRANCH_DETAIL),
+                            &["Delete", "Cancel"],
                             cx,
                         );
+                        let branch_name = force_delete_name.clone();
+                        cx.spawn_in(window, async move |this, cx| {
+                            if answer.await != Ok(0) {
+                                return;
+                            }
+                            this.update_in(cx, |this, window, cx| {
+                                this.delete_branch(branch_name, true, window, cx);
+                            })
+                            .log_err();
+                        })
+                        .detach();
                     })),
             );
         let Some(worktree) = worktree.filter(|_| !is_current) else {
@@ -5720,6 +5821,28 @@ Checked out in worktree {}",
             cx,
             |error, _, _| Some(format!("{error:#}")),
         );
+    }
+
+    /// Deletes a local branch through the repository rather than a terminal
+    /// task, which would first have to start a shell. Git's refusal to delete
+    /// an unmerged branch without `force` is shown as the error.
+    fn delete_branch(
+        &mut self,
+        branch_name: String,
+        force: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let delete = repository.update(cx, |repository, _| {
+            repository.delete_branch(false, branch_name, force)
+        });
+        cx.spawn(async move |_, _| delete.await?)
+            .detach_and_prompt_err("Failed to delete branch", window, cx, |error, _, _| {
+                Some(format!("{error:#}"))
+            });
     }
 
     fn remove_worktree_and_delete_branch(
@@ -6562,6 +6685,7 @@ Checked out in worktree {}",
                                                         entry.depth,
                                                         None,
                                                         commit_sha.clone(),
+                                                        git_graph.clone(),
                                                         repository.clone(),
                                                         workspace.clone(),
                                                         cx,
@@ -6577,6 +6701,7 @@ Checked out in worktree {}",
                                                 0,
                                                 directory_label,
                                                 commit_sha.clone(),
+                                                git_graph.clone(),
                                                 repository.clone(),
                                                 workspace.clone(),
                                                 cx,
@@ -8451,6 +8576,11 @@ mod persistence {
 impl GitGraph {
     pub fn search_for_test(&mut self, query: SharedString, cx: &mut Context<Self>) {
         self.search(query, cx);
+    }
+
+    pub fn selected_commit_sha_for_test(&self) -> Option<Oid> {
+        let idx = self.selected_entry_idx?;
+        Some(self.graph_data.commits.get(idx)?.data.sha)
     }
 
     pub fn search_matches_for_test(&self) -> Vec<Oid> {
@@ -12085,7 +12215,11 @@ mod tests {
         cx.run_until_parked();
 
         git_graph.update(cx, |graph, cx| {
+            let sha = graph
+                .selected_commit_sha_for_test()
+                .expect("a commit should be selected");
             graph.selected_commit_changes = Some(SelectedCommitChanges::new(
+                sha,
                 SelectedCommitChanges::compute(CommitDiff {
                     files: vec![CommitFile {
                         path: RepoPath::new("file.txt").expect("repository path should be valid"),

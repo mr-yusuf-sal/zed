@@ -7744,19 +7744,15 @@ impl Repository {
                         if let CommitDataHandlerState::Open(handler) = &mut this.commit_data_handler
                         {
                             handler.pending_requests.remove(&sha);
-                            if let Some(completion_sender) =
-                                handler.completion_senders.remove(&sha)
+                            if let Some(completion_sender) = handler.completion_senders.remove(&sha)
                             {
                                 completion_sender.send(data.clone()).ok();
                             }
                         } else {
-                            debug_panic!(
-                                "The handler state has to be open for this task to exist"
-                            );
+                            debug_panic!("The handler state has to be open for this task to exist");
                         }
 
-                        let old_value =
-                            this.commit_data.insert(sha, CommitDataState::Loaded(data));
+                        let old_value = this.commit_data.insert(sha, CommitDataState::Loaded(data));
                         debug_assert!(
                             !matches!(old_value, Some(CommitDataState::Loaded(_))),
                             "We should never overwrite commit data"

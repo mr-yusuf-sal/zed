@@ -67,7 +67,8 @@ use project::git_store::GitAccess;
 use project::{
     Fs, Project, ProjectPath,
     git_store::{
-        CommitDataState, GitStoreEvent, Repository, RepositoryEvent, RepositoryId, pending_op,
+        CommitDataState, GitGraphEvent, GitStoreEvent, Repository, RepositoryEvent, RepositoryId,
+        pending_op,
     },
     project_settings::{GitPathStyle, ProjectSettings},
 };
@@ -7416,17 +7417,19 @@ impl GitPanel {
                     if this.active_tab != GitPanelTab::History {
                         return;
                     }
-                    let is_relevant = match event {
-                        RepositoryEvent::GraphEvent((log_source, log_order), _) => {
-                            *log_order == LogOrder::DateOrder
+                    match event {
+                        RepositoryEvent::GraphEvent((log_source, log_order), graph_event) => {
+                            if *log_order == LogOrder::DateOrder
                                 && Self::commit_history_log_source(&repository, cx).as_ref()
                                     == Some(log_source)
+                            {
+                                let only_appended =
+                                    matches!(graph_event, GitGraphEvent::CountUpdated(_));
+                                this.update_commit_history_entries(only_appended, cx);
+                            }
                         }
-                        RepositoryEvent::TagsChanged => true,
-                        _ => false,
-                    };
-                    if is_relevant {
-                        this.fetch_commit_history_entries(cx);
+                        RepositoryEvent::TagsChanged => this.fetch_commit_history_entries(cx),
+                        _ => {}
                     }
                 },
             ));
@@ -7440,6 +7443,13 @@ impl GitPanel {
     }
 
     fn fetch_commit_history_entries(&mut self, cx: &mut Context<Self>) {
+        self.update_commit_history_entries(false, cx);
+    }
+
+    /// `only_appended` is set when the repository only added commits to the
+    /// history since the last update, so the entries already listed are kept
+    /// rather than rebuilt and compared for every batch of a long history.
+    fn update_commit_history_entries(&mut self, only_appended: bool, cx: &mut Context<Self>) {
         let Some(active_repository) = self.active_repository.clone() else {
             return;
         };
@@ -7451,13 +7461,38 @@ impl GitPanel {
         };
         let log_order = LogOrder::DateOrder;
 
+        let existing_entries = match &self.commit_history {
+            CommitHistory::Loaded(entries) if only_appended => Some(entries.clone()),
+            _ => None,
+        };
         let (entries, is_loading, error) = active_repository.update(cx, |repository, cx| {
             let response = repository.graph_data(log_source, log_order, 0..usize::MAX, cx);
-            let entries: Rc<[CommitHistoryEntry]> = response
-                .commits
-                .iter()
-                .map(CommitHistoryEntry::from)
-                .collect();
+            let existing_entries = existing_entries.filter(|existing| {
+                let last_index = existing.len().checked_sub(1);
+                last_index.is_some_and(|last_index| {
+                    response.commits.get(last_index).map(|commit| commit.sha)
+                        == existing.last().map(|entry| entry.sha)
+                        && response.commits.first().map(|commit| commit.sha)
+                            == existing.first().map(|entry| entry.sha)
+                })
+            });
+            let entries: Rc<[CommitHistoryEntry]> = match existing_entries {
+                Some(existing) if existing.len() == response.commits.len() => existing,
+                Some(existing) => existing
+                    .iter()
+                    .cloned()
+                    .chain(
+                        response.commits[existing.len()..]
+                            .iter()
+                            .map(CommitHistoryEntry::from),
+                    )
+                    .collect(),
+                None => response
+                    .commits
+                    .iter()
+                    .map(CommitHistoryEntry::from)
+                    .collect(),
+            };
             (entries, response.is_loading, response.error)
         });
 

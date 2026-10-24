@@ -200,6 +200,7 @@ impl CommitView {
             stash,
             file_filter,
             false,
+            None,
             window,
             cx,
         )
@@ -223,6 +224,33 @@ impl CommitView {
             None,
             None,
             true,
+            None,
+            window,
+            cx,
+        )
+    }
+
+    /// Opens the commit with `commit_diff`, the diff its caller already loaded
+    /// through `Repository::load_commit_diff`, instead of reading every changed
+    /// file's contents from git again.
+    pub fn open_with_diff(
+        commit_sha: String,
+        commit_diff: CommitDiff,
+        repo: WeakEntity<Repository>,
+        workspace: WeakEntity<Workspace>,
+        file_filter: Option<RepoPath>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        Self::open_with_options(
+            commit_sha,
+            None,
+            repo,
+            workspace,
+            None,
+            file_filter,
+            false,
+            Some(commit_diff),
             window,
             cx,
         )
@@ -236,6 +264,7 @@ impl CommitView {
         stash: Option<usize>,
         file_filter: Option<RepoPath>,
         ignore_shallow_boundary: bool,
+        preloaded_diff: Option<CommitDiff>,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -243,11 +272,14 @@ impl CommitView {
             Some(older_sha) => format!("{older_sha}..{commit_sha}"),
             None => commit_sha.clone(),
         };
-        let commit_diff = repo
-            .update(cx, |repo, cx| {
-                repo.load_commit_diff(revision.clone(), ignore_shallow_boundary, cx)
-            })
-            .ok();
+        let commit_diff = match preloaded_diff {
+            Some(diff) => Some(Task::ready(Ok(diff))),
+            None => repo
+                .update(cx, |repo, cx| {
+                    repo.load_commit_diff(revision.clone(), ignore_shallow_boundary, cx)
+                })
+                .ok(),
+        };
         let commit_details = repo
             .update(cx, |repo, cx| repo.show_commit(commit_sha.clone(), cx))
             .ok();
@@ -640,6 +672,7 @@ impl CommitView {
                                                     stash,
                                                     file_filter,
                                                     false,
+                                                    None,
                                                     window,
                                                     cx,
                                                 )
@@ -673,6 +706,7 @@ impl CommitView {
                                     stash,
                                     file_filter.clone(),
                                     true,
+                                    None,
                                     window,
                                     cx,
                                 );
