@@ -1,0 +1,8 @@
+[shell_environment_policy]
+inherit = "core"
+
+[shell_environment_policy.set]
+CARGO_PROFILE_RELEASE_LTO = "false"
+CARGO_PROFILE_RELEASE_DEBUG = "false"
+CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "16"
+CARGO_PROFILE_RELEASE_INCREMENTAL = "true"
