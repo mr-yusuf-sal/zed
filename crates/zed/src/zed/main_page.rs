@@ -12,7 +12,7 @@ use git::{
 use git_ui::{git_status_icon, project_diff::ProjectDiff};
 use git_ui_core::{askpass_modal::AskPassModal, notifications::show_error_toast};
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels, PromptLevel, Render,
+    App, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels, PromptLevel, Render,
     SharedString, Task, WeakEntity, Window, WindowHandle, canvas, px,
 };
 use project::{Project, ProjectPath, git_store::Repository};
@@ -262,13 +262,38 @@ impl MainPage {
                     })),
             )
             .end_slot(
-                IconButton::new((id, row_index), icon)
-                    .icon_size(IconSize::Small)
-                    .tooltip(Tooltip::text(tooltip))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.set_staged(&repository_handle, vec![repo_path.clone()], !staged, cx);
-                    })),
+                h_flex()
+                    .when(!staged, |this| {
+                        let repository_handle = repository_handle.clone();
+                        let file = file.clone();
+                        this.child(
+                            IconButton::new(("main-page-discard-change", row_index), IconName::Undo)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text(if file.status.is_created() {
+                                    "Trash File"
+                                } else {
+                                    "Discard Changes"
+                                }))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.discard(&repository_handle, vec![file.clone()], window, cx);
+                                })),
+                        )
+                    })
+                    .child(
+                        IconButton::new((id, row_index), icon)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text(tooltip))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.set_staged(
+                                    &repository_handle,
+                                    vec![repo_path.clone()],
+                                    !staged,
+                                    cx,
+                                );
+                            })),
+                    ),
             )
             .on_click(move |_, window, cx| {
                 let workspace = workspace.clone();
@@ -316,6 +341,78 @@ impl MainPage {
                     if let Some(workspace) = workspace.upgrade() {
                         let action = if stage { "add" } else { "reset" };
                         show_error_toast(workspace, action, error, cx);
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Puts tracked files back to HEAD, staged changes included, and trashes new ones.
+    fn discard(
+        &mut self,
+        repository: &WeakEntity<Repository>,
+        files: Vec<ChangedFile>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = repository.upgrade() else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        if files.is_empty() {
+            return;
+        }
+
+        let mut detail = files
+            .iter()
+            .take(5)
+            .map(|file| file.file_name.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if files.len() > 5 {
+            detail.push_str(&format!("\nand {} more…", files.len() - 5));
+        }
+        let (created, tracked): (Vec<_>, Vec<_>) =
+            files.into_iter().partition(|file| file.status.is_created());
+        let (message, confirm) = match (tracked.as_slice(), created.as_slice()) {
+            ([file], []) => (format!("Discard changes to {}?", file.file_name), "Discard"),
+            ([], [file]) => (format!("Trash {}?", file.file_name), "Trash"),
+            (tracked, []) => (
+                format!("Discard changes to {} files?", tracked.len()),
+                "Discard",
+            ),
+            ([], created) => (format!("Trash {} files?", created.len()), "Trash"),
+            (tracked, created) => (
+                format!(
+                    "Discard changes to {} files and trash {} files?",
+                    tracked.len(),
+                    created.len()
+                ),
+                "Discard and Trash",
+            ),
+        };
+        let detail = (tracked.len() + created.len() > 1).then_some(detail);
+        let prompt = window.prompt(
+            PromptLevel::Warning,
+            &message,
+            detail.as_deref(),
+            &[confirm, "Cancel"],
+            cx,
+        );
+
+        let project = workspace.read(cx).project().clone();
+        let workspace = workspace.downgrade();
+        cx.spawn(async move |_, cx| {
+            if prompt.await.ok() != Some(0) {
+                return;
+            }
+            if let Err(error) = discard_files(repository, project, tracked, created, cx).await {
+                cx.update(|cx| {
+                    if let Some(workspace) = workspace.upgrade() {
+                        show_error_toast(workspace, "checkout", error, cx);
                     }
                 });
             }
@@ -534,6 +631,63 @@ impl MainPage {
     }
 }
 
+async fn discard_files(
+    repository: Entity<Repository>,
+    project: Entity<Project>,
+    tracked: Vec<ChangedFile>,
+    created: Vec<ChangedFile>,
+    cx: &mut AsyncApp,
+) -> anyhow::Result<()> {
+    if !tracked.is_empty() {
+        let open_buffers = project.read_with(cx, |project, cx| {
+            tracked
+                .iter()
+                .filter_map(|file| project.get_open_buffer(file.project_path.as_ref()?, cx))
+                .collect::<Vec<_>>()
+        });
+        let repo_paths = tracked.iter().map(|file| file.repo_path.clone()).collect();
+        repository
+            .update(cx, |repository, cx| {
+                repository.checkout_files("HEAD", repo_paths, cx)
+            })
+            .await?;
+        // A buffer with unsaved edits keeps them over the restored file, and saving it would
+        // bring the discarded changes back.
+        let reloads = cx.update(|cx| {
+            open_buffers
+                .iter()
+                .filter_map(|buffer| {
+                    buffer.update(cx, |buffer, cx| buffer.is_dirty().then(|| buffer.reload(cx)))
+                })
+                .collect::<Vec<_>>()
+        });
+        futures::future::join_all(reloads).await;
+    }
+
+    if !created.is_empty() {
+        let staged = created
+            .iter()
+            .filter(|file| file.status.staging().has_staged())
+            .map(|file| file.repo_path.clone())
+            .collect::<Vec<_>>();
+        if !staged.is_empty() {
+            repository
+                .update(cx, |repository, cx| repository.unstage_entries(staged, cx))
+                .await?;
+        }
+        let trash_tasks = project.update(cx, |project, cx| {
+            created
+                .iter()
+                .filter_map(|file| project.trash_file(file.project_path.clone()?, cx))
+                .collect::<Vec<_>>()
+        });
+        for result in futures::future::join_all(trash_tasks).await {
+            result?;
+        }
+    }
+    Ok(())
+}
+
 fn render_placeholder(text: &'static str) -> AnyElement {
     div()
         .p_2()
@@ -576,11 +730,25 @@ fn render_repository_header(
                 .color(Color::Muted),
         )
         .child(
-            Button::new((id, repository_index), label)
-                .label_size(LabelSize::XSmall)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.set_staged(&repository_handle, repo_paths.clone(), !staged, cx);
-                })),
+            h_flex()
+                .when(!staged, |this| {
+                    let repository_handle = repository_handle.clone();
+                    let files = files.to_vec();
+                    this.child(
+                        Button::new(("main-page-discard-all", repository_index), "Discard All")
+                            .label_size(LabelSize::XSmall)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.discard(&repository_handle, files.clone(), window, cx);
+                            })),
+                    )
+                })
+                .child(
+                    Button::new((id, repository_index), label)
+                        .label_size(LabelSize::XSmall)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_staged(&repository_handle, repo_paths.clone(), !staged, cx);
+                        })),
+                ),
         )
         .into_any_element()
 }
