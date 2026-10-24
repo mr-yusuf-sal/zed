@@ -238,6 +238,7 @@ impl WorkingTreeChanges {
         let workspace = self.workspace.clone();
         let project_path = file.project_path.clone();
         let repository_handle = repository.repository.clone();
+        let diff_repository = repository.repository.clone();
         let repo_path = file.repo_path.clone();
         let (id, stat_id, icon, tooltip) = if staged {
             (
@@ -315,6 +316,7 @@ impl WorkingTreeChanges {
             .on_click(move |_, window, cx| {
                 let workspace = workspace.clone();
                 let project_path = project_path.clone();
+                let diff_repository = diff_repository.clone();
                 // Opening the diff deactivates the tab showing this list, which updates it, and
                 // the click is handled while that tab may still be updating.
                 window.defer(cx, move |window, cx| {
@@ -326,7 +328,20 @@ impl WorkingTreeChanges {
                                 window,
                                 cx,
                             ),
-                            None => ProjectDiff::deploy_at(workspace, None, window, cx),
+                            None => {
+                                ProjectDiff::deploy_at(workspace, None, window, cx);
+                                // `deploy_at` shows the active repository, which may not be the
+                                // one this file belongs to.
+                                let project_diff =
+                                    workspace.items_of_type::<ProjectDiff>(cx).next();
+                                if let Some(repository) = diff_repository.upgrade()
+                                    && let Some(project_diff) = project_diff
+                                {
+                                    project_diff.update(cx, |project_diff, cx| {
+                                        project_diff.set_repo(Some(repository), cx);
+                                    });
+                                }
+                            }
                         })
                         .log_err();
                 });

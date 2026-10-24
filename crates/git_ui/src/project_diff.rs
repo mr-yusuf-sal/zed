@@ -209,7 +209,24 @@ impl ProjectDiff {
             );
             project_diff
         };
+        // The diff shows one repository at a time, and the file may belong to another one, such
+        // as a linked worktree nested inside the project.
+        let owning_repo = workspace
+            .project()
+            .read(cx)
+            .git_store()
+            .read(cx)
+            .repository_and_path_for_project_path(&project_path, cx)
+            .map(|(repo, _)| repo);
         project_diff.update(cx, |project_diff, cx| {
+            if let Some(owning_repo) = owning_repo {
+                let needs_switch = project_diff
+                    .repo(cx)
+                    .is_none_or(|current| current.read(cx).id != owning_repo.read(cx).id);
+                if needs_switch {
+                    project_diff.set_repo(Some(owning_repo), cx);
+                }
+            }
             project_diff.move_to_project_path(&project_path, window, cx);
         });
     }
