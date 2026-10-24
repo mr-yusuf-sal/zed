@@ -12,8 +12,8 @@ use git::{
 use git_ui::{git_status_icon, project_diff::ProjectDiff};
 use git_ui_core::{askpass_modal::AskPassModal, notifications::show_error_toast};
 use gpui::{
-    App, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels, PromptLevel, Render,
-    SharedString, Task, WeakEntity, Window, WindowHandle, canvas, px,
+    App, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels, PromptLevel,
+    Render, SharedString, Task, WeakEntity, Window, WindowHandle, canvas, px,
 };
 use project::{Project, ProjectPath, git_store::Repository};
 use project_panel::ProjectPanel;
@@ -267,17 +267,27 @@ impl MainPage {
                         let repository_handle = repository_handle.clone();
                         let file = file.clone();
                         this.child(
-                            IconButton::new(("main-page-discard-change", row_index), IconName::Undo)
-                                .icon_size(IconSize::Small)
-                                .tooltip(Tooltip::text(if file.status.is_created() {
-                                    "Trash File"
-                                } else {
-                                    "Discard Changes"
-                                }))
-                                .on_click(cx.listener(move |this, _, window, cx| {
+                            IconButton::new(
+                                ("main-page-discard-change", row_index),
+                                IconName::Undo,
+                            )
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text(if file.status.is_created() {
+                                "Trash File"
+                            } else {
+                                "Discard Changes"
+                            }))
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
                                     cx.stop_propagation();
-                                    this.discard(&repository_handle, vec![file.clone()], window, cx);
-                                })),
+                                    this.discard(
+                                        &repository_handle,
+                                        vec![file.clone()],
+                                        window,
+                                        cx,
+                                    );
+                                },
+                            )),
                         )
                     })
                     .child(
@@ -657,7 +667,9 @@ async fn discard_files(
             open_buffers
                 .iter()
                 .filter_map(|buffer| {
-                    buffer.update(cx, |buffer, cx| buffer.is_dirty().then(|| buffer.reload(cx)))
+                    buffer.update(cx, |buffer, cx| {
+                        buffer.is_dirty().then(|| buffer.reload(cx))
+                    })
                 })
                 .collect::<Vec<_>>()
         });
