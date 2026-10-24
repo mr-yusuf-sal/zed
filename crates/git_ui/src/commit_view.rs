@@ -211,7 +211,9 @@ impl CommitView {
         window: &mut Window,
         cx: &mut App,
     ) {
-        Self::open_with_options(commit_sha, None, repo, workspace, options, false, window, cx)
+        Self::open_with_options(
+            commit_sha, None, repo, workspace, options, false, None, window, cx,
+        )
     }
 
     pub(crate) fn commit_sha(&self) -> &SharedString {
@@ -239,6 +241,35 @@ impl CommitView {
             workspace,
             CommitViewOptions::default(),
             true,
+            None,
+            window,
+            cx,
+        )
+    }
+
+    /// Opens the commit with `commit_diff`, the diff its caller already loaded
+    /// through `Repository::load_commit_diff`, instead of reading every changed
+    /// file's contents from git again.
+    pub fn open_with_diff(
+        commit_sha: String,
+        commit_diff: CommitDiff,
+        repo: WeakEntity<Repository>,
+        workspace: WeakEntity<Workspace>,
+        file_filter: Option<RepoPath>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        Self::open_with_options(
+            commit_sha,
+            None,
+            repo,
+            workspace,
+            CommitViewOptions {
+                file_filter,
+                ..Default::default()
+            },
+            false,
+            Some(commit_diff),
             window,
             cx,
         )
@@ -251,6 +282,7 @@ impl CommitView {
         workspace: WeakEntity<Workspace>,
         options: CommitViewOptions,
         ignore_shallow_boundary: bool,
+        preloaded_diff: Option<CommitDiff>,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -258,11 +290,14 @@ impl CommitView {
             Some(older_sha) => format!("{older_sha}..{commit_sha}"),
             None => commit_sha.clone(),
         };
-        let commit_diff = repo
-            .update(cx, |repo, cx| {
-                repo.load_commit_diff(revision.clone(), ignore_shallow_boundary, cx)
-            })
-            .ok();
+        let commit_diff = match preloaded_diff {
+            Some(diff) => Some(Task::ready(Ok(diff))),
+            None => repo
+                .update(cx, |repo, cx| {
+                    repo.load_commit_diff(revision.clone(), ignore_shallow_boundary, cx)
+                })
+                .ok(),
+        };
         let commit_details = repo
             .update(cx, |repo, cx| repo.show_commit(commit_sha.clone(), cx))
             .ok();
@@ -780,6 +815,7 @@ impl CommitView {
                                                         reveal_file,
                                                     },
                                                     false,
+                                                    None,
                                                     window,
                                                     cx,
                                                 )
@@ -816,6 +852,7 @@ impl CommitView {
                                         reveal_file: reveal_file.clone(),
                                     },
                                     true,
+                                    None,
                                     window,
                                     cx,
                                 );
