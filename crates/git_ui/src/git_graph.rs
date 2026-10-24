@@ -1667,7 +1667,7 @@ struct BranchDeletion {
     is_current: bool,
     /// A linked worktree that has the branch checked out. Git refuses to delete
     /// the branch until that worktree is removed.
-    worktree_path: Option<PathBuf>,
+    worktree: Option<GraphWorktree>,
 }
 
 /// A branch chip being dragged onto another commit.
@@ -2595,10 +2595,12 @@ Checked out in worktree {}",
     /// branch chip (e.g. a detached worktree). Clicking it switches to the
     /// first worktree; the tooltip lists all of them.
     fn render_worktree_chip(
+        &self,
         worktrees: Vec<GraphWorktree>,
         accent_color: gpui::Hsla,
         background: gpui::Hsla,
         commit_idx: usize,
+        cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let first_worktree = worktrees.first()?.clone();
         let label: SharedString = if worktrees.len() > 1 {
@@ -2610,23 +2612,14 @@ Checked out in worktree {}",
             .iter()
             .map(|worktree| match &worktree.branch_name {
                 Some(branch_name) => format!(
-                    "Worktree {} ({branch_name})
-{}",
+                    "Worktree {} ({branch_name})\n{}",
                     worktree.name,
                     worktree.path.display()
                 ),
-                None => format!(
-                    "Worktree {}
-{}",
-                    worktree.name,
-                    worktree.path.display()
-                ),
+                None => format!("Worktree {}\n{}", worktree.name, worktree.path.display()),
             })
             .collect::<Vec<_>>()
-            .join(
-                "
-",
-            );
+            .join("\n");
         let chip_id = SharedString::from(format!(
             "git-graph-worktree-chip-{commit_idx}-{}",
             first_worktree.path.display()
@@ -2649,14 +2642,21 @@ Checked out in worktree {}",
                 )
                 .tooltip(move |_window, cx| Tooltip::simple(tooltip_text.clone(), cx))
                 .on_click(move |_, window, cx| {
-                    window.dispatch_action(
-                        Box::new(zed_actions::SwitchWorktree {
-                            path: first_worktree.path.clone(),
-                            display_name: first_worktree.name.to_string(),
-                        }),
-                        cx,
-                    );
+                    Self::switch_to_worktree(&first_worktree, window, cx);
                 })
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.deploy_worktree_context_menu(
+                            event.position,
+                            commit_idx,
+                            worktrees.clone(),
+                            window,
+                            cx,
+                        );
+                    }),
+                )
                 .into_any_element(),
         )
     }
@@ -3613,7 +3613,15 @@ Checked out in worktree {}",
 
         let git_operations = self.git_operation_menu_entries(index, ref_name.clone(), cx);
         let branch_deletions = self.branch_deletions_at(index, cx);
-        let extra_entries: Option<CommitMenuEntries> = if branch_deletions.is_empty() {
+        let commit_worktrees = self
+            .graph_data
+            .commits
+            .get(index)
+            .and_then(|commit| self.worktrees_by_commit(cx).remove(&commit.data.sha))
+            .unwrap_or_default();
+        let extra_entries: Option<CommitMenuEntries> = if branch_deletions.is_empty()
+            && commit_worktrees.is_empty()
+        {
             git_operations
         } else {
             let git_graph = cx.entity();
@@ -3625,6 +3633,10 @@ Checked out in worktree {}",
                 for deletion in branch_deletions {
                     menu =
                         Self::add_branch_deletion_entries(menu, deletion, true, &git_graph, window);
+                }
+                for worktree in commit_worktrees {
+                    menu =
+                        Self::add_worktree_removal_entry(menu, worktree, true, &git_graph, window);
                 }
                 menu
             }))
@@ -5322,15 +5334,20 @@ Checked out in worktree {}",
             .branch
             .as_ref()
             .is_some_and(|branch| branch.name() == name);
-        let worktree_path = snapshot
+        let name_anchor_path = snapshot.main_worktree_abs_path();
+        let worktree = snapshot
             .linked_worktrees()
             .iter()
             .find(|worktree| !worktree.is_main && worktree.branch_name() == Some(name))
-            .map(|worktree| worktree.path.clone());
+            .map(|worktree| GraphWorktree {
+                name: worktree.directory_name(name_anchor_path).into(),
+                branch_name: Some(SharedString::from(name.to_string())),
+                path: worktree.path.clone(),
+            });
         Some(BranchDeletion {
             name: name.to_string(),
             is_current,
-            worktree_path,
+            worktree,
         })
     }
 
@@ -5372,7 +5389,7 @@ Checked out in worktree {}",
         let BranchDeletion {
             name,
             is_current,
-            worktree_path,
+            worktree,
         } = deletion;
         let label = |label: &str| -> String {
             if include_name {
@@ -5388,7 +5405,7 @@ Checked out in worktree {}",
         // Git refuses to delete the checked-out branch, or one checked out in
         // another worktree, so offer those disabled rather than let the
         // command fail in a terminal.
-        let is_blocked = is_current || worktree_path.is_some();
+        let is_blocked = is_current || worktree.is_some();
         let delete_args = vec!["branch".to_string(), "-d".to_string(), name.clone()];
         let force_delete_args = vec!["branch".to_string(), "-D".to_string(), name.clone()];
         let force_delete_message = format!("Force delete branch {name}?");
@@ -5414,21 +5431,146 @@ Checked out in worktree {}",
                         );
                     })),
             );
-        match worktree_path {
-            Some(worktree_path) if !is_current => menu.entry(
-                remove_worktree_label,
-                None,
-                window.handler_for(git_graph, move |this, window, cx| {
-                    this.remove_worktree_and_delete_branch(
-                        name.clone(),
-                        worktree_path.clone(),
-                        window,
-                        cx,
-                    );
-                }),
+        let Some(worktree) = worktree.filter(|_| !is_current) else {
+            return menu;
+        };
+        // Menus that name the branch list the commit's worktrees separately.
+        let menu = if include_name {
+            menu
+        } else {
+            Self::add_worktree_removal_entry(menu, worktree.clone(), false, git_graph, window)
+        };
+        menu.entry(
+            remove_worktree_label,
+            None,
+            window.handler_for(git_graph, move |this, window, cx| {
+                this.remove_worktree_and_delete_branch(
+                    name.clone(),
+                    worktree.path.clone(),
+                    window,
+                    cx,
+                );
+            }),
+        )
+    }
+
+    fn switch_to_worktree(worktree: &GraphWorktree, window: &mut Window, cx: &mut App) {
+        window.dispatch_action(
+            Box::new(zed_actions::SwitchWorktree {
+                path: worktree.path.clone(),
+                display_name: worktree.name.to_string(),
+            }),
+            cx,
+        );
+    }
+
+    fn deploy_worktree_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        index: usize,
+        worktrees: Vec<GraphWorktree>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let git_graph = cx.entity();
+        let context_menu = ContextMenu::build(window, cx, move |mut menu, window, _| {
+            if let [worktree] = worktrees.as_slice() {
+                menu = menu.header(format!("Worktree {}", worktree.name));
+                return Self::add_worktree_entries(menu, worktree.clone(), &git_graph, window);
+            }
+            menu = menu.header("Worktrees");
+            for worktree in worktrees.iter().cloned() {
+                let git_graph = git_graph.clone();
+                menu = menu.submenu(worktree.name.clone(), move |submenu, window, _| {
+                    Self::add_worktree_entries(submenu, worktree.clone(), &git_graph, window)
+                });
+            }
+            menu
+        });
+        self.set_context_menu(context_menu, position, Some(index), window, cx);
+    }
+
+    fn add_worktree_entries(
+        menu: ContextMenu,
+        worktree: GraphWorktree,
+        git_graph: &Entity<GitGraph>,
+        window: &mut Window,
+    ) -> ContextMenu {
+        let switch_worktree = worktree.clone();
+        let menu = menu.entry("Switch to Worktree", None, move |window, cx| {
+            Self::switch_to_worktree(&switch_worktree, window, cx);
+        });
+        Self::add_worktree_removal_entry(menu, worktree, false, git_graph, window)
+    }
+
+    /// Adds the entry that removes `worktree`. `include_name` puts the
+    /// worktree's name in the label, for menus that aren't about a single
+    /// worktree.
+    fn add_worktree_removal_entry(
+        menu: ContextMenu,
+        worktree: GraphWorktree,
+        include_name: bool,
+        git_graph: &Entity<GitGraph>,
+        window: &mut Window,
+    ) -> ContextMenu {
+        let label = if include_name {
+            format!("Remove Worktree {}…", worktree.name)
+        } else {
+            "Remove Worktree…".to_string()
+        };
+        menu.entry(
+            label,
+            None,
+            window.handler_for(git_graph, move |this, window, cx| {
+                this.remove_worktree(worktree.clone(), window, cx);
+            }),
+        )
+    }
+
+    fn remove_worktree(
+        &mut self,
+        worktree: GraphWorktree,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let detail = match &worktree.branch_name {
+            Some(branch_name) => format!(
+                "The worktree at {} is deleted along with any uncommitted changes in it. Its \
+                 branch {branch_name} is kept.",
+                worktree.path.display()
             ),
-            _ => menu,
-        }
+            None => format!(
+                "The worktree at {} is deleted along with any uncommitted changes in it.",
+                worktree.path.display()
+            ),
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Remove worktree {}?", worktree.name),
+            Some(&detail),
+            &["Remove", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |_, cx| {
+            if answer.await != Ok(0) {
+                return anyhow::Ok(());
+            }
+            repository
+                .update(cx, |repository, _| {
+                    repository.remove_worktree(worktree.path, true)
+                })
+                .await??;
+            anyhow::Ok(())
+        })
+        .detach_and_prompt_err(
+            "Failed to remove the worktree",
+            window,
+            cx,
+            |error, _, _| Some(format!("{error:#}")),
+        );
     }
 
     fn remove_worktree_and_delete_branch(
@@ -6061,11 +6203,12 @@ Checked out in worktree {}",
                                     )
                                 }))
                                 .children(unmatched_worktrees.iter().filter_map(|worktree| {
-                                    Self::render_worktree_chip(
+                                    self.render_worktree_chip(
                                         vec![worktree.clone()],
                                         accent_color,
                                         cx.theme().colors().editor_background,
                                         selected_idx,
+                                        cx,
                                     )
                                 }))
                         }),
@@ -6867,8 +7010,13 @@ Checked out in worktree {}",
                 .into_iter()
                 .filter(|worktree| primary_worktree_path.as_ref() != Some(&worktree.path))
                 .collect::<Vec<_>>();
-            let worktree_chip =
-                Self::render_worktree_chip(other_worktrees, accent_color, background, absolute_idx);
+            let worktree_chip = self.render_worktree_chip(
+                other_worktrees,
+                accent_color,
+                background,
+                absolute_idx,
+                cx,
+            );
 
             elements.push(
                 div()
