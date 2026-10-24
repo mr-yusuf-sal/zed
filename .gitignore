@@ -10,7 +10,6 @@
 .DS_Store
 .blob_store
 .build
-.claude/settings.local.json
 .envrc
 .flatpak-builder
 .idea
