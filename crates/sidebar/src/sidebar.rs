@@ -59,7 +59,7 @@ use ui::{
     AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, GradientFade,
     HighlightedLabel, KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes,
     Scrollbars, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar,
-    prelude::*, render_modifiers, right_click_menu,
+    WorktreeKind, prelude::*, render_modifiers, right_click_menu,
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 use util::ResultExt as _;
@@ -406,6 +406,18 @@ enum ListEntry {
     },
     Thread(Arc<ThreadEntry>),
     Terminal(TerminalEntry),
+    Worktree(WorktreeEntry),
+}
+
+/// A linked git worktree of a project group that has no thread or terminal
+/// rows of its own, so it would otherwise not be visible in the sidebar.
+#[derive(Clone)]
+struct WorktreeEntry {
+    path: PathBuf,
+    name: SharedString,
+    branch_name: Option<SharedString>,
+    workspace: ThreadEntryWorkspace,
+    highlight_positions: Vec<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -425,7 +437,7 @@ impl RenameTarget {
                 Self::Terminal(terminal.metadata.terminal_id),
                 terminal.metadata.editable_title(),
             )),
-            ListEntry::ProjectHeader { .. } => None,
+            ListEntry::ProjectHeader { .. } | ListEntry::Worktree(_) => None,
         }
     }
 }
@@ -451,7 +463,7 @@ impl ActivatableEntry {
                 metadata: terminal.metadata.clone(),
                 workspace: terminal.workspace.clone(),
             }),
-            ListEntry::ProjectHeader { .. } => None,
+            ListEntry::ProjectHeader { .. } | ListEntry::Worktree(_) => None,
         }
     }
 }
@@ -461,7 +473,9 @@ impl ListEntry {
     fn session_id(&self) -> Option<&acp::SessionId> {
         match self {
             ListEntry::Thread(thread_entry) => thread_entry.metadata.session_id.as_ref(),
-            ListEntry::Terminal(_) | ListEntry::ProjectHeader { .. } => None,
+            ListEntry::Terminal(_) | ListEntry::ProjectHeader { .. } | ListEntry::Worktree(_) => {
+                None
+            }
         }
     }
 
@@ -476,6 +490,10 @@ impl ListEntry {
                 ThreadEntryWorkspace::Closed { .. } => Vec::new(),
             },
             ListEntry::Terminal(terminal) => match &terminal.workspace {
+                ThreadEntryWorkspace::Open(workspace) => vec![workspace.clone()],
+                ThreadEntryWorkspace::Closed { .. } => Vec::new(),
+            },
+            ListEntry::Worktree(worktree) => match &worktree.workspace {
                 ThreadEntryWorkspace::Open(workspace) => vec![workspace.clone()],
                 ThreadEntryWorkspace::Closed { .. } => Vec::new(),
             },
@@ -522,6 +540,7 @@ enum EntryShape {
     },
     Thread(ThreadId),
     Terminal(TerminalId),
+    Worktree(PathBuf),
 }
 
 impl SidebarContents {
@@ -558,6 +577,61 @@ fn root_repository_snapshots(
 
 fn workspace_path_list(workspace: &Entity<Workspace>, cx: &App) -> PathList {
     PathList::new(&workspace.read(cx).root_paths(cx))
+}
+
+struct LinkedWorktreeInfo {
+    path: PathBuf,
+    name: SharedString,
+    branch_name: Option<SharedString>,
+}
+
+/// Lists the linked git worktrees of the repositories rooted at the given
+/// workspaces, including ones created outside of Zed (e.g. by an agent
+/// running `git worktree add`), so they can be surfaced in the sidebar even
+/// when no thread has been started in them yet.
+fn linked_worktrees_for_workspaces(
+    workspaces: &[Entity<Workspace>],
+    cx: &App,
+) -> Vec<LinkedWorktreeInfo> {
+    let mut linked_worktrees: Vec<LinkedWorktreeInfo> = Vec::new();
+    for workspace in workspaces {
+        if workspace.read(cx).visible_worktrees(cx).count() != 1 {
+            continue;
+        }
+        for snapshot in root_repository_snapshots(workspace, cx) {
+            let name_anchor_path = snapshot.main_worktree_abs_path().or_else(|| {
+                repo_identity_path_if_local(&snapshot.common_dir_abs_path, snapshot.path_style)
+            });
+            for linked_worktree in snapshot.linked_worktrees() {
+                if linked_worktree.is_main || linked_worktree.is_bare {
+                    continue;
+                }
+                if name_anchor_path == Some(linked_worktree.path.as_path()) {
+                    continue;
+                }
+                let name = name_anchor_path
+                    .and_then(|name_anchor_path| {
+                        project::linked_worktree_short_name(
+                            name_anchor_path,
+                            &linked_worktree.path,
+                            snapshot.path_style,
+                        )
+                    })
+                    .unwrap_or_else(|| linked_worktree.directory_name(name_anchor_path).into());
+                linked_worktrees.push(LinkedWorktreeInfo {
+                    path: linked_worktree.path.clone(),
+                    name,
+                    branch_name: linked_worktree
+                        .branch_name()
+                        .map(|branch| SharedString::from(branch.to_string())),
+                });
+            }
+        }
+    }
+
+    linked_worktrees.sort_by(|a, b| a.path.cmp(&b.path));
+    linked_worktrees.dedup_by(|a, b| a.path == b.path);
+    linked_worktrees
 }
 
 fn linked_worktree_path_lists_for_workspaces(
@@ -2011,6 +2085,32 @@ impl Sidebar {
             };
             let has_threads = has_visible_rows || has_stored_thread_rows;
 
+            let mut worktrees: Vec<WorktreeEntry> = Vec::new();
+            if should_load_threads {
+                let folder_paths_with_rows: HashSet<&PathList> = threads
+                    .iter()
+                    .map(|thread| thread.metadata.folder_paths())
+                    .chain(
+                        terminals
+                            .iter()
+                            .map(|terminal| terminal.metadata.folder_paths()),
+                    )
+                    .collect();
+                for linked_worktree in linked_worktrees_for_workspaces(group_workspaces, cx) {
+                    let folder_paths = PathList::new(std::slice::from_ref(&linked_worktree.path));
+                    if folder_paths_with_rows.contains(&folder_paths) {
+                        continue;
+                    }
+                    worktrees.push(WorktreeEntry {
+                        workspace: resolve_workspace(&folder_paths),
+                        path: linked_worktree.path,
+                        name: linked_worktree.name,
+                        branch_name: linked_worktree.branch_name,
+                        highlight_positions: Vec::new(),
+                    });
+                }
+            }
+
             if !query.is_empty() {
                 let workspace_highlight_positions =
                     fuzzy_match_positions(&query, &label).unwrap_or_default();
@@ -2067,7 +2167,25 @@ impl Sidebar {
                     }
                 }
 
-                if matched_threads.is_empty() && matched_terminals.is_empty() && !workspace_matched
+                let mut matched_worktrees: Vec<WorktreeEntry> = Vec::new();
+                for mut worktree in worktrees {
+                    if let Some(positions) = fuzzy_match_positions(&query, &worktree.name) {
+                        worktree.highlight_positions = positions;
+                        matched_worktrees.push(worktree);
+                    } else if workspace_matched
+                        || worktree
+                            .branch_name
+                            .as_ref()
+                            .is_some_and(|branch| fuzzy_match_positions(&query, branch).is_some())
+                    {
+                        matched_worktrees.push(worktree);
+                    }
+                }
+
+                if matched_threads.is_empty()
+                    && matched_terminals.is_empty()
+                    && matched_worktrees.is_empty()
+                    && !workspace_matched
                 {
                     continue;
                 }
@@ -2099,6 +2217,7 @@ impl Sidebar {
                     &mut current_session_ids,
                     &mut current_thread_ids,
                 );
+                entries.extend(matched_worktrees.into_iter().map(ListEntry::Worktree));
             } else {
                 let has_terminal_notifications = terminals
                     .iter()
@@ -2149,6 +2268,7 @@ impl Sidebar {
                     &mut current_session_ids,
                     &mut current_thread_ids,
                 );
+                entries.extend(worktrees.into_iter().map(ListEntry::Worktree));
             }
         }
 
@@ -2266,6 +2386,7 @@ impl Sidebar {
             },
             ListEntry::Thread(thread) => EntryShape::Thread(thread.metadata.thread_id),
             ListEntry::Terminal(terminal) => EntryShape::Terminal(terminal.metadata.terminal_id),
+            ListEntry::Worktree(worktree) => EntryShape::Worktree(worktree.path.clone()),
         })
     }
 
@@ -2414,6 +2535,7 @@ impl Sidebar {
             ListEntry::Terminal(terminal) => {
                 self.render_terminal(ix, terminal, is_active, is_selected, cx)
             }
+            ListEntry::Worktree(worktree) => self.render_worktree(ix, worktree, is_selected, cx),
         };
 
         if is_group_header_after_first {
@@ -2485,6 +2607,8 @@ impl Sidebar {
         let key_for_focus = key.clone();
         let key_for_drop = key.clone();
         let key_for_disclosure = key.clone();
+        let key_for_label = key.clone();
+        let key_for_new_thread = key.clone();
         let dragged_group = DraggedProjectGroup {
             key: key.clone(),
             label: label.clone(),
@@ -2589,7 +2713,25 @@ impl Sidebar {
                     .min_w_0()
                     .w_full()
                     .gap_1()
-                    .child(label)
+                    .child(
+                        div()
+                            .id(format!("{id_prefix}project-header-label-{ix}"))
+                            .min_w_0()
+                            .child(label)
+                            .when(!has_filter, |this| {
+                                // Clicking the name toggles the group, while a
+                                // click on the rest of the header focuses it.
+                                this.on_click(cx.listener(
+                                    move |this, event: &ClickEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        if event.click_count() > 1 {
+                                            return;
+                                        }
+                                        this.toggle_collapse(&key_for_label, window, cx);
+                                    },
+                                ))
+                            }),
+                    )
                     .when_some(
                         self.render_remote_project_icon(ix, host.as_ref()),
                         |this, icon| this.child(icon),
@@ -2698,8 +2840,14 @@ impl Sidebar {
                     menu_handle.toggle(window, cx);
                 }
             })
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.activate_or_open_workspace_for_group(&key_for_focus, window, cx);
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                if event.click_count() > 1 && !this.has_filter_query(cx) {
+                    this.set_group_expanded(&key_for_new_thread, true, cx);
+                    this.selection = None;
+                    this.create_new_entry_in_main_worktree(&key_for_new_thread, window, cx);
+                } else {
+                    this.activate_or_open_workspace_for_group(&key_for_focus, window, cx);
+                }
             }))
             .block_mouse_except_scroll();
 
@@ -3698,6 +3846,10 @@ impl Sidebar {
                 let workspace = terminal.workspace.clone();
                 self.activate_terminal_entry(metadata, workspace, false, window, cx);
             }
+            ListEntry::Worktree(worktree) => {
+                let workspace = worktree.workspace.clone();
+                self.activate_worktree_entry(workspace, window, cx);
+            }
         }
     }
 
@@ -4428,7 +4580,7 @@ impl Sidebar {
                     self.update_entries(cx);
                 }
             }
-            Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => {
+            Some(ListEntry::Thread(_) | ListEntry::Terminal(_) | ListEntry::Worktree(_)) => {
                 for i in (0..ix).rev() {
                     if let Some(ListEntry::ProjectHeader { key, .. }) = self.contents.entries.get(i)
                     {
@@ -4455,12 +4607,14 @@ impl Sidebar {
         // Find the group header for the current selection.
         let header_ix = match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { .. }) => Some(ix),
-            Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => (0..ix).rev().find(|&i| {
-                matches!(
-                    self.contents.entries.get(i),
-                    Some(ListEntry::ProjectHeader { .. })
-                )
-            }),
+            Some(ListEntry::Thread(_) | ListEntry::Terminal(_) | ListEntry::Worktree(_)) => {
+                (0..ix).rev().find(|&i| {
+                    matches!(
+                        self.contents.entries.get(i),
+                        Some(ListEntry::ProjectHeader { .. })
+                    )
+                })
+            }
             None => None,
         };
 
@@ -5862,7 +6016,7 @@ impl Sidebar {
                 }
                 ListEntry::Thread(thread) => Sidebar::thread_display_time(&thread.metadata),
                 ListEntry::Terminal(terminal) => terminal.metadata.created_at,
-                ListEntry::ProjectHeader { .. } => unreachable!(),
+                ListEntry::ProjectHeader { .. } | ListEntry::Worktree(_) => unreachable!(),
             }
         }
 
@@ -5988,6 +6142,7 @@ impl Sidebar {
                         timestamp,
                     }))
                 }
+                ListEntry::Worktree(_) => None,
             })
             .collect();
 
@@ -6740,6 +6895,111 @@ impl Sidebar {
             .into_any_element()
     }
 
+    fn render_worktree(
+        &self,
+        ix: usize,
+        worktree: &WorktreeEntry,
+        is_focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = ElementId::from(SharedString::from(format!(
+            "worktree-{}",
+            worktree.path.display()
+        )));
+        let is_hovered = self.hovered_thread_index == Some(ix);
+        // The row stands in for a workspace that has no thread rows, so it is
+        // highlighted whenever its workspace is the one being shown.
+        let is_active = match &worktree.workspace {
+            ThreadEntryWorkspace::Open(workspace) => self
+                .multi_workspace
+                .upgrade()
+                .is_some_and(|multi_workspace| multi_workspace.read(cx).workspace() == workspace),
+            ThreadEntryWorkspace::Closed { .. } => false,
+        };
+        let worktree_info = ThreadItemWorktreeInfo {
+            worktree_name: None,
+            branch_name: worktree.branch_name.clone(),
+            full_path: SharedString::from(worktree.path.display().to_string()),
+            highlight_positions: Vec::new(),
+            kind: WorktreeKind::Linked,
+        };
+
+        ThreadItem::new(id, worktree.name.clone())
+            .base_bg(cx.theme().colors().panel_background)
+            .icon(IconName::GitWorktree)
+            .is_remote(worktree.workspace.is_remote(cx))
+            .worktrees(vec![worktree_info])
+            .highlight_positions(worktree.highlight_positions.clone())
+            .selected(is_active)
+            .focused(is_focused)
+            .hovered(is_hovered)
+            .on_hover(cx.listener(move |this, is_hovered: &bool, _window, cx| {
+                if *is_hovered {
+                    this.hovered_thread_index = Some(ix);
+                } else if this.hovered_thread_index == Some(ix) {
+                    this.hovered_thread_index = None;
+                }
+                cx.notify();
+            }))
+            .on_click(cx.listener({
+                let workspace = worktree.workspace.clone();
+                move |this, _, window, cx| {
+                    this.selection = None;
+                    this.activate_worktree_entry(workspace.clone(), window, cx);
+                }
+            }))
+            .into_any_element()
+    }
+
+    fn activate_worktree_entry(
+        &mut self,
+        workspace: ThreadEntryWorkspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match workspace {
+            ThreadEntryWorkspace::Open(workspace) => {
+                self.activate_workspace(&workspace, window, cx);
+                self.update_entries(cx);
+            }
+            ThreadEntryWorkspace::Closed {
+                folder_paths,
+                project_group_key,
+            } => {
+                let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+                    return;
+                };
+                let host = project_group_key.host();
+                let provisional_key = Some(project_group_key);
+                let active_workspace = multi_workspace.read(cx).workspace().clone();
+                let modal_workspace = active_workspace.clone();
+
+                let open_task = multi_workspace.update(cx, |this, cx| {
+                    this.find_or_create_workspace(
+                        folder_paths,
+                        host,
+                        provisional_key,
+                        |options, window, cx| connect_remote(active_workspace, options, window, cx),
+                        None,
+                        OpenMode::Activate,
+                        None,
+                        window,
+                        cx,
+                    )
+                });
+
+                cx.spawn_in(window, async move |this, cx| {
+                    let result = open_task.await;
+                    remote_connection::dismiss_connection_modal(&modal_workspace, cx);
+                    result?;
+                    this.update(cx, |this, cx| this.update_entries(cx))?;
+                    anyhow::Ok(())
+                })
+                .detach_and_log_err(cx);
+            }
+        }
+    }
+
     fn render_filter_input(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .min_w_0()
@@ -7132,14 +7392,12 @@ impl Sidebar {
         let ix = self.selection?;
         match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { key, .. }) => Some(key.clone()),
-            Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => {
-                (0..ix)
-                    .rev()
-                    .find_map(|i| match self.contents.entries.get(i) {
-                        Some(ListEntry::ProjectHeader { key, .. }) => Some(key.clone()),
-                        _ => None,
-                    })
-            }
+            Some(ListEntry::Thread(_) | ListEntry::Terminal(_) | ListEntry::Worktree(_)) => (0..ix)
+                .rev()
+                .find_map(|i| match self.contents.entries.get(i) {
+                    Some(ListEntry::ProjectHeader { key, .. }) => Some(key.clone()),
+                    _ => None,
+                }),
             _ => None,
         }
     }
@@ -7321,7 +7579,7 @@ impl Sidebar {
                 let workspace = terminal.workspace.clone();
                 self.activate_terminal_entry(metadata, workspace, true, window, cx);
             }
-            ListEntry::ProjectHeader { .. } => {}
+            ListEntry::ProjectHeader { .. } | ListEntry::Worktree(_) => {}
         }
     }
 

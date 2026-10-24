@@ -11,7 +11,7 @@ use editor::{
 };
 use gpui::{
     AnyEntity, App, AppContext as _, Corners, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, ScrollHandle, TextStyleRefinement, WeakEntity, Window,
+    Focusable, Pixels, ScrollHandle, TextStyleRefinement, WeakEntity, Window,
 };
 use language::language_settings::SoftWrap;
 use multi_buffer::MultiBuffer;
@@ -49,7 +49,17 @@ pub struct EntryViewState {
     user_toggled_thinking_blocks: HashSet<(usize, usize)>,
     expanded_compactions: HashSet<usize>,
     expanded_tool_calls: HashSet<acp_v1::ToolCallId>,
-    full_terminal_output_tool_calls: HashSet<acp_v1::ToolCallId>,
+    fully_shown_blocks: HashSet<(acp_v1::ToolCallId, ToolCallBlock)>,
+}
+
+/// A multi-line part of a tool call card that is cut down to a few lines
+/// until the user asks to see all of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ToolCallBlock {
+    Input,
+    Command,
+    TerminalOutput,
+    Content(usize),
 }
 
 impl EntryViewState {
@@ -72,7 +82,7 @@ impl EntryViewState {
             user_toggled_thinking_blocks: HashSet::default(),
             expanded_compactions: HashSet::default(),
             expanded_tool_calls: HashSet::default(),
-            full_terminal_output_tool_calls: HashSet::default(),
+            fully_shown_blocks: HashSet::default(),
         }
     }
 
@@ -98,14 +108,23 @@ impl EntryViewState {
         }
     }
 
-    pub(crate) fn is_terminal_output_full(&self, tool_call_id: &acp_v1::ToolCallId) -> bool {
-        self.full_terminal_output_tool_calls.contains(tool_call_id)
+    pub(crate) fn is_block_fully_shown(
+        &self,
+        tool_call_id: &acp_v1::ToolCallId,
+        block: ToolCallBlock,
+    ) -> bool {
+        self.fully_shown_blocks
+            .contains(&(tool_call_id.clone(), block))
     }
 
-    pub(crate) fn toggle_terminal_output_full(&mut self, tool_call_id: &acp_v1::ToolCallId) {
-        if !self.full_terminal_output_tool_calls.remove(tool_call_id) {
-            self.full_terminal_output_tool_calls
-                .insert(tool_call_id.clone());
+    pub(crate) fn toggle_block_fully_shown(
+        &mut self,
+        tool_call_id: &acp_v1::ToolCallId,
+        block: ToolCallBlock,
+    ) {
+        let key = (tool_call_id.clone(), block);
+        if !self.fully_shown_blocks.remove(&key) {
+            self.fully_shown_blocks.insert(key);
         }
     }
 
@@ -805,16 +824,23 @@ fn create_multibuffer_diff_editor(
     })
 }
 
-fn diff_editor_text_style_refinement(cx: &mut App) -> TextStyleRefinement {
+fn diff_editor_font_size(cx: &App) -> Pixels {
+    TextSize::Small
+        .rems(cx)
+        .to_pixels(ThemeSettings::get_global(cx).agent_ui_font_size(cx))
+}
+
+fn diff_editor_text_style_refinement(cx: &App) -> TextStyleRefinement {
     TextStyleRefinement {
-        font_size: Some(
-            TextSize::Small
-                .rems(cx)
-                .to_pixels(ThemeSettings::get_global(cx).agent_ui_font_size(cx))
-                .into(),
-        ),
+        font_size: Some(diff_editor_font_size(cx).into()),
         ..Default::default()
     }
+}
+
+/// The height of one row of a tool call's diff editor, matching the line
+/// height the editor derives from its font size refinement.
+pub(crate) fn diff_editor_line_height(cx: &App) -> Pixels {
+    (diff_editor_font_size(cx) * ThemeSettings::get_global(cx).buffer_line_height.value()).round()
 }
 
 #[cfg(test)]

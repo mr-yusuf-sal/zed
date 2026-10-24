@@ -58,9 +58,14 @@ use super::elicitation::{
 };
 use super::*;
 
-/// How many of a command's last output lines an expanded terminal card shows
-/// until the user asks for all of it.
-const TERMINAL_TAIL_LINES: usize = 7;
+/// How many lines a multi-line block of a tool call card (its input, command,
+/// output or diff) shows until the user asks for all of it. A command's output
+/// shows its last lines, like `tail`; every other block shows its first.
+const PREVIEW_LINES: usize = 7;
+
+fn multibuffer_line_count(multibuffer: &Entity<MultiBuffer>, cx: &App) -> usize {
+    multibuffer.read(cx).snapshot(cx).max_row().0 as usize + 1
+}
 
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
 
@@ -8793,6 +8798,7 @@ impl ThreadView {
     fn render_collapsible_command(
         &self,
         group: SharedString,
+        tool_call_id: &acp_v1::ToolCallId,
         is_preview: bool,
         command: Entity<Markdown>,
         window: &Window,
@@ -8807,10 +8813,13 @@ impl ThreadView {
             .unwrap_or(&command_source)
             .to_string();
 
+        let command_line_count = command_text.lines().count();
+        let command_line_height = rems_from_px(17_f32);
+
         let mut style =
             MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_agent_buffer_font(cx);
         style.container_style.text.font_size = Some(rems_from_px(12_f32).into());
-        style.container_style.text.line_height = Some(rems_from_px(17_f32).into());
+        style.container_style.text.line_height = Some(command_line_height.into());
         style.height_is_multiple_of_line_height = true;
         // Soft-wrap the command instead of horizontally scrolling it: the card is
         // narrow, and in scroll mode a long command wraps anyway but its wrapped
@@ -8853,7 +8862,15 @@ impl ThreadView {
             .p_1p5()
             .bg(header_bg)
             .when(is_preview, |this| this.pt_1().children(run_command_label))
-            .child(markdown_element)
+            .child(self.render_line_clamped_block(
+                tool_call_id,
+                ToolCallBlock::Command,
+                command_line_count,
+                command_line_height.to_pixels(window.rem_size()),
+                markdown_element.into_any_element(),
+                window,
+                cx,
+            ))
             .child(div().absolute().top_1().right_1().child(copy_button))
     }
 
@@ -8920,6 +8937,7 @@ impl ThreadView {
 
         let command_element = self.render_collapsible_command(
             header_group.clone(),
+            &tool_call.id,
             false,
             tool_call.label.clone(),
             window,
@@ -9008,20 +9026,19 @@ impl ThreadView {
                 terminal_view::ContentMode::Scrollable => usize::MAX,
             }
         });
-        let has_hidden_output = output_lines.is_some_and(|lines| lines > TERMINAL_TAIL_LINES);
+        let has_hidden_output = output_lines.is_some_and(|lines| lines > PREVIEW_LINES);
         let show_full_output = self
             .entry_view_state
             .read(cx)
-            .is_terminal_output_full(&tool_call.id);
+            .is_block_fully_shown(&tool_call.id, ToolCallBlock::TerminalOutput);
         let show_tail = has_hidden_output && !show_full_output;
         // Matches the height the terminal element gives each line in embedded
         // mode, under the `text_ui_sm` this card sets.
-        let tail_height = {
-            let line_height = f32::from(TextSize::Small.rems(cx).to_pixels(window.rem_size()))
-                * TerminalSettings::get_global(cx).line_height.value();
-            let scale_factor = window.scale_factor().max(1.);
-            px((line_height * TERMINAL_TAIL_LINES as f32 * scale_factor).ceil() / scale_factor)
-        };
+        let tail_height = Self::preview_height(
+            TextSize::Small.rems(cx).to_pixels(window.rem_size())
+                * TerminalSettings::get_global(cx).line_height.value(),
+            window,
+        );
 
         v_flex()
             .when(layout == ToolCallLayout::Standalone, |this| {
@@ -9079,42 +9096,13 @@ impl ThreadView {
                                 .into_any_element()
                         }))
                         .when(has_hidden_output, |this| {
-                            this.child(
-                                h_flex().w_full().justify_center().py_0p5().child(
-                                    Button::new(
-                                        SharedString::from(format!(
-                                            "terminal-output-toggle-{}",
-                                            terminal.entity_id()
-                                        )),
-                                        if show_full_output {
-                                            "Show Less"
-                                        } else {
-                                            "Show All Output"
-                                        },
-                                    )
-                                    .label_size(LabelSize::Small)
-                                    .color(Color::Muted)
-                                    .end_icon(
-                                        Icon::new(if show_full_output {
-                                            IconName::ChevronUp
-                                        } else {
-                                            IconName::ChevronDown
-                                        })
-                                        .size(IconSize::XSmall)
-                                        .color(Color::Muted),
-                                    )
-                                    .on_click(cx.listener({
-                                        let id = tool_call.id.clone();
-                                        move |this, _event, window, cx| {
-                                            this.entry_view_state.update(cx, |state, _cx| {
-                                                state.toggle_terminal_output_full(&id);
-                                            });
-                                            this.refresh_thread_search(window, cx);
-                                            cx.notify();
-                                        }
-                                    })),
-                                ),
-                            )
+                            this.child(self.render_block_toggle(
+                                &tool_call.id,
+                                ToolCallBlock::TerminalOutput,
+                                show_full_output,
+                                "Show All Output",
+                                cx,
+                            ))
                         }),
                 )
             })
@@ -9547,15 +9535,7 @@ impl ThreadView {
                                     .when(is_raw_input_expanded, |this| {
                                         this.children(tool_call.raw_input_markdown.clone().map(
                                             |input| {
-                                                self.render_markdown(
-                                                    input,
-                                                    MarkdownStyle::themed(
-                                                        MarkdownFont::Agent,
-                                                        window,
-                                                        cx,
-                                                    ),
-                                                    cx,
-                                                )
+                                                self.render_raw_input(tool_call, input, window, cx)
                                             },
                                         ))
                                     }),
@@ -9587,13 +9567,9 @@ impl ThreadView {
                                 .border_color(self.tool_card_border_color(cx))
                                 .child(input_output_header("Raw Input:".into()))
                                 .children(tool_call.raw_input_markdown.clone().map(|input| {
-                                    div().id(("tool-call-raw-input-markdown", entry_ix)).child(
-                                        self.render_markdown(
-                                            input,
-                                            MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
-                                            cx,
-                                        ),
-                                    )
+                                    div()
+                                        .id(("tool-call-raw-input-markdown", entry_ix))
+                                        .child(self.render_raw_input(tool_call, input, window, cx))
                                 }))
                                 .child(input_output_header("Output:".into())),
                         )
@@ -9682,6 +9658,7 @@ impl ThreadView {
                 if is_terminal_tool {
                     this.child(self.render_collapsible_command(
                         card_header_id.clone(),
+                        &tool_call.id,
                         true,
                         tool_call.label.clone(),
                         window,
@@ -11457,9 +11434,10 @@ impl ThreadView {
                 window,
                 cx,
             ),
-            ToolCallContent::Diff(diff) | ToolCallContent::LegacyDiff { diff, .. } => {
-                self.render_diff_editor(entry_ix, diff, tool_call, has_failed, cx)
-            }
+            ToolCallContent::Diff(diff) | ToolCallContent::LegacyDiff { diff, .. } => self
+                .render_diff_editor(
+                    entry_ix, context_ix, diff, tool_call, has_failed, window, cx,
+                ),
             ToolCallContent::Terminal { terminal, .. } => self.render_terminal_tool_call(
                 session_id,
                 entry_ix,
@@ -11471,6 +11449,17 @@ impl ThreadView {
                 cx,
             ),
             ToolCallContent::DiffPatch { source, render } => {
+                let line_count = render
+                    .files
+                    .iter()
+                    .map(|file| {
+                        1 + file
+                            .hunks
+                            .iter()
+                            .map(|hunk| 1 + multibuffer_line_count(&hunk.buffer, cx))
+                            .sum::<usize>()
+                    })
+                    .sum();
                 let files = render.files.iter().filter_map(|file| {
                     let change = source.changes.get(file.change_index)?;
                     Some(
@@ -11510,7 +11499,15 @@ impl ThreadView {
                     )
                 });
                 v_flex()
-                    .children(files)
+                    .child(self.render_line_clamped_block(
+                        &tool_call.id,
+                        ToolCallBlock::Content(context_ix),
+                        line_count,
+                        diff_editor_line_height(cx),
+                        v_flex().children(files).into_any_element(),
+                        window,
+                        cx,
+                    ))
                     .when(
                         render.files.is_empty() && render.fallback.is_none(),
                         |this| {
@@ -11708,9 +11705,11 @@ impl ThreadView {
     fn render_diff_editor(
         &self,
         entry_ix: usize,
+        context_ix: usize,
         diff: &Entity<acp_thread::Diff>,
         tool_call: &ToolCall,
         has_failed: bool,
+        window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
         let tool_progress = matches!(
@@ -11738,7 +11737,16 @@ impl ThreadView {
                     .border_color(self.tool_card_border_color(cx))
             })
             .child(if let Some(editor) = revealed_diff_editor {
-                editor.into_any_element()
+                let line_count = multibuffer_line_count(editor.read(cx).buffer(), cx);
+                self.render_line_clamped_block(
+                    &tool_call.id,
+                    ToolCallBlock::Content(context_ix),
+                    line_count,
+                    diff_editor_line_height(cx),
+                    editor.into_any_element(),
+                    window,
+                    cx,
+                )
             } else if tool_progress && self.as_native_connection(cx).is_some() {
                 self.render_diff_loading(cx)
             } else {
@@ -11758,6 +11766,10 @@ impl ThreadView {
         cx: &Context<Self>,
     ) -> AnyElement {
         let markdown_style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+        let line_height = markdown_style
+            .base_text_style
+            .line_height_in_pixels(window.rem_size());
+        let line_count = markdown.read(cx).source().lines().count();
         let output = self
             .render_numbered_read_file_output(
                 markdown.clone(),
@@ -11789,7 +11801,129 @@ impl ThreadView {
             })
             .text_xs()
             .text_color(cx.theme().colors().text_muted)
-            .child(output)
+            .child(self.render_line_clamped_block(
+                &tool_call.id,
+                ToolCallBlock::Content(context_ix),
+                line_count,
+                line_height,
+                output,
+                window,
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    fn render_raw_input(
+        &self,
+        tool_call: &ToolCall,
+        input: Entity<Markdown>,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+        let line_height = style
+            .base_text_style
+            .line_height_in_pixels(window.rem_size());
+        let line_count = input.read(cx).source().lines().count();
+        self.render_line_clamped_block(
+            &tool_call.id,
+            ToolCallBlock::Input,
+            line_count,
+            line_height,
+            self.render_markdown(input, style, cx).into_any_element(),
+            window,
+            cx,
+        )
+    }
+
+    /// The height of `PREVIEW_LINES` lines, snapped to the device pixel grid.
+    fn preview_height(line_height: Pixels, window: &Window) -> Pixels {
+        let scale_factor = window.scale_factor().max(1.);
+        px((f32::from(line_height) * PREVIEW_LINES as f32 * scale_factor).ceil() / scale_factor)
+    }
+
+    /// Shows only the first `PREVIEW_LINES` lines of a block taller than that,
+    /// with a button under it that switches between all of it and the preview.
+    fn render_line_clamped_block(
+        &self,
+        tool_call_id: &acp_v1::ToolCallId,
+        block: ToolCallBlock,
+        line_count: usize,
+        line_height: Pixels,
+        content: AnyElement,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        if line_count <= PREVIEW_LINES {
+            return content;
+        }
+        let is_fully_shown = self
+            .entry_view_state
+            .read(cx)
+            .is_block_fully_shown(tool_call_id, block);
+
+        v_flex()
+            .w_full()
+            .map(|this| {
+                if is_fully_shown {
+                    this.child(content)
+                } else {
+                    this.child(
+                        v_flex()
+                            .w_full()
+                            .max_h(Self::preview_height(line_height, window))
+                            .overflow_hidden()
+                            .child(div().flex_none().w_full().child(content)),
+                    )
+                }
+            })
+            .child(self.render_block_toggle(tool_call_id, block, is_fully_shown, "Show All", cx))
+            .into_any_element()
+    }
+
+    fn render_block_toggle(
+        &self,
+        tool_call_id: &acp_v1::ToolCallId,
+        block: ToolCallBlock,
+        is_fully_shown: bool,
+        show_all_label: &'static str,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .w_full()
+            .justify_center()
+            .py_0p5()
+            .child(
+                Button::new(
+                    SharedString::from(format!("tool-call-block-toggle-{tool_call_id}-{block:?}")),
+                    if is_fully_shown {
+                        "Show Less"
+                    } else {
+                        show_all_label
+                    },
+                )
+                .label_size(LabelSize::Small)
+                .color(Color::Muted)
+                .end_icon(
+                    Icon::new(if is_fully_shown {
+                        IconName::ChevronUp
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+                )
+                .on_click(cx.listener({
+                    let tool_call_id = tool_call_id.clone();
+                    move |this, _event, window, cx| {
+                        this.entry_view_state.update(cx, |state, _cx| {
+                            state.toggle_block_fully_shown(&tool_call_id, block);
+                        });
+                        this.refresh_thread_search(window, cx);
+                        cx.notify();
+                    }
+                })),
+            )
             .into_any_element()
     }
 
