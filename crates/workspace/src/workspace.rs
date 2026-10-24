@@ -8998,14 +8998,27 @@ impl Workspace {
             .overflow_hidden()
             .flex_none()
             // The right dock is only revealed while hovered (see `Dock::can_open`), so it is drawn
-            // over the left of the window instead of pushing anything aside.
+            // over the left of the center, which it is rendered in, instead of pushing it aside.
             .when(position == DockPosition::Right, |this| {
+                let weak_dock = dock.downgrade();
                 this.absolute()
                     .top_0()
                     .bottom_0()
                     .left_0()
                     .occlude()
                     .when(dock_is_open, |this| this.shadow_lg())
+                    .child(
+                        canvas(
+                            move |bounds, _, cx| {
+                                weak_dock
+                                    .update(cx, |dock, _| dock.set_reveal_area(bounds))
+                                    .ok();
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
             })
             .child(dock.clone())
             .children(leader_border);
@@ -10054,9 +10067,15 @@ impl Render for Workspace {
                                                     );
                                                 }
                                                 DockPosition::Right => {
+                                                    let center_left = workspace
+                                                        .right_dock
+                                                        .read(cx)
+                                                        .reveal_area()
+                                                        .map_or(workspace.bounds.left(), |area| {
+                                                            area.left()
+                                                        });
                                                     workspace.resize_right_dock(
-                                                        e.event.position.x
-                                                            - workspace.bounds.left(),
+                                                        e.event.position.x - center_left,
                                                         window,
                                                         cx,
                                                     );
@@ -10113,6 +10132,13 @@ impl Render for Workspace {
                                                                     window,
                                                                     cx,
                                                                 ))
+                                                                .relative()
+                                                                .children(self.render_dock(
+                                                                    DockPosition::Right,
+                                                                    &self.right_dock,
+                                                                    window,
+                                                                    cx,
+                                                                ))
                                                                 .when_some(
                                                                     centered_paddings.1,
                                                                     |this, p| {
@@ -10120,13 +10146,7 @@ impl Render for Workspace {
                                                                     },
                                                                 ),
                                                         ),
-                                                )
-                                                .children(self.render_dock(
-                                                    DockPosition::Right,
-                                                    &self.right_dock,
-                                                    window,
-                                                    cx,
-                                                )),
+                                                ),
                                         )
                                         .child(div().w_full().children(self.render_dock(
                                             DockPosition::Bottom,
@@ -10135,11 +10155,8 @@ impl Render for Workspace {
                                             cx,
                                         ))),
 
-                                    BottomDockLayout::LeftAligned => div()
-                                        .flex()
-                                        .flex_row()
-                                        .h_full()
-                                        .child(
+                                    BottomDockLayout::LeftAligned => {
+                                        div().flex().flex_row().h_full().child(
                                             div()
                                                 .flex()
                                                 .flex_col()
@@ -10178,6 +10195,13 @@ impl Render for Workspace {
                                                                             window,
                                                                             cx,
                                                                         ))
+                                                                        .relative()
+                                                                        .children(self.render_dock(
+                                                                            DockPosition::Right,
+                                                                            &self.right_dock,
+                                                                            window,
+                                                                            cx,
+                                                                        ))
                                                                         .when_some(
                                                                             centered_paddings.1,
                                                                             |this, p| {
@@ -10196,12 +10220,7 @@ impl Render for Workspace {
                                                     cx,
                                                 ))),
                                         )
-                                        .children(self.render_dock(
-                                            DockPosition::Right,
-                                            &self.right_dock,
-                                            window,
-                                            cx,
-                                        )),
+                                    }
                                     BottomDockLayout::RightAligned => div()
                                         .flex()
                                         .flex_row()
@@ -10219,48 +10238,45 @@ impl Render for Workspace {
                                                 .flex_1()
                                                 .h_full()
                                                 .child(
-                                                    div()
-                                                        .flex()
-                                                        .flex_row()
-                                                        .flex_1()
-                                                        .child(
-                                                            div()
-                                                                .flex()
-                                                                .flex_col()
-                                                                .flex_1()
-                                                                .overflow_hidden()
-                                                                .child(
-                                                                    h_flex()
-                                                                        .flex_1()
-                                                                        .when_some(
-                                                                            centered_paddings.0,
-                                                                            |this, p| {
-                                                                                this.child(
-                                                                                    p.border_r_1(),
-                                                                                )
-                                                                            },
-                                                                        )
-                                                                        .child(self.render_center(
-                                                                            &pane_render_context,
-                                                                            window,
-                                                                            cx,
-                                                                        ))
-                                                                        .when_some(
-                                                                            centered_paddings.1,
-                                                                            |this, p| {
-                                                                                this.child(
-                                                                                    p.border_l_1(),
-                                                                                )
-                                                                            },
-                                                                        ),
-                                                                ),
-                                                        )
-                                                        .children(self.render_dock(
-                                                            DockPosition::Right,
-                                                            &self.right_dock,
-                                                            window,
-                                                            cx,
-                                                        )),
+                                                    div().flex().flex_row().flex_1().child(
+                                                        div()
+                                                            .flex()
+                                                            .flex_col()
+                                                            .flex_1()
+                                                            .overflow_hidden()
+                                                            .child(
+                                                                h_flex()
+                                                                    .flex_1()
+                                                                    .when_some(
+                                                                        centered_paddings.0,
+                                                                        |this, p| {
+                                                                            this.child(
+                                                                                p.border_r_1(),
+                                                                            )
+                                                                        },
+                                                                    )
+                                                                    .child(self.render_center(
+                                                                        &pane_render_context,
+                                                                        window,
+                                                                        cx,
+                                                                    ))
+                                                                    .relative()
+                                                                    .children(self.render_dock(
+                                                                        DockPosition::Right,
+                                                                        &self.right_dock,
+                                                                        window,
+                                                                        cx,
+                                                                    ))
+                                                                    .when_some(
+                                                                        centered_paddings.1,
+                                                                        |this, p| {
+                                                                            this.child(
+                                                                                p.border_l_1(),
+                                                                            )
+                                                                        },
+                                                                    ),
+                                                            ),
+                                                    ),
                                                 )
                                                 .child(div().w_full().children(self.render_dock(
                                                     DockPosition::Bottom,
@@ -10297,6 +10313,13 @@ impl Render for Workspace {
                                                             window,
                                                             cx,
                                                         ))
+                                                        .relative()
+                                                        .children(self.render_dock(
+                                                            DockPosition::Right,
+                                                            &self.right_dock,
+                                                            window,
+                                                            cx,
+                                                        ))
                                                         .when_some(
                                                             centered_paddings.1,
                                                             |this, p| this.child(p.border_l_1()),
@@ -10308,13 +10331,7 @@ impl Render for Workspace {
                                                     window,
                                                     cx,
                                                 )),
-                                        )
-                                        .children(self.render_dock(
-                                            DockPosition::Right,
-                                            &self.right_dock,
-                                            window,
-                                            cx,
-                                        )),
+                                        ),
                                 }
                             })
                             .children(self.zoomed.as_ref().and_then(|view| {
