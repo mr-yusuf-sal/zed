@@ -2581,6 +2581,8 @@ impl Sidebar {
         let key_for_focus = key.clone();
         let key_for_drop = key.clone();
         let key_for_disclosure = key.clone();
+        let key_for_label = key.clone();
+        let key_for_new_thread = key.clone();
         let dragged_group = DraggedProjectGroup {
             key: key.clone(),
             label: label.clone(),
@@ -2685,7 +2687,25 @@ impl Sidebar {
                     .min_w_0()
                     .w_full()
                     .gap_1()
-                    .child(label)
+                    .child(
+                        div()
+                            .id(format!("{id_prefix}project-header-label-{ix}"))
+                            .min_w_0()
+                            .child(label)
+                            .when(!has_filter, |this| {
+                                // Clicking the name toggles the group, while a
+                                // click on the rest of the header focuses it.
+                                this.on_click(cx.listener(
+                                    move |this, event: &ClickEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        if event.click_count() > 1 {
+                                            return;
+                                        }
+                                        this.toggle_collapse(&key_for_label, window, cx);
+                                    },
+                                ))
+                            }),
+                    )
                     .when_some(
                         self.render_remote_project_icon(ix, host.as_ref()),
                         |this, icon| this.child(icon),
@@ -2794,8 +2814,14 @@ impl Sidebar {
                     menu_handle.toggle(window, cx);
                 }
             })
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.activate_or_open_workspace_for_group(&key_for_focus, window, cx);
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                if event.click_count() > 1 && !this.has_filter_query(cx) {
+                    this.set_group_expanded(&key_for_new_thread, true, cx);
+                    this.selection = None;
+                    this.create_new_entry_in_main_worktree(&key_for_new_thread, window, cx);
+                } else {
+                    this.activate_or_open_workspace_for_group(&key_for_focus, window, cx);
+                }
             }))
             .block_mouse_except_scroll();
 
