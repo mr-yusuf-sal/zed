@@ -215,12 +215,6 @@ fn assert_remote_project_integration_sidebar_state(
                     terminal.metadata.title
                 );
             }
-            ListEntry::Worktree(worktree) => {
-                panic!(
-                    "unexpected sidebar worktree while simulating remote project integration flicker: name=`{}`",
-                    worktree.name
-                );
-            }
         }
     }
 
@@ -706,14 +700,6 @@ fn visible_entries_as_strings(
                         let title = terminal.metadata.display_title();
                         let worktree = format_linked_worktree_chips(&terminal.worktrees);
                         format!("  {title}{worktree}{selected}")
-                    }
-                    ListEntry::Worktree(worktree) => {
-                        let branch = worktree
-                            .branch_name
-                            .as_ref()
-                            .map(|branch| format!(" <{branch}>"))
-                            .unwrap_or_default();
-                        format!("  [worktree: {}]{branch}{selected}", worktree.name)
                     }
                 }
             })
@@ -5779,9 +5765,7 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
                     thread.metadata.thread_id,
                     thread.metadata.display_title(),
                 )),
-                ListEntry::ProjectHeader { .. }
-                | ListEntry::Terminal(_)
-                | ListEntry::Worktree(_) => None,
+                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
             })
             .expect("sidebar should have a thread entry")
     });
@@ -5867,9 +5851,7 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
             .iter()
             .find_map(|entry| match entry {
                 ListEntry::Thread(thread) => Some(thread),
-                ListEntry::ProjectHeader { .. }
-                | ListEntry::Terminal(_)
-                | ListEntry::Worktree(_) => None,
+                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
             })
             .expect("renamed thread should match the search");
         let title = thread.metadata.display_title();
@@ -5908,9 +5890,7 @@ async fn test_rename_selected_thread_action_renames_selected_thread(cx: &mut Tes
             .enumerate()
             .find_map(|(ix, entry)| match entry {
                 ListEntry::Thread(thread) => Some((ix, thread.metadata.thread_id)),
-                ListEntry::ProjectHeader { .. }
-                | ListEntry::Terminal(_)
-                | ListEntry::Worktree(_) => None,
+                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
             })
             .expect("sidebar should have a thread entry")
     });
@@ -7434,98 +7414,10 @@ async fn test_threadless_workspace_shows_new_thread_with_worktree_chip(cx: &mut 
     cx.run_until_parked();
 
     // Workspace A's thread appears normally. Workspace B (threadless)
-    // appears as a worktree row with its branch.
+    // appears as a "New Thread" button with its worktree chip.
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
-        vec![
-            "v [project]",
-            "  Thread A {wt-feature-a}",
-            "  [worktree: wt-feature-b] <feature-b>",
-        ]
-    );
-}
-
-#[gpui::test]
-async fn test_externally_created_worktrees_are_listed_and_openable(cx: &mut TestAppContext) {
-    // Worktrees created outside of Zed (for example by an agent running
-    // `git worktree add`) have no threads and no open workspace, but should
-    // still be listed under their project and open when activated.
-    init_test(cx);
-    let fs = FakeFs::new(cx.executor());
-    fs.insert_tree(
-        "/project",
-        serde_json::json!({
-            ".git": {},
-            "src": {},
-        }),
-    )
-    .await;
-    fs.insert_tree("/worktrees/agent-task", serde_json::json!({ "src": {} }))
-        .await;
-    fs.add_linked_worktree_for_repo(
-        Path::new("/project/.git"),
-        false,
-        git::repository::Worktree {
-            path: std::path::PathBuf::from("/worktrees/agent-task"),
-            ref_name: Some("refs/heads/agent-task".into()),
-            sha: "aaa".into(),
-            is_main: false,
-            is_bare: false,
-        },
-    )
-    .await;
-
-    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
-
-    let project = project::Project::test(fs.clone(), ["/project".as_ref()], cx).await;
-    project.update(cx, |p, cx| p.git_scans_complete(cx)).await;
-
-    let (multi_workspace, cx) =
-        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-    let sidebar = setup_sidebar(&multi_workspace, cx);
-
-    save_named_thread_metadata("thread-main", "Main Thread", &project, cx).await;
-    multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
-    cx.run_until_parked();
-
-    assert_eq!(
-        visible_entries_as_strings(&sidebar, cx),
-        vec![
-            "v [project]",
-            "  Main Thread",
-            "  [worktree: agent-task] <agent-task>",
-        ]
-    );
-
-    let worktree_ix = sidebar.read_with(cx, |sidebar, _| {
-        sidebar
-            .contents
-            .entries
-            .iter()
-            .position(|entry| matches!(entry, ListEntry::Worktree(_)))
-            .expect("sidebar should have a worktree entry")
-    });
-    focus_sidebar(&sidebar, cx);
-    sidebar.update_in(cx, |sidebar, _window, _cx| {
-        sidebar.selection = Some(worktree_ix);
-    });
-    cx.dispatch_action(Confirm);
-    cx.run_until_parked();
-
-    let active_root_paths = multi_workspace.read_with(cx, |multi_workspace, cx| {
-        multi_workspace.workspace().read(cx).root_paths(cx)
-    });
-    assert_eq!(
-        active_root_paths,
-        vec![Arc::from(Path::new("/worktrees/agent-task"))]
-    );
-    assert_eq!(
-        visible_entries_as_strings(&sidebar, cx),
-        vec![
-            "v [project]",
-            "  Main Thread",
-            "  [worktree: agent-task] <agent-task>  <== selected",
-        ]
+        vec!["v [project]", "  Thread A {wt-feature-a}",]
     );
 }
 
@@ -8095,12 +7987,6 @@ async fn test_clicking_worktree_thread_does_not_briefly_render_as_separate_proje
                     panic!(
                         "unexpected sidebar terminal while opening linked worktree thread: title=`{}`",
                         terminal.metadata.title
-                    );
-                }
-                ListEntry::Worktree(worktree) => {
-                    panic!(
-                        "unexpected sidebar worktree while opening linked worktree thread: name=`{}`",
-                        worktree.name
                     );
                 }
             }
