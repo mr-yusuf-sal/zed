@@ -24,6 +24,10 @@
     three. The commit has to be pushed and the tree clean, since the release claims the
     exe is that commit; every fork running another commit installs it within the hour.
 
+    -Sweep deletes build output nothing has used for -SweepDays days (default 7): the copies
+    left behind by every rebase, toolchain update and profile or feature change, which cargo
+    never removes on its own. Needs cargo-sweep (cargo install cargo-sweep).
+
     The script lives in the checkout it builds (script\fork), so it is versioned with the
     stack and rebased along with it. -Update rewrites this file mid-run, which is safe:
     PowerShell has parsed the whole script before the first line runs.
@@ -32,6 +36,7 @@
     .\build.ps1 -Install            # build the current branch and install it
     .\build.ps1 -Update -Install    # move to the latest stable tag, build, install
     .\build.ps1 -Install -Publish   # build, install here, ship it to every other machine
+    .\build.ps1 -Update -Install -Sweep   # also drop what the old base left in target\
 #>
 [CmdletBinding()]
 param(
@@ -41,6 +46,8 @@ param(
     [switch]$Update,
     [switch]$Install,
     [switch]$Publish,
+    [switch]$Sweep,
+    [int]$SweepDays = 7,
     [string]$GitHubRepo = "mr-yusuf-sal/zed",
     [int]$KeepReleases = 3
 )
@@ -60,6 +67,10 @@ function Invoke-Git {
 
 if (-not (Test-Path $Repo)) {
     throw "Zed checkout not found at $Repo. Clone it with: git clone --filter=blob:none https://github.com/mr-yusuf-sal/zed `"$Repo`""
+}
+
+if ($Sweep -and -not (Get-Command cargo-sweep -ErrorAction SilentlyContinue)) {
+    throw "-Sweep needs cargo-sweep. Install it with: cargo install cargo-sweep"
 }
 
 if ($Update) {
@@ -114,6 +125,23 @@ try {
 
 $built = Join-Path $Repo "target\release\zed.exe"
 Write-Host "Built: $built ($(git -C $Repo describe --tags HEAD))"
+
+if ($Sweep) {
+    # cargo-sweep goes by the last access time of each .fingerprint entry. --time rather than
+    # --stamp/--file: NTFS updates access times at most once an hour, so a build soon after the
+    # previous one would look like it used nothing and lose its whole cache. Days also keep the
+    # artifacts agents' `cargo check/test --release` build without this script's profile env.
+    cargo sweep --time $SweepDays $Repo
+    if ($LASTEXITCODE -ne 0) { Write-Warning "cargo sweep failed" }
+
+    # cargo-sweep skips incremental\, which is not named by fingerprint hash, and rustc never
+    # deletes the directory of a crate hash it no longer builds. rustc rewrites a crate's
+    # directory on every compile, so one untouched for days only costs that crate's cache.
+    $cutoff = (Get-Date).AddDays(-$SweepDays)
+    Get-ChildItem (Join-Path $Repo "target\*\incremental\*") -Directory |
+        Where-Object LastWriteTime -lt $cutoff |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 if ($Publish) {
     $sha = (git -C $Repo rev-parse HEAD).Trim()
