@@ -84,7 +84,7 @@ use crate::agent_connection_store::{
 };
 use crate::agent_diff::AgentDiff;
 use crate::completion_provider::{AgentContextSelection, AvailableSkill};
-use crate::entry_view_state::{EntryViewEvent, ViewEvent};
+use crate::entry_view_state::{EntryViewEvent, ToolCallBlock, ViewEvent, diff_editor_line_height};
 use crate::message_editor::{InputAttempt, MessageEditor, MessageEditorEvent};
 use crate::profile_selector::{ProfileProvider, ProfileSelector};
 
