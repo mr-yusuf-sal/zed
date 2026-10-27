@@ -1,4 +1,3 @@
-use auto_update::DismissMessage;
 use editor::Editor;
 use extension_host::{ExtensionOperation, ExtensionStore};
 use futures::StreamExt;
@@ -313,7 +312,7 @@ impl ActivityIndicator {
         });
     }
 
-    fn dismiss_message(&mut self, _: &DismissMessage, _: &mut Window, cx: &mut Context<Self>) {
+    fn dismiss_message(&mut self, cx: &mut Context<Self>) {
         self.project.update(cx, |project, cx| {
             if project.last_formatting_failure(cx).is_some() {
                 project.reset_last_formatting_failure(cx);
@@ -543,10 +542,10 @@ impl ActivityIndicator {
                         }
                     )
                 ),
-                on_click: Some(Arc::new(move |this, window, cx| {
+                on_click: Some(Arc::new(move |this, _window, cx| {
                     this.statuses
                         .retain(|status| !downloading.contains(&status.name));
-                    this.dismiss_message(&DismissMessage, window, cx)
+                    this.dismiss_message(cx)
                 })),
                 tooltip_message: None,
             });
@@ -568,10 +567,10 @@ impl ActivityIndicator {
                         }
                     ),
                 ),
-                on_click: Some(Arc::new(move |this, window, cx| {
+                on_click: Some(Arc::new(move |this, _window, cx| {
                     this.statuses
                         .retain(|status| !checking_for_update.contains(&status.name));
-                    this.dismiss_message(&DismissMessage, window, cx)
+                    this.dismiss_message(cx)
                 })),
                 tooltip_message: None,
             });
@@ -685,9 +684,7 @@ impl ActivityIndicator {
             return Some(Content {
                 icon,
                 message,
-                on_click: Some(Arc::new(|this, window, cx| {
-                    this.dismiss_message(&Default::default(), window, cx)
-                })),
+                on_click: Some(Arc::new(|this, _window, cx| this.dismiss_message(cx))),
                 tooltip_message: None,
             });
         }
@@ -736,8 +733,7 @@ impl Render for ActivityIndicator {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let result = h_flex()
             .id("activity-indicator")
-            .on_action(cx.listener(Self::show_error_message))
-            .on_action(cx.listener(Self::dismiss_message));
+            .on_action(cx.listener(Self::show_error_message));
 
         let Some(content) = self.content_to_render(cx) else {
             return result;
