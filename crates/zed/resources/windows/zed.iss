@@ -5,7 +5,6 @@ AppVerName={#AppDisplayName}
 AppPublisher=Zed Industries
 AppPublisherURL=https://www.zed.dev/
 AppSupportURL=https://www.zed.dev/
-AppUpdatesURL=https://www.zed.dev/
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 DisableReadyPage=yes
@@ -14,7 +13,7 @@ OutputDir={#OutputDir}
 OutputBaseFilename={#AppSetupName}
 Compression=lzma
 SolidCompression=yes
-AppMutex={code:GetAppMutex}
+AppMutex={#AppMutex}
 SetupMutex={#AppMutex}Setup
 ; WizardImageFile="{#ResourcesDir}\inno-100.bmp,{#ResourcesDir}\inno-125.bmp,{#ResourcesDir}\inno-150.bmp,{#ResourcesDir}\inno-175.bmp,{#ResourcesDir}\inno-200.bmp,{#ResourcesDir}\inno-225.bmp,{#ResourcesDir}\inno-250.bmp"
 ; WizardSmallImageFile="{#ResourcesDir}\inno-small-100.bmp,{#ResourcesDir}\inno-small-125.bmp,{#ResourcesDir}\inno-small-150.bmp,{#ResourcesDir}\inno-small-175.bmp,{#ResourcesDir}\inno-small-200.bmp,{#ResourcesDir}\inno-small-225.bmp,{#ResourcesDir}\inno-small-250.bmp"
@@ -46,9 +45,6 @@ Name: "english"; MessagesFile: "compiler:Default.isl,{#ResourcesDir}\messages\en
 Name: "simplifiedChinese"; MessagesFile: "{#ResourcesDir}\messages\Default.zh-cn.isl,{#ResourcesDir}\messages\zh-cn.isl"; LicenseFile: "script\terms\terms.rtf"
 
 [UninstallDelete]
-; Delete logs
-Type: filesandordirs; Name: "{app}\tools"
-Type: filesandordirs; Name: "{app}\updates"
 ; Delete newer files which may not have been added by the initial installation
 Type: filesandordirs; Name: "{app}\x64"
 Type: filesandordirs; Name: "{app}\arm64"
@@ -65,20 +61,19 @@ Name: "addtopath"; Description: "{cm:AddToPath}"; GroupDescription: "{cm:Other}"
 Name: "{app}"; AfterInstall: DisableAppDirInheritance
 
 [Files]
-Source: "{#ResourcesDir}\Zed.exe"; DestDir: "{code:GetInstallDir}"; Flags: ignoreversion
-Source: "{#ResourcesDir}\bin\*"; DestDir: "{code:GetInstallDir}\bin"; Flags: ignoreversion
-Source: "{#ResourcesDir}\tools\*"; DestDir: "{app}\tools"; Flags: ignoreversion
+Source: "{#ResourcesDir}\Zed.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#ResourcesDir}\bin\*"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "{#ResourcesDir}\appx\*"; DestDir: "{app}\appx";  BeforeInstall: RemoveAppxPackage; AfterInstall: AddAppxPackage; Flags: ignoreversion; Check: IsWindows11OrLater
 #ifexist ResourcesDir + "\amd_ags_x64.dll"
 Source: "{#ResourcesDir}\amd_ags_x64.dll"; DestDir: "{app}"; Flags: ignoreversion
 #endif
 #ifexist ResourcesDir + "\x64\OpenConsole.exe"
-Source: "{#ResourcesDir}\x64\OpenConsole.exe"; DestDir: "{code:GetInstallDir}\x64"; Flags: ignoreversion
+Source: "{#ResourcesDir}\x64\OpenConsole.exe"; DestDir: "{app}\x64"; Flags: ignoreversion
 #endif
 #ifexist ResourcesDir + "\arm64\OpenConsole.exe"
-Source: "{#ResourcesDir}\arm64\OpenConsole.exe"; DestDir: "{code:GetInstallDir}\arm64"; Flags: ignoreversion
+Source: "{#ResourcesDir}\arm64\OpenConsole.exe"; DestDir: "{app}\arm64"; Flags: ignoreversion
 #endif
-Source: "{#ResourcesDir}\conpty.dll"; DestDir: "{code:GetInstallDir}"; Flags: ignoreversion
+Source: "{#ResourcesDir}\conpty.dll"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}.exe"; AppUserModelID: "{#AppUserId}"
@@ -1381,41 +1376,4 @@ begin
   if not WizardIsTaskSelected('addcontextmenufiles') then begin
     RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\{#RegValueName}ContextMenu');
   end;
-end;
-
-function SwitchHasValue(Name: string; Value: string): Boolean;
-begin
-  Result := CompareText(ExpandConstant('{param:' + Name + '}'), Value) = 0;
-end;
-
-function IsUpdating(): Boolean;
-begin
-  Result := SwitchHasValue('update', 'true') and WizardSilent();
-end;
-
-procedure CurStepChanged(CurStep: TSetupStep);
-begin
-  if CurStep = ssPostInstall then
-  begin
-    if IsUpdating() then
-    begin
-      SaveStringToFile(ExpandConstant('{app}\updates\versions.txt'), '{#Version}' + #13#10, True);
-    end
-  end;
-end;
-
-function GetAppMutex(Param: string): string;
-begin
-  if IsUpdating() then
-    Result := ''
-  else
-    Result := '{#AppMutex}';
-end;
-
-function GetInstallDir(Param: string): string;
-begin
-  if IsUpdating() then
-    Result := ExpandConstant('{app}\install')
-  else
-    Result := ExpandConstant('{app}');
 end;

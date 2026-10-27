@@ -4,7 +4,6 @@
 
 - [Getting Started](./getting-started.md)
 - [Installation](./installation.md)
-  - [Update](./update.md)
   - [Uninstall](./uninstall.md)
 - [Troubleshooting](./troubleshooting.md)
 

@@ -433,16 +433,6 @@ Note that a save will be triggered when an unsaved tab is closed, even if this i
 
 `boolean` values
 
-## Auto Update
-
-- Description: Whether or not to automatically check for updates.
-- Setting: `auto_update`
-- Default: `true`
-
-**Options**
-
-`boolean` values
-
 ## Base Keymap
 
 - Description: Base key bindings scheme. Base keymaps can be overridden with user keymaps.

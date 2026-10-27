@@ -1,8 +1,8 @@
 mod app_menus;
 pub mod edit_prediction_registry;
-mod main_page;
 #[cfg(target_os = "macos")]
 pub(crate) mod mac_only_instance;
+mod main_page;
 mod migrate;
 #[cfg(target_os = "macos")]
 pub(crate) mod move_to_applications;
@@ -521,8 +521,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
                 };
 
                 let active_workspace = this.workspace().clone();
-                if let Some(terminal_panel) = active_workspace.read(cx).panel::<TerminalPanel>(cx)
-                {
+                if let Some(terminal_panel) = active_workspace.read(cx).panel::<TerminalPanel>(cx) {
                     let other_terminal_panels = this
                         .workspaces()
                         .filter(|workspace| *workspace != &active_workspace)
@@ -5915,7 +5914,6 @@ mod tests {
                 "app_menu",
                 "assistant",
                 "assistant2",
-                "auto_update",
                 "branch_picker",
                 "bedrock",
                 "branches",

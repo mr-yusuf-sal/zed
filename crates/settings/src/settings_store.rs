@@ -1686,14 +1686,14 @@ mod tests {
     use util::rel_path::rel_path;
 
     #[derive(Debug, PartialEq)]
-    struct AutoUpdateSetting {
-        auto_update: bool,
+    struct ServerUrlSetting {
+        server_url: String,
     }
 
-    impl Settings for AutoUpdateSetting {
+    impl Settings for ServerUrlSetting {
         fn from_settings(content: &SettingsContent) -> Self {
-            AutoUpdateSetting {
-                auto_update: content.auto_update.unwrap(),
+            ServerUrlSetting {
+                server_url: content.server_url.clone().unwrap(),
             }
         }
     }
@@ -1842,16 +1842,24 @@ mod tests {
         let root = defaults
             .as_object_mut()
             .expect("default settings must be a JSON object");
-        root.insert("dev".into(), serde_json::json!({ "auto_update": false }));
-        root.insert("stable".into(), serde_json::json!({ "auto_update": true }));
+        root.insert(
+            "dev".into(),
+            serde_json::json!({ "server_url": "https://example.com" }),
+        );
+        root.insert(
+            "stable".into(),
+            serde_json::json!({ "server_url": "https://zed.dev" }),
+        );
         let defaults_with_overrides = serde_json::to_string(&defaults).unwrap();
 
         let mut store = SettingsStore::new(cx, &defaults_with_overrides);
-        store.register_setting::<AutoUpdateSetting>();
+        store.register_setting::<ServerUrlSetting>();
 
         assert_eq!(
-            store.get::<AutoUpdateSetting>(None),
-            &AutoUpdateSetting { auto_update: false },
+            store.get::<ServerUrlSetting>(None),
+            &ServerUrlSetting {
+                server_url: "https://example.com".into()
+            },
             "dev override from default settings should apply",
         );
     }
@@ -1859,13 +1867,15 @@ mod tests {
     #[gpui::test]
     fn test_settings_store_basic(cx: &mut App) {
         let mut store = SettingsStore::new(cx, &default_settings());
-        store.register_setting::<AutoUpdateSetting>();
+        store.register_setting::<ServerUrlSetting>();
         store.register_setting::<ItemSettings>();
         store.register_setting::<DefaultLanguageSettings>();
 
         assert_eq!(
-            store.get::<AutoUpdateSetting>(None),
-            &AutoUpdateSetting { auto_update: true }
+            store.get::<ServerUrlSetting>(None),
+            &ServerUrlSetting {
+                server_url: "https://zed.dev".into()
+            }
         );
         assert_eq!(
             store.get::<ItemSettings>(None).close_position,
@@ -1875,7 +1885,7 @@ mod tests {
         store
             .set_user_settings(
                 r#"{
-                    "auto_update": false,
+                    "server_url": "https://example.com",
                     "tabs": {
                       "close_position": "left"
                     }
@@ -1885,8 +1895,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.get::<AutoUpdateSetting>(None),
-            &AutoUpdateSetting { auto_update: false }
+            store.get::<ServerUrlSetting>(None),
+            &ServerUrlSetting {
+                server_url: "https://example.com".into()
+            }
         );
         assert_eq!(
             store.get::<ItemSettings>(None).close_position,
@@ -1917,7 +1929,7 @@ mod tests {
                 WorktreeId::from_usize(1),
                 LocalSettingsPath::InWorktree(rel_path("root2").into()),
                 LocalSettingsKind::Settings,
-                Some(r#"{ "tab_size": 9, "auto_update": true}"#),
+                Some(r#"{ "tab_size": 9, "server_url": "https://zed.dev"}"#),
                 cx,
             )
             .unwrap();
@@ -1953,11 +1965,13 @@ mod tests {
             }
         );
         assert_eq!(
-            store.get::<AutoUpdateSetting>(Some(SettingsLocation {
+            store.get::<ServerUrlSetting>(Some(SettingsLocation {
                 worktree_id: WorktreeId::from_usize(1),
                 path: rel_path("root2/something")
             })),
-            &AutoUpdateSetting { auto_update: false }
+            &ServerUrlSetting {
+                server_url: "https://example.com".into()
+            }
         );
     }
 
@@ -1965,13 +1979,15 @@ mod tests {
     fn test_setting_store_assign_json_before_register(cx: &mut App) {
         let mut store = SettingsStore::new(cx, &test_settings());
         store
-            .set_user_settings(r#"{ "auto_update": false }"#, cx)
+            .set_user_settings(r#"{ "server_url": "https://example.com" }"#, cx)
             .unwrap();
-        store.register_setting::<AutoUpdateSetting>();
+        store.register_setting::<ServerUrlSetting>();
 
         assert_eq!(
-            store.get::<AutoUpdateSetting>(None),
-            &AutoUpdateSetting { auto_update: false }
+            store.get::<ServerUrlSetting>(None),
+            &ServerUrlSetting {
+                server_url: "https://example.com".into()
+            }
         );
     }
 
@@ -2112,8 +2128,8 @@ mod tests {
         check_settings_update(
             &mut store,
             r#"{ "one": 1, "two": 2 }"#.to_owned(),
-            |settings| settings.auto_update = Some(true),
-            r#"{ "auto_update": true, "one": 1, "two": 2 }"#.to_owned(),
+            |settings| settings.server_url = Some("https://zed.dev".into()),
+            r#"{ "server_url": "https://zed.dev", "one": 1, "two": 2 }"#.to_owned(),
             cx,
         );
 
@@ -2175,21 +2191,21 @@ mod tests {
     #[gpui::test]
     fn test_edits_for_update_preserves_unknown_keys(cx: &mut App) {
         let mut store = SettingsStore::new(cx, &test_settings());
-        store.register_setting::<AutoUpdateSetting>();
+        store.register_setting::<ServerUrlSetting>();
 
         let old_json = r#"{
             "some_unknown_key": "should_be_preserved",
-            "auto_update": false
+            "server_url": "https://example.com"
         }"#
         .unindent();
 
         check_settings_update(
             &mut store,
             old_json,
-            |settings| settings.auto_update = Some(true),
+            |settings| settings.server_url = Some("https://zed.dev".into()),
             r#"{
             "some_unknown_key": "should_be_preserved",
-            "auto_update": true
+            "server_url": "https://zed.dev"
         }"#
             .unindent(),
             cx,
@@ -2210,7 +2226,7 @@ mod tests {
         let mut store = SettingsStore::new(cx, &test_settings());
         store.register_setting::<DefaultLanguageSettings>();
         store.register_setting::<ItemSettings>();
-        store.register_setting::<AutoUpdateSetting>();
+        store.register_setting::<ServerUrlSetting>();
         store.register_setting::<ThemeSettings>();
 
         // create settings that werent present
@@ -2871,7 +2887,7 @@ mod tests {
     fn test_get_value_for_field_local_worktrees_dont_interfere(cx: &mut App) {
         let mut store = SettingsStore::new(cx, &test_settings());
         store.register_setting::<DefaultLanguageSettings>();
-        store.register_setting::<AutoUpdateSetting>();
+        store.register_setting::<ServerUrlSetting>();
 
         let local_1 = (WorktreeId::from_usize(0), RelPath::empty_arc());
 
@@ -3374,7 +3390,7 @@ mod tests {
         let user_schema_str = serde_json::to_string(&user_schema).unwrap();
         let project_schema_str = serde_json::to_string(&project_schema).unwrap();
 
-        assert!(user_schema_str.contains("\"auto_update\""));
-        assert!(!project_schema_str.contains("\"auto_update\""));
+        assert!(user_schema_str.contains("\"server_url\""));
+        assert!(!project_schema_str.contains("\"server_url\""));
     }
 }
