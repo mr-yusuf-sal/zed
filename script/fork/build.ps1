@@ -13,16 +13,8 @@
     aside, copies the build over Zed.exe and restarts Zed; agent hosts are left running so
     Claude Code turns survive, and the cli (bin\zed) is left as is since it just launches it.
 
-    The build sets ZED_UPDATE_EXPLANATION, which compiles auto-update out of the binary.
-    Without it the official updater would overwrite the fork on its next check. It is a
-    build-time switch on purpose: "auto_update": false in settings.json would also stop
-    official Zed from updating on the other machine that shares Backups\zed.
-
-    The fork updates itself instead (crates/fork_sync): it asks zed.incapon.com for the
-    newest build, which is the GitHub release on mr-yusuf-sal/zed that -Publish creates.
-    -Publish zips the exe, uploads it as release custom-<commit sha> and keeps the newest
-    three. The commit has to be pushed and the tree clean, since the release claims the
-    exe is that commit; every fork running another commit installs it within the hour.
+    The fork has no updater of its own: the official one is removed from the code, so
+    nothing replaces the installed exe except running this script again.
 
     -Sweep deletes build output nothing has used for -SweepDays days (default 7): the copies
     left behind by every rebase, toolchain update and profile or feature change, which cargo
@@ -38,7 +30,6 @@
 .EXAMPLE
     .\build.ps1 -Install            # build the current branch and install it
     .\build.ps1 -Update -Install    # move to the latest stable tag, build, install
-    .\build.ps1 -Install -Publish   # build, install here, ship it to every other machine
     .\build.ps1 -Update -Install -Sweep   # also drop what the old base left in target\
 #>
 [CmdletBinding()]
@@ -48,12 +39,9 @@ param(
     [string]$InstallDir = "$env:LOCALAPPDATA\Programs\Zed",
     [switch]$Update,
     [switch]$Install,
-    [switch]$Publish,
     [switch]$Sweep,
     [int]$SweepDays = 7,
-    [int]$SweepMaxSizeGB = 50,
-    [string]$GitHubRepo = "mr-yusuf-sal/zed",
-    [int]$KeepReleases = 3
+    [int]$SweepMaxSizeGB = 50
 )
 
 # No global "Stop": cargo and git log progress to stderr, and Windows PowerShell 5.1 turns
@@ -129,18 +117,6 @@ $env:CARGO_PROFILE_RELEASE_DEBUG = "false"
 $env:CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "16"
 $env:CARGO_PROFILE_RELEASE_INCREMENTAL = "true"
 
-$env:ZED_UPDATE_EXPLANATION ="This is a custom build of the mr-yusuf-sal/zed fork. Update it with script\fork\build.ps1 -Update -Install in the fork's checkout."
-
-if ($Publish) {
-    # Checked before the build so a long build does not end in a refused publish.
-    if (git -C $Repo status --porcelain) {
-        throw "-Publish needs a clean tree: the release says the exe is HEAD, and a dirty build is not."
-    }
-    Invoke-Git fetch origin $Branch
-    git -C $Repo merge-base --is-ancestor HEAD "origin/$Branch"
-    if ($LASTEXITCODE -ne 0) { throw "-Publish needs HEAD pushed to origin/$Branch first: the release tag points at it." }
-}
-
 Push-Location $Repo
 try {
     cargo build --release -p zed
@@ -175,43 +151,7 @@ if ($SweepMaxSizeGB -gt 0) {
     }
 }
 
-if ($Publish) {
-    $sha = (git -C $Repo rev-parse HEAD).Trim()
-    $tag = "custom-$sha"
-    $title = "$(git -C $Repo describe --tags HEAD) (fork)"
-    $baseTag = git -C $Repo describe --tags --abbrev=0 --match "v*" --exclude "*-pre" HEAD
-    $notes = git -C $Repo log --format="- %s" "$baseTag..HEAD" | Out-String
-
-    $staging = Join-Path $env:TEMP "zed-fork-publish"
-    Remove-Item $staging -Recurse -Force -ErrorAction SilentlyContinue
-    New-Item -ItemType Directory $staging -ErrorAction Stop | Out-Null
-    $zip = Join-Path $staging "zed-windows-x86_64.zip"
-    # Windows' bundled bsdtar writes a deflate zip, which crates/fork_sync unpacks.
-    tar.exe -a -c -f $zip -C (Split-Path $built) zed.exe
-    if ($LASTEXITCODE -ne 0) { throw "zipping $built failed" }
-
-    gh release view $tag --repo $GitHubRepo *> $null
-    if ($LASTEXITCODE -eq 0) {
-        gh release upload $tag $zip --repo $GitHubRepo --clobber
-    } else {
-        gh release create $tag $zip --repo $GitHubRepo --target $sha --title $title --notes $notes --latest
-    }
-    if ($LASTEXITCODE -ne 0) { throw "publishing $tag to $GitHubRepo failed" }
-    Write-Host "Published $tag; forks on other commits install it within the hour."
-
-    $old = gh release list --repo $GitHubRepo --limit 100 --json tagName,createdAt |
-        ConvertFrom-Json |
-        Where-Object { $_.tagName -like "custom-*" } |
-        Sort-Object createdAt -Descending |
-        Select-Object -Skip $KeepReleases
-    foreach ($release in $old) {
-        gh release delete $release.tagName --repo $GitHubRepo --cleanup-tag --yes
-        if ($LASTEXITCODE -ne 0) { Write-Warning "Could not delete the old release $($release.tagName)" }
-    }
-    Remove-Item $staging -Recurse -Force -ErrorAction SilentlyContinue
-}
-
-# After publishing: stopping Zed can take this script down with it when it runs in Zed's
+# Last: stopping Zed can take this script down with it when it runs in Zed's
 # terminal, which kills its processes on close.
 if ($Install) {
     $target = Join-Path $InstallDir "Zed.exe"
