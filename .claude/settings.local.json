@@ -3,7 +3,6 @@
     "CARGO_PROFILE_RELEASE_LTO": "false",
     "CARGO_PROFILE_RELEASE_DEBUG": "false",
     "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "16",
-    "CARGO_PROFILE_RELEASE_INCREMENTAL": "true",
-    "ZED_UPDATE_EXPLANATION": "This is a custom build of the mr-yusuf-sal/zed fork. Update it with script\\fork\\build.ps1 -Update -Install in the fork's checkout."
+    "CARGO_PROFILE_RELEASE_INCREMENTAL": "true"
   }
 }
