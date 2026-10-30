@@ -613,7 +613,7 @@ fn deploy_blame_entry_context_menu(
     });
 }
 
-fn open_buffer_blame_at_revision(
+pub(crate) fn open_buffer_blame_at_revision(
     repository: Entity<Repository>,
     workspace: WeakEntity<Workspace>,
     path: RepoPath,

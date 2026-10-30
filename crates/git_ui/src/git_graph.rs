@@ -1,6 +1,6 @@
 pub use crate::commit_context_menu::{CopyCommitSha, CopyCommitTag, OpenCommitView};
 use crate::{
-    CommitMessageConfirm, CommitMessageModal,
+    CommitMessageConfirm, CommitMessageModal, InteractiveRebaseModal,
     commit_context_menu::{
         CUSTOM_GIT_COMMANDS_DOCS_SLUG, CommitContextMenuData, CommitContextMenuSource,
         CommitMenuEntries, commit_context_menu, git_context_menu_tasks, git_task_context,
@@ -65,12 +65,12 @@ use theme::AccentColors;
 use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};
 use ui::{
     Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, ContextMenuEntry, DiffStat,
-    Disclosure, Divider, HeaderResizeInfo, HighlightedLabel, IndentGuideColors, ListItem,
-    ListItemSpacing, PopoverMenu, RedistributableColumnsState, ScrollableHandle, Table,
+    Disclosure, Divider, DocumentationSide, HeaderResizeInfo, HighlightedLabel, IndentGuideColors,
+    ListItem, ListItemSpacing, PopoverMenu, RedistributableColumnsState, ScrollableHandle, Table,
     TableInteractionState, TableRenderContext, TableResizeBehavior, Tooltip, WithScrollbar,
     bind_redistributable_columns, prelude::*, redistribute_hidden_fractions,
     redistribute_hidden_widths, render_redistributable_columns_resize_handles, render_table_header,
-    table_row::TableRow,
+    right_click_menu, table_row::TableRow,
 };
 use util::{ResultExt, debug_panic};
 use workspace::{
@@ -88,6 +88,24 @@ const FORCE_DELETE_BRANCH_DETAIL: &str = "Commits only reachable from this branc
 const ABORT_OPERATION_DETAIL: &str = "The repository goes back to where it was before it started, and conflict resolutions made so far are lost.";
 const HARD_RESET_WARNING: &str =
     "Uncommitted changes will be lost, and commits after this one will no longer be on the branch.";
+const GIT_SCRIPT_ALIAS: &str = "zed-graph-script";
+/// Writes the todo list the graph built into the file `git rebase -i` asks
+/// the sequence editor to edit, instead of opening an editor. The variable
+/// can't start with `ZED_`: task resolution expands `$ZED_…` in env values
+/// and refuses to run a task naming one it doesn't know.
+const REBASE_SEQUENCE_EDITOR: &str = "f() { printf '%s\\n' \"$GRAPH_REBASE_TODO\" > \"$1\"; }; f";
+const RESTORE_FILE_SCRIPT: &str = r#"if git cat-file -e "$2:$1" 2>/dev/null; then
+  git restore --source="$2" --worktree -- "$1"
+else
+  rm -f -- "$1"
+fi"#;
+const UNDO_FILE_CHANGES_SCRIPT: &str = r#"git show --format= --binary --no-renames --diff-merges=first-parent "$2" -- "$1" | git apply -R --binary"#;
+const REMOVE_FILE_FROM_HEAD_SCRIPT: &str = r#"if git rev-parse -q --verify HEAD^ >/dev/null; then
+  git reset -q HEAD^ -- "$1"
+else
+  git rm -q --cached --ignore-unmatch -- "$1"
+fi && git commit -q --amend --no-edit --allow-empty"#;
+const REWRITE_DETAIL: &str = "The commits after it are rewritten with new SHAs. Uncommitted changes are stashed during the rebase and restored after it. Avoid this on commits others have already pulled.";
 const COMMIT_CIRCLE_RADIUS: Pixels = px(4.5);
 const COMMIT_CIRCLE_STROKE_WIDTH: Pixels = px(1.5);
 const COMMIT_CIRCLE_HALO_WIDTH: Pixels = px(2.0);
@@ -349,8 +367,11 @@ impl ChangedFileEntry {
     ) -> AnyElement {
         let file_name = self.file_name.clone();
         let dir_path = self.dir_path.clone();
+        let menu_entry = self.clone();
+        let menu_git_graph = git_graph.clone();
+        let menu_sha = commit_sha.parse::<Oid>().ok();
 
-        ListItem::new(("changed-file", ix))
+        let list_item = ListItem::new(("changed-file", ix))
             .spacing(ListItemSpacing::Sparse)
             .indent_level(depth)
             .indent_step_size(px(TREE_INDENT))
@@ -388,6 +409,16 @@ impl ChangedFileEntry {
                         cx,
                     );
                 }
+            });
+
+        right_click_menu(("changed-file-menu", ix))
+            .trigger(move |_, _, _| list_item)
+            .maybe_menu(move |window, cx| {
+                let sha = menu_sha?;
+                let git_graph = menu_git_graph.upgrade()?;
+                Some(git_graph.update(cx, |git_graph, cx| {
+                    git_graph.changed_file_context_menu(menu_entry.clone(), sha, window, cx)
+                }))
             })
             .into_any_element()
     }
@@ -1518,6 +1549,23 @@ pub fn open_or_reuse_graph(
     }
 }
 
+/// A menu entry that is disabled while `blocker` is set, with the blocker
+/// shown beside it, so the reason isn't left to guesswork.
+fn blockable_entry(
+    label: impl Into<SharedString>,
+    blocker: Option<&'static str>,
+    handler: impl Fn(&mut Window, &mut App) + 'static,
+) -> ContextMenuEntry {
+    ContextMenuEntry::new(label)
+        .disabled(blocker.is_some())
+        .handler(handler)
+        .when_some(blocker, |entry, blocker| {
+            entry.documentation_aside(DocumentationSide::Left, move |_| {
+                Label::new(blocker).into_any_element()
+            })
+        })
+}
+
 fn lane_center_x(bounds: Bounds<Pixels>, lane: f32) -> Pixels {
     bounds.origin.x + LEFT_PADDING + lane * LANE_WIDTH + LANE_WIDTH / 2.0
 }
@@ -1772,13 +1820,15 @@ impl RefMenuEntry {
     }
 }
 
-/// A merge, rebase, cherry-pick or revert that stopped and waits for the user.
+/// A merge, rebase, cherry-pick or revert that stopped and waits for the user,
+/// or a bisect waiting for the checked-out commit to be marked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OperationInProgress {
     Merge,
     Rebase,
     CherryPick,
     Revert,
+    Bisect,
 }
 
 impl OperationInProgress {
@@ -1799,6 +1849,11 @@ impl OperationInProgress {
                 return Some(operation);
             }
         }
+        // Checked last: a cherry-pick made while bisecting is what needs
+        // finishing first.
+        if fs.is_file(&git_dir.join("BISECT_LOG")).await {
+            return Some(Self::Bisect);
+        }
         None
     }
 
@@ -1808,6 +1863,7 @@ impl OperationInProgress {
             Self::Rebase => "Rebase",
             Self::CherryPick => "Cherry-pick",
             Self::Revert => "Revert",
+            Self::Bisect => "Bisect",
         }
     }
 
@@ -1817,6 +1873,7 @@ impl OperationInProgress {
             Self::Rebase => "rebase",
             Self::CherryPick => "cherry-pick",
             Self::Revert => "revert",
+            Self::Bisect => "bisect",
         }
     }
 
@@ -4801,8 +4858,88 @@ Checked out in worktree {}",
         }));
     }
 
+    fn render_bisect_banner(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().status();
+        let mark_button = |id: &'static str, label: &'static str, tooltip: &'static str| {
+            Button::new(id, label)
+                .label_size(LabelSize::Small)
+                .style(ButtonStyle::Filled)
+                .tooltip(Tooltip::text(tooltip))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.run_git_in_terminal(
+                        vec!["bisect".to_string(), label.to_lowercase()],
+                        window,
+                        cx,
+                    );
+                }))
+        };
+
+        h_flex()
+            .w_full()
+            .px_2()
+            .py_1()
+            .gap_2()
+            .bg(colors.info_background)
+            .border_b_1()
+            .border_color(colors.info_border)
+            .child(
+                Icon::new(IconName::MagnifyingGlass)
+                    .size(IconSize::Small)
+                    .color(Color::Info),
+            )
+            .child(
+                div().flex_1().min_w_0().child(
+                    Label::new("Bisecting. Test the checked-out commit, then mark it good or bad.")
+                        .size(LabelSize::Small)
+                        .truncate(),
+                ),
+            )
+            .child(mark_button(
+                "bisect-good",
+                "Good",
+                "The checked-out commit doesn't have the problem",
+            ))
+            .child(mark_button(
+                "bisect-bad",
+                "Bad",
+                "The checked-out commit has the problem",
+            ))
+            .child(
+                Button::new("bisect-skip", "Skip")
+                    .label_size(LabelSize::Small)
+                    .style(ButtonStyle::Subtle)
+                    .tooltip(Tooltip::text("The checked-out commit can't be tested"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.run_git_in_terminal(
+                            vec!["bisect".to_string(), "skip".to_string()],
+                            window,
+                            cx,
+                        );
+                    })),
+            )
+            .child(
+                Button::new("bisect-reset", "End Bisect")
+                    .label_size(LabelSize::Small)
+                    .style(ButtonStyle::Subtle)
+                    .tooltip(Tooltip::text(
+                        "Stop bisecting and check out the branch it started from",
+                    ))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.run_git_in_terminal(
+                            vec!["bisect".to_string(), "reset".to_string()],
+                            window,
+                            cx,
+                        );
+                    })),
+            )
+            .into_any_element()
+    }
+
     fn render_operation_in_progress_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let operation = self.operation_in_progress?;
+        if operation == OperationInProgress::Bisect {
+            return Some(self.render_bisect_banner(cx));
+        }
         let colors = cx.theme().status();
         let command = operation.command();
 
@@ -5419,6 +5556,46 @@ Checked out in worktree {}",
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let label = format!("git {}", args.join(" "));
+        self.run_git_task(label, args, HashMap::default(), window, cx);
+    }
+
+    /// Runs a shell script through git in a terminal task, for operations
+    /// that take more than one git command or a pipe. The script is handed to
+    /// git as an alias set through the environment, so git's own `sh` runs it
+    /// on every platform, from the top of the work tree, and the user's shell
+    /// never has to quote it. `args` become `$1`, `$2`, ….
+    fn run_git_script_in_terminal(
+        &mut self,
+        label: String,
+        script: &str,
+        args: Vec<String>,
+        mut env: HashMap<String, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        env.insert("GIT_CONFIG_COUNT".to_string(), "1".to_string());
+        env.insert(
+            "GIT_CONFIG_KEY_0".to_string(),
+            format!("alias.{GIT_SCRIPT_ALIAS}"),
+        );
+        env.insert(
+            "GIT_CONFIG_VALUE_0".to_string(),
+            format!("!f() {{\n{script}\n}}; f"),
+        );
+        let mut task_args = vec![GIT_SCRIPT_ALIAS.to_string()];
+        task_args.extend(args);
+        self.run_git_task(label, task_args, env, window, cx);
+    }
+
+    fn run_git_task(
+        &mut self,
+        label: String,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(repository) = self.get_repository(cx) else {
             return;
         };
@@ -5428,9 +5605,10 @@ Checked out in worktree {}",
             .to_string_lossy()
             .into_owned();
         let template = TaskTemplate {
-            label: format!("git {}", args.join(" ")),
+            label,
             command: "git".to_string(),
             args,
+            env,
             cwd: Some(work_directory),
             reveal: RevealStrategy::NoFocus,
             hide: HideStrategy::OnSuccess,
@@ -5471,6 +5649,631 @@ Checked out in worktree {}",
             .log_err();
         })
         .detach();
+    }
+
+    /// Why history can't be rewritten right now, if it can't.
+    fn rewrite_blocker(&self) -> Option<&'static str> {
+        self.operation_in_progress
+            .map(|_| "Finish or abort the operation in progress first")
+    }
+
+    /// The commits from HEAD back to `target`, newest first, and the commit
+    /// before `target` (`None` when it is the first commit), when they form
+    /// one straight line of history. Rewriting goes through `git rebase -i`,
+    /// which flattens merges, so anything else is refused rather than rebased
+    /// into a different history.
+    fn linear_history_to(
+        &self,
+        target: Oid,
+        cx: &App,
+    ) -> Result<(Vec<Oid>, Option<Oid>), &'static str> {
+        if let Some(blocker) = self.rewrite_blocker() {
+            return Err(blocker);
+        }
+        // A file's history links each commit to the previous one that touched
+        // the file, so walking it would leave the commits in between out of
+        // the todo list, and the rebase would drop them.
+        if matches!(self.log_source, LogSource::Path(_)) {
+            return Err("Rewrite history from the full graph, not a file's history");
+        }
+        let repository = self.get_repository(cx).ok_or("No repository")?;
+        let repository = repository.read(cx);
+        let head = Self::head_sha(repository)
+            .and_then(|sha| sha.parse::<Oid>().ok())
+            .ok_or("The repository has no checked-out commit")?;
+        let graph = repository
+            .get_graph_data(self.log_source.clone(), self.log_order)
+            .ok_or("The graph is still loading")?;
+        let mut commits = Vec::new();
+        let mut current = head;
+        loop {
+            let commit = graph
+                .commit_oid_to_index
+                .get(&current)
+                .and_then(|index| graph.commit_data.get(*index))
+                .ok_or("The commit isn't in the history of the checked-out commit")?;
+            commits.push(current);
+            let parents = commit.parents.as_slice();
+            if current == target {
+                return match parents {
+                    [] => Ok((commits, None)),
+                    [parent] => Ok((commits, Some(*parent))),
+                    _ => Err("Merge commits can't be rewritten this way"),
+                };
+            }
+            match parents {
+                [parent] => current = *parent,
+                [] => return Err("The commit isn't in the history of the checked-out commit"),
+                _ => {
+                    return Err(
+                        "There is a merge between this commit and HEAD, which a rebase would flatten",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Runs `git rebase -i` onto `base` (from the first commit when `None`)
+    /// with `todo` as its todo list, then `then_script` if the rebase didn't
+    /// fail. Squashes keep git's combined message rather than waiting on an
+    /// editor inside the terminal.
+    fn run_rebase_with_todo(
+        &mut self,
+        label: String,
+        base: Option<Oid>,
+        todo: String,
+        then_script: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut script = r#"git rebase -i --autostash "$@""#.to_string();
+        if let Some(then_script) = then_script {
+            script.push_str(" && ");
+            script.push_str(then_script);
+        }
+        let base = base.map_or_else(|| "--root".to_string(), |base| base.to_string());
+        let env = HashMap::from_iter([
+            ("GRAPH_REBASE_TODO".to_string(), todo),
+            (
+                "GIT_SEQUENCE_EDITOR".to_string(),
+                REBASE_SEQUENCE_EDITOR.to_string(),
+            ),
+            ("GIT_EDITOR".to_string(), "true".to_string()),
+        ]);
+        self.run_git_script_in_terminal(label, &script, vec![base], env, window, cx);
+    }
+
+    fn confirm_then(
+        &mut self,
+        message: String,
+        detail: &'static str,
+        confirm_label: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        on_confirm: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &message,
+            Some(detail),
+            &[confirm_label, "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            this.update_in(cx, |this, window, cx| on_confirm(this, window, cx))
+                .log_err();
+        })
+        .detach();
+    }
+
+    fn drop_commit(&mut self, sha: Oid, window: &mut Window, cx: &mut Context<Self>) {
+        let Ok((commits, base)) = self.linear_history_to(sha, cx) else {
+            return;
+        };
+        let mut todo = commits
+            .iter()
+            .rev()
+            .filter(|commit| **commit != sha)
+            .map(|commit| format!("pick {commit}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // An empty todo list makes git abort the rebase as having nothing to do.
+        if todo.is_empty() {
+            todo = "noop".to_string();
+        }
+        let short_sha = sha.display_short();
+        self.confirm_then(
+            format!("Drop commit {short_sha}?"),
+            REWRITE_DETAIL,
+            "Drop Commit",
+            window,
+            cx,
+            move |this, window, cx| {
+                this.run_rebase_with_todo(
+                    format!("Drop commit {short_sha}"),
+                    base,
+                    todo,
+                    None,
+                    window,
+                    cx,
+                );
+            },
+        );
+    }
+
+    /// Why the commit at `sha` can't be split, if it can't.
+    fn split_blocker(&self, sha: Oid, cx: &App) -> Option<&'static str> {
+        match self.linear_history_to(sha, cx) {
+            Ok((_, None)) => Some("The first commit of the repository can't be split this way"),
+            Ok(_) => None,
+            Err(blocker) => Some(blocker),
+        }
+    }
+
+    /// Stops a rebase at the commit with its changes unstaged, so they can be
+    /// committed again in several pieces before continuing.
+    fn split_commit(&mut self, sha: Oid, window: &mut Window, cx: &mut Context<Self>) {
+        let Ok((commits, Some(base))) = self.linear_history_to(sha, cx) else {
+            return;
+        };
+        let todo = commits
+            .iter()
+            .rev()
+            .map(|commit| {
+                let action = if *commit == sha { "edit" } else { "pick" };
+                format!("{action} {commit}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let short_sha = sha.display_short();
+        self.confirm_then(
+            format!("Split commit {short_sha}?"),
+            "The rebase stops at this commit with its changes unstaged. Commit them in as many pieces as you like, then continue the rebase from the banner above the graph.",
+            "Split Commit",
+            window,
+            cx,
+            move |this, window, cx| {
+                this.run_rebase_with_todo(
+                    format!("Split commit {short_sha}"),
+                    Some(base),
+                    todo,
+                    Some("git reset -q HEAD^"),
+                    window,
+                    cx,
+                );
+            },
+        );
+    }
+
+    /// Why the staged changes can't be folded into the commit at `sha`, if
+    /// they can't.
+    fn fixup_blocker(&self, sha: Oid, cx: &App) -> Option<&'static str> {
+        let repository = self.get_repository(cx)?;
+        if !Self::has_staged_changes(repository.read(cx)) {
+            return Some("Stage the changes to add to this commit first");
+        }
+        self.linear_history_to(sha, cx).err()
+    }
+
+    /// Commits the staged changes as a fixup of the commit at `sha` and
+    /// squashes them into it.
+    fn fixup_commit(&mut self, sha: Oid, window: &mut Window, cx: &mut Context<Self>) {
+        if self.fixup_blocker(sha, cx).is_some() {
+            return;
+        }
+        let Ok((commits, base)) = self.linear_history_to(sha, cx) else {
+            return;
+        };
+        if commits.len() == 1 {
+            self.run_git_in_terminal(
+                vec![
+                    "commit".to_string(),
+                    "--amend".to_string(),
+                    "--no-edit".to_string(),
+                ],
+                window,
+                cx,
+            );
+            return;
+        }
+        let short_sha = sha.display_short();
+        let base = base.map_or_else(|| "--root".to_string(), |base| base.to_string());
+        self.confirm_then(
+            format!("Add the staged changes to commit {short_sha}?"),
+            REWRITE_DETAIL,
+            "Add to Commit",
+            window,
+            cx,
+            move |this, window, cx| {
+                this.run_git_script_in_terminal(
+                    format!("Fixup commit {short_sha}"),
+                    r#"git commit -q --fixup="$1" && GIT_SEQUENCE_EDITOR=true git rebase -i --autostash --autosquash "$2""#,
+                    vec![sha.to_string(), base],
+                    HashMap::default(),
+                    window,
+                    cx,
+                );
+            },
+        );
+    }
+
+    fn open_interactive_rebase(&mut self, sha: Oid, window: &mut Window, cx: &mut Context<Self>) {
+        let Ok((commits, base)) = self.linear_history_to(sha, cx) else {
+            return;
+        };
+        let messages = self.load_commit_messages(commits.clone(), cx);
+        let git_graph = cx.weak_entity();
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let messages = messages.await?;
+            let commits = commits
+                .into_iter()
+                .zip(messages)
+                .map(|(sha, message)| {
+                    let subject = message.lines().next().unwrap_or_default().to_string();
+                    (sha, SharedString::from(subject))
+                })
+                .collect::<Vec<_>>();
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    InteractiveRebaseModal::new(
+                        commits,
+                        Box::new(move |todo, window, cx| {
+                            git_graph
+                                .update(cx, |this, cx| {
+                                    this.run_rebase_with_todo(
+                                        "Interactive rebase".to_string(),
+                                        base,
+                                        todo,
+                                        None,
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .log_err();
+                        }),
+                        window,
+                        cx,
+                    )
+                });
+            })
+        })
+        .detach_and_prompt_err(
+            "Failed to load the commit messages",
+            window,
+            cx,
+            |error, _, _| Some(format!("{error:#}")),
+        );
+    }
+
+    /// Moves the current branch, or HEAD when detached, back to where its
+    /// reflog says it was before its last change. `--keep` refuses rather
+    /// than overwrite uncommitted changes to the files that differ.
+    fn undo_last_ref_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let branch = repository
+            .read(cx)
+            .branch
+            .as_ref()
+            .map(|branch| branch.name().to_string());
+        let (message, target) = match branch {
+            Some(branch) => (
+                format!("Move {branch} back to where it was before its last change?"),
+                format!("{branch}@{{1}}"),
+            ),
+            None => (
+                "Move HEAD back to where it was before its last change?".to_string(),
+                "HEAD@{1}".to_string(),
+            ),
+        };
+        self.confirm_and_run_git_in_terminal(
+            message,
+            "This undoes the last commit, amend, reset, rebase, merge or pull, using the reflog. Uncommitted changes are kept; if they touch files that would change, git refuses and nothing moves.",
+            "Undo",
+            vec!["reset".to_string(), "--keep".to_string(), target],
+            window,
+            cx,
+        );
+    }
+
+    fn file_has_uncommitted_changes(&self, repo_path: &RepoPath, cx: &App) -> bool {
+        self.get_repository(cx)
+            .is_some_and(|repository| repository.read(cx).status_for_path(repo_path).is_some())
+    }
+
+    /// Puts the file in the work tree back to how it was at `revision`,
+    /// deleting it when it didn't exist then, and leaves the result unstaged.
+    fn restore_file_at(
+        &mut self,
+        repo_path: RepoPath,
+        revision: String,
+        revision_label: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let file_name = repo_path
+            .file_name()
+            .map(|name| name.to_string())
+            .unwrap_or_default();
+        let label = format!("Restore {file_name} to {revision_label}");
+        let args = vec![repo_path.as_unix_str().to_string(), revision];
+        if !self.file_has_uncommitted_changes(&repo_path, cx) {
+            self.run_git_script_in_terminal(
+                label,
+                RESTORE_FILE_SCRIPT,
+                args,
+                HashMap::default(),
+                window,
+                cx,
+            );
+            return;
+        }
+        self.confirm_then(
+            format!("Restore {file_name} to {revision_label}?"),
+            "The file has uncommitted changes, which will be lost.",
+            "Restore",
+            window,
+            cx,
+            move |this, window, cx| {
+                this.run_git_script_in_terminal(
+                    label,
+                    RESTORE_FILE_SCRIPT,
+                    args,
+                    HashMap::default(),
+                    window,
+                    cx,
+                );
+            },
+        );
+    }
+
+    /// Applies the reverse of what the commit at `sha` did to the file, on
+    /// top of the file as it is now, leaving the result unstaged.
+    fn undo_file_changes_of_commit(
+        &mut self,
+        repo_path: RepoPath,
+        sha: Oid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let file_name = repo_path
+            .file_name()
+            .map(|name| name.to_string())
+            .unwrap_or_default();
+        self.run_git_script_in_terminal(
+            format!("Undo {} changes to {file_name}", sha.display_short()),
+            UNDO_FILE_CHANGES_SCRIPT,
+            vec![repo_path.as_unix_str().to_string(), sha.to_string()],
+            HashMap::default(),
+            window,
+            cx,
+        );
+    }
+
+    /// Why the file can't be taken out of the commit at `sha`, if it can't.
+    /// Only HEAD is amended this way; older commits would need the change
+    /// carried through a rebase.
+    fn remove_file_from_commit_blocker(&self, sha: Oid, cx: &App) -> Option<&'static str> {
+        if let Some(blocker) = self.rewrite_blocker() {
+            return Some(blocker);
+        }
+        let repository = self.get_repository(cx)?;
+        let repository = repository.read(cx);
+        if Self::head_sha(repository).as_deref() != Some(sha.to_string().as_str()) {
+            return Some("Only the checked-out commit (HEAD) can have files taken out");
+        }
+        if Self::has_staged_changes(repository) {
+            return Some("Unstage your changes first, or they would be added to the commit");
+        }
+        None
+    }
+
+    fn remove_file_from_head_commit(
+        &mut self,
+        repo_path: RepoPath,
+        sha: Oid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.remove_file_from_commit_blocker(sha, cx).is_some() {
+            return;
+        }
+        let file_name = repo_path
+            .file_name()
+            .map(|name| name.to_string())
+            .unwrap_or_default();
+        self.run_git_script_in_terminal(
+            format!("Remove {file_name} from the last commit"),
+            REMOVE_FILE_FROM_HEAD_SCRIPT,
+            vec![repo_path.as_unix_str().to_string()],
+            HashMap::default(),
+            window,
+            cx,
+        );
+    }
+
+    fn open_file_history(&self, repo_path: RepoPath, window: &mut Window, cx: &mut App) {
+        let workspace = self.workspace.clone();
+        let git_store = self.git_store.clone();
+        let repo_id = self.repo_id;
+        // Opening another graph tab updates this one, and callers are inside
+        // an update of it.
+        window.defer(cx, move |window, cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    open_or_reuse_graph(
+                        workspace,
+                        repo_id,
+                        git_store,
+                        LogSource::Path(repo_path),
+                        None,
+                        window,
+                        cx,
+                    );
+                })
+                .log_err();
+        });
+    }
+
+    fn open_project_file(&self, repo_path: &RepoPath, window: &mut Window, cx: &mut App) {
+        let Some(project_path) = self
+            .get_repository(cx)
+            .and_then(|repository| repository.read(cx).repo_path_to_project_path(repo_path, cx))
+        else {
+            return;
+        };
+        let workspace = self.workspace.clone();
+        window.defer(cx, move |window, cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace
+                        .open_path(project_path, None, true, window, cx)
+                        .detach_and_log_err(cx);
+                })
+                .log_err();
+        });
+    }
+
+    fn changed_file_context_menu(
+        &self,
+        entry: ChangedFileEntry,
+        sha: Oid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ContextMenu> {
+        let git_graph = cx.entity();
+        let repository = self.get_repository(cx);
+        let workspace = self.workspace.clone();
+        let short_sha = sha.display_short();
+        let repo_path = entry.repo_path.clone();
+        let added_in_commit = entry.status.is_created();
+        let deleted_in_commit = entry.status.is_deleted();
+        let remove_blocker = self.remove_file_from_commit_blocker(sha, cx);
+        let absolute_path = repository.as_ref().map(|repository| {
+            repository
+                .read(cx)
+                .work_directory_abs_path
+                .join(repo_path.as_std_path())
+        });
+
+        ContextMenu::build(window, cx, move |menu, window, _| {
+            let restore = |revision: String, revision_label: String| {
+                let repo_path = repo_path.clone();
+                window.handler_for(&git_graph, move |this, window, cx| {
+                    this.restore_file_at(
+                        repo_path.clone(),
+                        revision.clone(),
+                        revision_label.clone(),
+                        window,
+                        cx,
+                    );
+                })
+            };
+
+            menu.entry("View Changes", None, {
+                let entry = entry.clone();
+                let git_graph = git_graph.downgrade();
+                let repository = repository.as_ref().map(|repository| repository.downgrade());
+                let workspace = workspace.clone();
+                let sha = SharedString::from(sha.to_string());
+                move |window, cx| {
+                    if let Some(repository) = &repository {
+                        entry.open_in_commit_view(
+                            &sha, &git_graph, repository, &workspace, window, cx,
+                        );
+                    }
+                }
+            })
+            .item(
+                ContextMenuEntry::new("Open File")
+                    .disabled(deleted_in_commit)
+                    .handler({
+                        let repo_path = repo_path.clone();
+                        window.handler_for(&git_graph, move |this, window, cx| {
+                            this.open_project_file(&repo_path, window, cx);
+                        })
+                    }),
+            )
+            .entry("File History", None, {
+                let repo_path = repo_path.clone();
+                window.handler_for(&git_graph, move |this, window, cx| {
+                    this.open_file_history(repo_path.clone(), window, cx);
+                })
+            })
+            .item(
+                ContextMenuEntry::new("Blame at This Commit")
+                    .disabled(deleted_in_commit || repository.is_none())
+                    .handler({
+                        let repository = repository.clone();
+                        let workspace = workspace.clone();
+                        let repo_path = repo_path.clone();
+                        move |window, cx| {
+                            if let Some(repository) = repository.clone() {
+                                crate::blame_ui::open_buffer_blame_at_revision(
+                                    repository,
+                                    workspace.clone(),
+                                    repo_path.clone(),
+                                    sha,
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }
+                    }),
+            )
+            .separator()
+            .entry(
+                if deleted_in_commit {
+                    "Delete File, as in This Commit…"
+                } else {
+                    "Restore File to This Commit…"
+                },
+                None,
+                restore(sha.to_string(), short_sha.to_string()),
+            )
+            .entry(
+                if added_in_commit {
+                    "Delete File, as Before This Commit…"
+                } else {
+                    "Restore File to Before This Commit…"
+                },
+                None,
+                restore(format!("{sha}^"), format!("before {short_sha}")),
+            )
+            .entry("Undo This Commit's Changes to File", None, {
+                let repo_path = repo_path.clone();
+                window.handler_for(&git_graph, move |this, window, cx| {
+                    this.undo_file_changes_of_commit(repo_path.clone(), sha, window, cx);
+                })
+            })
+            .item(blockable_entry(
+                "Remove File from This Commit",
+                remove_blocker,
+                {
+                    let repo_path = repo_path.clone();
+                    window.handler_for(&git_graph, move |this, window, cx| {
+                        this.remove_file_from_head_commit(repo_path.clone(), sha, window, cx);
+                    })
+                },
+            ))
+            .separator()
+            .entry("Copy Relative Path", None, {
+                let repo_path = repo_path.as_unix_str().to_string();
+                move |_, cx| cx.write_to_clipboard(ClipboardItem::new_string(repo_path.clone()))
+            })
+            .when_some(absolute_path.clone(), |menu, absolute_path| {
+                menu.entry("Copy Path", None, move |_, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(
+                        absolute_path.to_string_lossy().into_owned(),
+                    ))
+                })
+            })
+        })
     }
 
     /// Builds the commit menu's git operations for the commit at `index`.
@@ -5541,6 +6344,17 @@ Checked out in worktree {}",
             .into_iter()
             .collect();
 
+        let rewrite_blocker = self.linear_history_to(sha, cx).err();
+        let fixup_blocker = self.fixup_blocker(sha, cx);
+        let split_blocker = self.split_blocker(sha, cx);
+        let undo_commit_blocker = self.rewrite_blocker().or_else(|| {
+            commit
+                .data
+                .parents
+                .is_empty()
+                .then_some("The first commit of the repository can't be undone this way")
+        });
+        let bisecting = self.operation_in_progress == Some(OperationInProgress::Bisect);
         let weak_git_graph = cx.weak_entity();
         let workspace = self.workspace.clone();
 
@@ -5630,6 +6444,67 @@ Checked out in worktree {}",
                             None,
                             run(vec!["revert", "--no-edit", &sha_string]),
                         );
+                }
+
+                let handler = |f: fn(&mut GitGraph, Oid, &mut Window, &mut Context<GitGraph>)| {
+                    window.handler_for(&git_graph, move |this, window, cx| f(this, sha, window, cx))
+                };
+                menu = menu
+                    .separator()
+                    .item(blockable_entry(
+                        "Interactive Rebase from Here…",
+                        rewrite_blocker,
+                        handler(GitGraph::open_interactive_rebase),
+                    ))
+                    .item(blockable_entry(
+                        "Add Staged Changes to This Commit",
+                        fixup_blocker,
+                        handler(GitGraph::fixup_commit),
+                    ))
+                    .item(blockable_entry(
+                        "Split Commit…",
+                        split_blocker,
+                        handler(GitGraph::split_commit),
+                    ))
+                    .item(blockable_entry(
+                        "Drop Commit…",
+                        rewrite_blocker,
+                        handler(GitGraph::drop_commit),
+                    ));
+                if is_head_commit {
+                    menu = menu
+                        .item(blockable_entry(
+                            "Undo Commit (Keep Changes)",
+                            undo_commit_blocker,
+                            run(vec!["reset", "--soft", "HEAD^"]),
+                        ))
+                        .entry(
+                            match &current_branch {
+                                Some(branch) => format!("Undo Last Change to {branch}…"),
+                                None => "Undo Last Change to HEAD…".to_string(),
+                            },
+                            None,
+                            window.handler_for(&git_graph, |this, window, cx| {
+                                this.undo_last_ref_change(window, cx);
+                            }),
+                        );
+                }
+
+                if bisecting {
+                    menu = menu.separator();
+                    for (label, verb) in [
+                        ("Bisect: Mark as Good", "good"),
+                        ("Bisect: Mark as Bad", "bad"),
+                        ("Bisect: Skip", "skip"),
+                    ] {
+                        menu = menu.entry(label, None, run(vec!["bisect", verb, &sha_string]));
+                    }
+                } else if !is_head_commit {
+                    menu = menu.separator().entry(
+                        "Bisect from Here (This Good, HEAD Bad)",
+                        None,
+                        run(vec!["bisect", "start", "HEAD", &sha_string]),
+                    );
                 }
 
                 if let Some(current_branch) = current_branch.clone() {
