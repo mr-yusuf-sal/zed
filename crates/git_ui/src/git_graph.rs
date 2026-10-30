@@ -7,7 +7,9 @@ use crate::{
     },
     commit_tooltip::CommitAvatar,
     commit_view::CommitView,
-    create_branch_at_commit, git_status_icon,
+    create_branch_at_commit,
+    git_panel::GitPanel,
+    git_status_icon,
     project_diff::ProjectDiff,
     rename_branch_modal,
     working_tree_changes::WorkingTreeChanges,
@@ -1547,6 +1549,27 @@ pub fn open_or_reuse_graph(
             });
         });
     }
+}
+
+/// Runs `operation` on the workspace's git panel for `repository`, for the
+/// views that show a repository other than the panel's active one.
+pub(crate) fn with_git_panel(
+    workspace: &WeakEntity<Workspace>,
+    repository: Option<Entity<Repository>>,
+    window: &mut Window,
+    cx: &mut App,
+    operation: fn(&mut GitPanel, Entity<Repository>, &mut Window, &mut Context<GitPanel>),
+) {
+    let Some(repository) = repository else {
+        return;
+    };
+    let Some(panel) = workspace
+        .upgrade()
+        .and_then(|workspace| workspace.read(cx).panel::<GitPanel>(cx))
+    else {
+        return;
+    };
+    panel.update(cx, |panel, cx| operation(panel, repository, window, cx));
 }
 
 /// A menu entry that is disabled while `blocker` is set, with the blocker
@@ -4479,39 +4502,35 @@ Checked out in worktree {}",
     /// disabled while that is not the repository this graph shows.
     fn render_remote_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let repository = self.get_repository(cx);
-        let graph_repository_is_active = self
-            .git_store
-            .read(cx)
-            .active_repository()
-            .is_some_and(|active| active.read(cx).id == self.repo_id);
         let (ahead, behind) = repository
             .as_ref()
             .and_then(|repository| repository.read(cx).branch.clone())
             .and_then(|branch| branch.tracking_status())
             .map_or((0, 0), |status| (status.ahead, status.behind));
-        let disabled_reason = (!graph_repository_is_active)
-            .then_some("Switch the active repository to this one to sync it");
-        let focus_handle = self.focus_handle.clone();
 
+        // `git::Fetch`, `git::Pull` and `git::Push` act on the active
+        // repository, so the buttons hand this graph's repository to the git
+        // panel, which still picks the remote, asks for credentials and
+        // reports the result.
         let remote_button = |id: &'static str,
                              label: String,
                              icon: IconName,
                              tooltip: &'static str,
-                             action: Box<dyn Action>| {
-            let focus_handle = focus_handle.clone();
-            let tooltip_action = action.boxed_clone();
+                             operation: fn(
+            &mut GitPanel,
+            Entity<Repository>,
+            &mut Window,
+            &mut Context<GitPanel>,
+        )| {
+            let repository = repository.clone();
+            let workspace = self.workspace.clone();
             Button::new(id, label)
                 .start_icon(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
                 .label_size(LabelSize::Small)
-                .disabled(disabled_reason.is_some())
-                .tooltip(move |_, cx| match disabled_reason {
-                    Some(reason) => Tooltip::simple(reason, cx),
-                    None => {
-                        Tooltip::for_action_in(tooltip, tooltip_action.as_ref(), &focus_handle, cx)
-                    }
-                })
+                .disabled(repository.is_none())
+                .tooltip(Tooltip::text(tooltip))
                 .on_click(move |_, window, cx| {
-                    window.dispatch_action(action.boxed_clone(), cx);
+                    with_git_panel(&workspace, repository.clone(), window, cx, operation);
                 })
         };
 
@@ -4536,7 +4555,9 @@ Checked out in worktree {}",
                 "Fetch".to_string(),
                 IconName::ArrowCircle,
                 "Fetch from all remotes",
-                Box::new(git::Fetch),
+                |panel, repository, window, cx| {
+                    panel.fetch_repository(repository, true, window, cx)
+                },
             ))
             .child(remote_button(
                 "git-graph-pull",
@@ -4547,7 +4568,9 @@ Checked out in worktree {}",
                 },
                 IconName::ArrowDown,
                 "Pull",
-                Box::new(git::Pull),
+                |panel, repository, window, cx| {
+                    panel.pull_repository(repository, false, window, cx)
+                },
             ))
             .child(remote_button(
                 "git-graph-push",
@@ -4558,7 +4581,9 @@ Checked out in worktree {}",
                 },
                 IconName::ArrowUp,
                 "Push",
-                Box::new(git::Push),
+                |panel, repository, window, cx| {
+                    panel.push_repository(repository, false, false, window, cx)
+                },
             ))
     }
 
@@ -4738,11 +4763,6 @@ Checked out in worktree {}",
 
     fn render_uncommitted_panel(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let file_count = self.uncommitted_changes(cx).count();
-        let graph_repository_is_active = self
-            .git_store
-            .read(cx)
-            .active_repository()
-            .is_some_and(|active| active.read(cx).id == self.repo_id);
 
         let header = h_flex()
             .w_full()
@@ -4792,15 +4812,20 @@ Checked out in worktree {}",
                     )
                     .style(ButtonStyle::OutlinedGhost)
                     .label_size(LabelSize::Small)
-                    // `git::StashAll` acts on the git panel's active repository.
-                    .disabled(!graph_repository_is_active)
-                    .when(!graph_repository_is_active, |button| {
-                        button.tooltip(Tooltip::text(
-                            "Switch the active repository to this one to stash it",
-                        ))
-                    })
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(git::StashAll.boxed_clone(), cx);
+                    .on_click({
+                        let workspace = self.workspace.clone();
+                        let repository = self.get_repository(cx);
+                        move |_, window, cx| {
+                            with_git_panel(
+                                &workspace,
+                                repository.clone(),
+                                window,
+                                cx,
+                                |panel, repository, window, cx| {
+                                    panel.stash_all_in(repository, window, cx)
+                                },
+                            );
+                        }
                     }),
             );
 
