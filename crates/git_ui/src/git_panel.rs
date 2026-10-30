@@ -232,12 +232,14 @@ impl StashKind {
 struct StashMessageModal {
     editor: Entity<Editor>,
     panel: WeakEntity<GitPanel>,
+    repository: Entity<Repository>,
     kind: StashKind,
 }
 
 impl StashMessageModal {
     fn new(
         panel: WeakEntity<GitPanel>,
+        repository: Entity<Repository>,
         kind: StashKind,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -250,6 +252,7 @@ impl StashMessageModal {
         Self {
             editor,
             panel,
+            repository,
             kind,
         }
     }
@@ -262,8 +265,11 @@ impl StashMessageModal {
         let message = self.editor.read(cx).text(cx).trim().to_owned();
         let message = (!message.is_empty()).then_some(message);
         let kind = self.kind;
+        let repository = self.repository.clone();
         self.panel
-            .update(cx, |panel, cx| panel.perform_stash(kind, message, cx))
+            .update(cx, |panel, cx| {
+                panel.perform_stash(repository, kind, message, cx)
+            })
             .ok();
         cx.emit(DismissEvent);
     }
@@ -3641,9 +3647,30 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.active_repository.is_none() {
+        let Some(repository) = self.active_repository.clone() else {
             return;
-        }
+        };
+        self.prompt_for_stash_message_in(repository, kind, window, cx);
+    }
+
+    /// Stashes all of `repository`'s changes, which needn't be the panel's
+    /// active repository, after asking for an optional message.
+    pub(crate) fn stash_all_in(
+        &mut self,
+        repository: Entity<Repository>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.prompt_for_stash_message_in(repository, StashKind::All, window, cx);
+    }
+
+    fn prompt_for_stash_message_in(
+        &mut self,
+        repository: Entity<Repository>,
+        kind: StashKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // `git::StashAll` is also registered on the workspace, which dispatches it while
         // `Workspace` is leased, so opening the modal inline would re-enter that update.
         cx.defer_in(window, move |this, window, cx| {
@@ -3651,18 +3678,20 @@ impl GitPanel {
             this.workspace
                 .update(cx, |workspace, cx| {
                     workspace.toggle_modal(window, cx, |window, cx| {
-                        StashMessageModal::new(panel, kind, window, cx)
+                        StashMessageModal::new(panel, repository, kind, window, cx)
                     });
                 })
                 .ok();
         });
     }
 
-    fn perform_stash(&mut self, kind: StashKind, message: Option<String>, cx: &mut Context<Self>) {
-        let Some(active_repository) = self.active_repository.clone() else {
-            return;
-        };
-
+    fn perform_stash(
+        &mut self,
+        active_repository: Entity<Repository>,
+        kind: StashKind,
+        message: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn({
             async move |this, cx| {
                 let stash_task = active_repository
@@ -4545,14 +4574,13 @@ impl GitPanel {
 
     fn get_fetch_options(
         &self,
+        repo: Entity<Repository>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Option<FetchOptions>> {
-        let repo = self.active_repository.clone();
         let workspace = self.workspace.clone();
 
         cx.spawn_in(window, async move |_, cx| {
-            let repo = repo?;
             let remotes = repo
                 .update(cx, |repo, _| repo.get_remotes(None, false))
                 .await
@@ -4585,13 +4613,24 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.can_push_and_pull(cx) {
-            return;
-        }
-
         let Some(repo) = self.active_repository.clone() else {
             return;
         };
+        self.fetch_repository(repo, is_fetch_all, window, cx);
+    }
+
+    /// Fetches `repo`, which needn't be the panel's active repository: the git
+    /// graph and the main page fetch, pull and push the repository they show.
+    pub(crate) fn fetch_repository(
+        &mut self,
+        repo: Entity<Repository>,
+        is_fetch_all: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_push_and_pull(cx) {
+            return;
+        }
         if !self.start_remote_operation(RemoteOperationKind::Fetch, cx) {
             return;
         }
@@ -4603,7 +4642,7 @@ impl GitPanel {
         let fetch_options = if is_fetch_all {
             Task::ready(Some(FetchOptions::All))
         } else {
-            self.get_fetch_options(window, cx)
+            self.get_fetch_options(repo.clone(), window, cx)
         };
 
         window
@@ -4737,12 +4776,22 @@ impl GitPanel {
     }
 
     pub(crate) fn pull(&mut self, rebase: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.can_push_and_pull(cx) {
-            return;
-        }
         let Some(repo) = self.active_repository.clone() else {
             return;
         };
+        self.pull_repository(repo, rebase, window, cx);
+    }
+
+    pub(crate) fn pull_repository(
+        &mut self,
+        repo: Entity<Repository>,
+        rebase: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_push_and_pull(cx) {
+            return;
+        }
         let Some(branch) = repo.read(cx).branch.clone() else {
             return;
         };
@@ -4751,7 +4800,7 @@ impl GitPanel {
         }
 
         telemetry::event!("Git Pulled");
-        let remote = self.get_remote(false, false, window, cx);
+        let remote = self.get_remote(repo.clone(), false, false, window, cx);
         cx.spawn_in(window, async move |this, cx| {
             let _clear_pending_remote_operation = cx.on_drop(&this, |this, cx| {
                 this.clear_remote_operation(cx);
@@ -4807,12 +4856,23 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.can_push_and_pull(cx) {
-            return;
-        }
         let Some(repo) = self.active_repository.clone() else {
             return;
         };
+        self.push_repository(repo, force_push, select_remote, window, cx);
+    }
+
+    pub(crate) fn push_repository(
+        &mut self,
+        repo: Entity<Repository>,
+        force_push: bool,
+        select_remote: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_push_and_pull(cx) {
+            return;
+        }
         let Some(branch) = repo.read(cx).branch.clone() else {
             return;
         };
@@ -4834,7 +4894,7 @@ impl GitPanel {
                 _ => None,
             }
         };
-        let remote = self.get_remote(select_remote, true, window, cx);
+        let remote = self.get_remote(repo.clone(), select_remote, true, window, cx);
 
         cx.spawn_in(window, async move |this, cx| {
             let _clear_pending_remote_operation = cx.on_drop(&this, |this, cx| {
@@ -5048,17 +5108,16 @@ impl GitPanel {
 
     fn get_remote(
         &mut self,
+        repo: Entity<Repository>,
         always_select: bool,
         is_push: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl Future<Output = anyhow::Result<Option<Remote>>> + use<> {
-        let repo = self.active_repository.clone();
         let workspace = self.workspace.clone();
         let mut cx = window.to_async(cx);
 
         async move {
-            let repo = repo.context("No active repository")?;
             let current_remotes: Vec<Remote> = repo
                 .update(&mut cx, |repo, _| {
                     let current_branch = if always_select {

@@ -14,8 +14,8 @@ use project::{
     git_store::{GitStore, GitStoreEvent, Repository, RepositoryEvent, RepositoryId},
 };
 use ui::{
-    ContextMenu, ContextMenuEntry, DiffStat, ListItem, ListItemSpacing, Tooltip, prelude::*,
-    right_click_menu,
+    ContextMenu, ContextMenuEntry, DiffStat, ListItem, ListItemSpacing, PopoverMenu, Tooltip,
+    prelude::*, right_click_menu,
 };
 use util::ResultExt as _;
 use workspace::Workspace;
@@ -27,8 +27,11 @@ use crate::{git_status_icon, project_diff::ProjectDiff};
 pub struct WorkingTreeChanges {
     workspace: WeakEntity<Workspace>,
     git_store: Entity<GitStore>,
-    /// `None` lists every repository and commits to the active one.
+    /// `None` lists every repository, and commits to `commit_target`.
     repository_id: Option<RepositoryId>,
+    /// The repository picked to commit and push when every repository is
+    /// listed. `None` follows the staged changes, see `target_repository`.
+    commit_target: Option<RepositoryId>,
     changes: Vec<RepositoryChanges>,
     commit_title_editor: Entity<Editor>,
     commit_description_editor: Entity<Editor>,
@@ -39,6 +42,7 @@ pub struct WorkingTreeChanges {
 
 #[derive(PartialEq)]
 struct RepositoryChanges {
+    id: RepositoryId,
     name: SharedString,
     repository: WeakEntity<Repository>,
     unstaged: Vec<ChangedFile>,
@@ -91,6 +95,7 @@ impl WorkingTreeChanges {
             workspace,
             git_store,
             repository_id,
+            commit_target: None,
             changes: Vec::new(),
             commit_title_editor,
             commit_description_editor,
@@ -171,6 +176,7 @@ impl WorkingTreeChanges {
                     .filter(|file| file.status.staging().has_unstaged())
                     .collect();
                 RepositoryChanges {
+                    id: repository.id,
                     name: name.into(),
                     repository: repository_handle.downgrade(),
                     unstaged,
@@ -180,12 +186,115 @@ impl WorkingTreeChanges {
             .collect()
     }
 
+    /// The repository the commit form commits to and pushes. When every
+    /// repository is listed and none was picked, it is the one holding the
+    /// staged changes: the active repository is only where the last edited
+    /// file was, and committing there found nothing staged.
     fn target_repository(&self, cx: &App) -> Option<Entity<Repository>> {
         let git_store = self.git_store.read(cx);
-        match self.repository_id {
-            Some(repository_id) => git_store.repositories().get(&repository_id).cloned(),
-            None => git_store.active_repository(),
+        let repositories = git_store.repositories();
+        if let Some(repository_id) = self.repository_id {
+            return repositories.get(&repository_id).cloned();
         }
+        if let Some(repository) = self
+            .commit_target
+            .and_then(|repository_id| repositories.get(&repository_id))
+        {
+            return Some(repository.clone());
+        }
+        let active = git_store.active_repository();
+        if active
+            .as_ref()
+            .is_some_and(|repository| has_staged_changes(repository.read(cx)))
+        {
+            return active;
+        }
+        self.changes
+            .iter()
+            .filter(|repository| !repository.staged.is_empty())
+            .find_map(|repository| repository.repository.upgrade())
+            .or(active)
+    }
+
+    fn set_commit_target(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
+        self.commit_target = Some(repository_id);
+        cx.notify();
+    }
+
+    /// Picks the repository to commit to, shown only when there is more than
+    /// one to pick from.
+    fn render_commit_target(
+        &self,
+        target: Option<&Entity<Repository>>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if self.repository_id.is_some() || self.changes.len() < 2 {
+            return None;
+        }
+        let target_id = target.map(|repository| repository.read(cx).id);
+        let label = self
+            .changes
+            .iter()
+            .find(|repository| Some(repository.id) == target_id)
+            .map_or_else(
+                || SharedString::from("Repository"),
+                |repository| repository.name.clone(),
+            );
+        let repositories = self
+            .changes
+            .iter()
+            .map(|repository| {
+                (
+                    repository.id,
+                    repository.name.clone(),
+                    repository.staged.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let this = cx.weak_entity();
+        Some(
+            PopoverMenu::new("commit-target")
+                .trigger_with_tooltip(
+                    Button::new("commit-target-button", label)
+                        .label_size(LabelSize::Small)
+                        .end_icon(
+                            Icon::new(IconName::ChevronDown)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                    Tooltip::text("The repository to commit to and push"),
+                )
+                .anchor(gpui::Anchor::BottomLeft)
+                .menu(move |window, cx| {
+                    let this = this.clone();
+                    let repositories = repositories.clone();
+                    Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                        for (repository_id, name, staged_count) in &repositories {
+                            let this = this.clone();
+                            let repository_id = *repository_id;
+                            let label = if *staged_count > 0 {
+                                format!("{name} ({staged_count} staged)")
+                            } else {
+                                name.to_string()
+                            };
+                            menu = menu.toggleable_entry(
+                                label,
+                                Some(repository_id) == target_id,
+                                IconPosition::Start,
+                                None,
+                                move |_, cx| {
+                                    this.update(cx, |this, cx| {
+                                        this.set_commit_target(repository_id, cx);
+                                    })
+                                    .log_err();
+                                },
+                            );
+                        }
+                        menu
+                    }))
+                })
+                .into_any_element(),
+        )
     }
 
     fn render_changes(&self, staged: bool, cx: &mut Context<Self>) -> AnyElement {
@@ -675,11 +784,7 @@ impl WorkingTreeChanges {
             self.commit_title_editor.focus_handle(cx).focus(window, cx);
             return;
         }
-        let has_staged_changes = repository
-            .read(cx)
-            .cached_status()
-            .any(|entry| entry.status.staging().has_staged());
-        if !has_staged_changes {
+        if !has_staged_changes(repository.read(cx)) {
             let prompt = window.prompt(
                 PromptLevel::Warning,
                 "No staged changes to commit",
@@ -774,13 +879,7 @@ impl WorkingTreeChanges {
                 .as_ref()
                 .map(|branch| SharedString::from(branch.name().to_string()))
         });
-        // `git::Push` pushes the git panel's repository, which is the active one.
-        let can_push = repository.as_ref().is_some_and(|repository| {
-            self.git_store
-                .read(cx)
-                .active_repository()
-                .is_some_and(|active| active.read(cx).id == repository.read(cx).id)
-        });
+        let commit_target = self.render_commit_target(repository.as_ref(), cx);
         let editor_container = |editor: Entity<Editor>| {
             div()
                 .px_1p5()
@@ -805,6 +904,7 @@ impl WorkingTreeChanges {
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     )
+                    .children(commit_target)
                     .children(branch_name.map(|branch_name| {
                         Label::new(branch_name)
                             .size(LabelSize::XSmall)
@@ -821,17 +921,27 @@ impl WorkingTreeChanges {
                     .child(
                         Button::new("push", "Push")
                             .start_icon(Icon::new(IconName::ArrowUp).size(IconSize::Small))
-                            .disabled(!can_push)
-                            .when(repository.is_some() && !can_push, |button| {
-                                button.tooltip(Tooltip::text(
-                                    "Switch the active repository to this one to push it",
-                                ))
-                            })
-                            .on_click(cx.listener(|this, _, window, cx| {
+                            .disabled(repository.is_none())
+                            .on_click({
                                 // The git panel owns pushing: it picks the remote, asks for
-                                // credentials and reports the result.
-                                this.focus_handle.dispatch_action(&git::Push, window, cx);
-                            })),
+                                // credentials and reports the result. `git::Push` would push
+                                // the active repository rather than this one.
+                                let workspace = self.workspace.clone();
+                                let repository = repository.clone();
+                                move |_, window, cx| {
+                                    crate::git_graph::with_git_panel(
+                                        &workspace,
+                                        repository.clone(),
+                                        window,
+                                        cx,
+                                        |panel, repository, window, cx| {
+                                            panel.push_repository(
+                                                repository, false, false, window, cx,
+                                            )
+                                        },
+                                    );
+                                }
+                            }),
                     )
                     .child(
                         Button::new("commit", "Commit")
@@ -874,6 +984,12 @@ impl WorkingTreeChanges {
             )
             .into_any_element()
     }
+}
+
+fn has_staged_changes(repository: &Repository) -> bool {
+    repository
+        .cached_status()
+        .any(|entry| entry.status.staging().has_staged())
 }
 
 async fn discard_files(
