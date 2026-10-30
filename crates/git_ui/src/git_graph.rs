@@ -4135,6 +4135,7 @@ Checked out in worktree {}",
                             ),
                     ),
             )
+            .children(self.render_repository_filter(cx))
             .children(self.render_branch_filter(cx))
             .child(self.render_remote_buttons(cx))
     }
@@ -4151,6 +4152,118 @@ Checked out in worktree {}",
         self.clear_selection(cx);
         self.invalidate_state(cx);
         self.fetch_initial_graph_data(cx);
+    }
+
+    /// Points the graph at another repository of the project, showing all of
+    /// its branches: a branch filter or commit sha names something in the
+    /// previous repository.
+    fn select_repository(&mut self, repo_id: RepositoryId, cx: &mut Context<Self>) {
+        if repo_id == self.repo_id {
+            return;
+        }
+        self.set_repo_id(repo_id, cx);
+        if self.repo_id != repo_id {
+            return;
+        }
+        self.log_source = LogSource::All;
+        self.graph_data.uncommitted_parent = self.wanted_uncommitted_parent(cx);
+        self.pending_select_sha = None;
+        self.clear_selection(cx);
+        self.invalidate_state(cx);
+        self.fetch_initial_graph_data(cx);
+    }
+
+    /// A dropdown that switches the graph between the project's repositories,
+    /// shown only when the project has more than one. File history belongs to
+    /// the repository containing the file, so it gets no dropdown.
+    fn render_repository_filter(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if matches!(self.log_source, LogSource::Path(_)) {
+            return None;
+        }
+        let git_store = self.git_store.read(cx);
+        if git_store.repositories().len() < 2 {
+            return None;
+        }
+        let label = git_store
+            .repositories()
+            .get(&self.repo_id)
+            .map(|repository| repository.read(cx).display_name())
+            .unwrap_or_else(|| "Repository".into());
+        let git_store = self.git_store.downgrade();
+        let selected_repo_id = self.repo_id;
+        let git_graph = cx.weak_entity();
+
+        Some(
+            PopoverMenu::new("git-graph-repository-filter")
+                .trigger_with_tooltip(
+                    Button::new("git-graph-repository-filter-button", label)
+                        .start_icon(
+                            Icon::new(IconName::FileGit)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .end_icon(
+                            Icon::new(IconName::ChevronDown)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .label_size(LabelSize::Small),
+                    Tooltip::text("Show the history of another repository in the project"),
+                )
+                .anchor(Anchor::TopRight)
+                .menu(move |window, cx| {
+                    let git_graph = git_graph.clone();
+                    let git_store = git_store.upgrade()?;
+                    let mut repositories = git_store
+                        .read(cx)
+                        .repositories()
+                        .iter()
+                        .map(|(repo_id, repository)| {
+                            let repository = repository.read(cx);
+                            (
+                                *repo_id,
+                                repository.display_name(),
+                                repository.work_directory_abs_path.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    repositories.sort_by(|(_, _, left), (_, _, right)| left.cmp(right));
+                    Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                        for (repo_id, name, path) in &repositories {
+                            // Nested repositories often share a folder name
+                            // (`frontend/app`, `backend/app`), so those are
+                            // told apart by their full path.
+                            let label = if repositories
+                                .iter()
+                                .filter(|(_, other_name, _)| other_name == name)
+                                .count()
+                                > 1
+                            {
+                                path.to_string_lossy().to_string()
+                            } else {
+                                name.to_string()
+                            };
+                            let git_graph = git_graph.clone();
+                            let repo_id = *repo_id;
+                            menu = menu.toggleable_entry(
+                                label,
+                                repo_id == selected_repo_id,
+                                IconPosition::Start,
+                                None,
+                                move |_: &mut Window, cx: &mut App| {
+                                    git_graph
+                                        .update(cx, |this, cx| {
+                                            this.select_repository(repo_id, cx);
+                                        })
+                                        .log_err();
+                                },
+                            );
+                        }
+                        menu
+                    }))
+                })
+                .into_any_element(),
+        )
     }
 
     /// A dropdown that narrows the graph to one branch's history. File history
