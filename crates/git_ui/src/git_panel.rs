@@ -44,7 +44,7 @@ use git::{
 };
 use git::{
     ExpandCommitEditor, GitHostingProviderRegistry, GitRemote, RestoreTrackedFiles, StageAll,
-    StashAll, StashApply, StashPop, StashStaged, StashTracked, ToggleCommitEditor,
+    StashAll, StashApply, StashPop, StashSelected, StashStaged, StashTracked, ToggleCommitEditor,
     ToggleFillCommitEditor, TrashUntrackedFiles, UnstageAll, ViewFile, parse_git_remote_url,
 };
 use gpui::{
@@ -299,6 +299,9 @@ impl Render for StashMessageModal {
     }
 }
 
+/// How many of the last commits `UseRecentCommitMessage` offers messages from.
+const RECENT_COMMIT_MESSAGE_COUNT: usize = 15;
+
 fn git_panel_context_menu(
     has_tracked_changes: bool,
     has_staged_tracked_changes: bool,
@@ -346,6 +349,12 @@ fn git_panel_context_menu(
             })
             .action_disabled_when(!has_stash_items, "Stash Pop", StashPop.boxed_clone())
             .action("View Stash", zed_actions::git::ViewStash.boxed_clone())
+            .separator()
+            .action(
+                "Use a Recent Commit Message…",
+                git::UseRecentCommitMessage.boxed_clone(),
+            )
+            .action("Update Submodules", git::UpdateSubmodules.boxed_clone())
             .when(include_copy_paths, |context_menu| {
                 context_menu
                     .separator()
@@ -3548,6 +3557,82 @@ impl GitPanel {
 
     pub fn stash_staged(&mut self, _: &StashStaged, window: &mut Window, cx: &mut Context<Self>) {
         self.prompt_for_stash_message(StashKind::Staged, window, cx);
+    }
+
+    fn use_recent_commit_message(
+        &mut self,
+        _: &git::UseRecentCommitMessage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.active_repository.clone() else {
+            return;
+        };
+        let receivers = repository.update(cx, |repository, _| {
+            (0..RECENT_COMMIT_MESSAGE_COUNT)
+                .map(|index| repository.show(format!("HEAD~{index}")))
+                .collect::<Vec<_>>()
+        });
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let mut messages: Vec<String> = Vec::new();
+            for receiver in receivers {
+                // A history shorter than the count runs out of revisions to show.
+                let Ok(Ok(details)) = receiver.await else {
+                    break;
+                };
+                let message = details.message.trim().to_string();
+                if !message.is_empty() && !messages.contains(&message) {
+                    messages.push(message);
+                }
+            }
+            let subjects = messages
+                .iter()
+                .map(|message| {
+                    SharedString::from(message.lines().next().unwrap_or_default().to_string())
+                })
+                .collect();
+            let selection = this.update_in(cx, |_, window, cx| {
+                picker_prompt::prompt("Recent commit messages", subjects, workspace, window, cx)
+            })?;
+            let Some(message) = selection.await.and_then(|index| messages.get(index)) else {
+                return anyhow::Ok(());
+            };
+            this.update_in(cx, |this, window, cx| {
+                this.commit_editor.update(cx, |editor, cx| {
+                    editor.set_text(message.clone(), window, cx);
+                });
+                this.commit_editor.focus_handle(cx).focus(window, cx);
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn stash_selected(&mut self, _: &StashSelected, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(active_repository) = self.active_repository.clone() else {
+            return;
+        };
+        let repo_paths = self
+            .effective_status_entries()
+            .into_iter()
+            .map(|entry| entry.repo_path)
+            .collect::<Vec<_>>();
+        if repo_paths.is_empty() {
+            return;
+        }
+        let task = active_repository.update(cx, |repository, cx| {
+            repository.stash_entries(repo_paths, None, cx)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    this.show_error_toast("stash", error, cx);
+                }
+                cx.notify();
+            })
+        })
+        .detach();
     }
 
     fn prompt_for_stash_message(
@@ -8404,6 +8489,11 @@ impl GitPanel {
                 &format!("Discard Changes to {file_count} {file_label}")
             }
         };
+        let stash_title = match target_kind {
+            SelectionTargetKind::Directory => "Stash Folder",
+            SelectionTargetKind::File => "Stash File",
+            SelectionTargetKind::Multiple => &format!("Stash {file_count} {file_label}"),
+        };
         let is_bulk = matches!(target_kind, SelectionTargetKind::Multiple);
         let is_file_or_bulk = !matches!(target_kind, SelectionTargetKind::Directory);
         let has_tracked = !all_created;
@@ -8431,6 +8521,7 @@ impl GitPanel {
                 .context(self.focus_handle.clone())
                 .action(stage_title, ToggleStaged.boxed_clone())
                 .action(restore_title, RestoreFile::default().boxed_clone())
+                .action(stash_title, StashSelected.boxed_clone())
                 .separator()
                 .action("Unstaged Changes", ViewUnstagedChanges.boxed_clone())
                 .action("Staged Changes", ViewStagedChanges.boxed_clone())
@@ -9384,6 +9475,8 @@ impl Render for GitPanel {
                     .on_action(cx.listener(Self::stash_all))
                     .on_action(cx.listener(Self::stash_tracked))
                     .on_action(cx.listener(Self::stash_staged))
+                    .on_action(cx.listener(Self::stash_selected))
+                    .on_action(cx.listener(Self::use_recent_commit_message))
                     .on_action(cx.listener(Self::stash_pop))
             })
             .on_action(cx.listener(Self::cancel))

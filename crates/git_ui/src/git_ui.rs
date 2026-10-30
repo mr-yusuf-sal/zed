@@ -21,7 +21,10 @@ use notifications::status_toast::StatusToast;
 use project::git_store::Repository;
 use project_diff::ProjectDiff;
 use time::OffsetDateTime;
-use ui::{ButtonLike, ContextMenu, ElevationIndex, PopoverMenuHandle, TintColor, prelude::*};
+use ui::{
+    ButtonLike, ContextMenu, ElevationIndex, PopoverMenu, PopoverMenuHandle, TintColor, Tooltip,
+    prelude::*,
+};
 use util::ResultExt as _;
 use workspace::{
     ModalView, OpenMode, Workspace,
@@ -266,6 +269,41 @@ pub fn init(cx: &mut App) {
             panel.update(cx, |panel, cx| {
                 panel.stash_staged(action, window, cx);
             });
+        });
+        workspace.register_action(|workspace, _: &git::UpdateSubmodules, window, cx| {
+            let Some(repository) = workspace.project().read(cx).active_repository(cx) else {
+                return;
+            };
+            let work_directory = repository
+                .read(cx)
+                .work_directory_abs_path
+                .to_string_lossy()
+                .into_owned();
+            let template = task::TaskTemplate {
+                label: "git submodule update --init --recursive".to_string(),
+                command: "git".to_string(),
+                args: ["submodule", "update", "--init", "--recursive"]
+                    .map(str::to_string)
+                    .to_vec(),
+                cwd: Some(work_directory),
+                reveal: task::RevealStrategy::NoFocus,
+                hide: task::HideStrategy::OnSuccess,
+                show_summary: true,
+                show_command: true,
+                ..task::TaskTemplate::default()
+            };
+            let Some(resolved_task) =
+                template.resolve_task("git-submodules", &task::TaskContext::default())
+            else {
+                return;
+            };
+            workspace.schedule_resolved_task(
+                project::TaskSourceKind::UserInput,
+                resolved_task,
+                false,
+                window,
+                cx,
+            );
         });
         workspace.register_action(|workspace, action: &git::StashTracked, window, cx| {
             let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
@@ -876,6 +914,335 @@ impl Render for CommitMessageModal {
                     .child(
                         Button::new("commit-message-confirm", self.confirm_label.clone())
                             .style(ButtonStyle::Filled)
+                            .key_binding(ui::KeyBinding::for_action_in(&Confirm, &focus_handle, cx))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm(&Confirm, window, cx);
+                            })),
+                    ),
+            )
+    }
+}
+
+pub(crate) type InteractiveRebaseConfirm = Box<dyn FnOnce(String, &mut Window, &mut App)>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RebaseAction {
+    Pick,
+    Squash,
+    Fixup,
+    Edit,
+    Drop,
+}
+
+impl RebaseAction {
+    const ALL: [Self; 5] = [
+        Self::Pick,
+        Self::Squash,
+        Self::Fixup,
+        Self::Edit,
+        Self::Drop,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pick => "Pick",
+            Self::Squash => "Squash",
+            Self::Fixup => "Fixup",
+            Self::Edit => "Edit",
+            Self::Drop => "Drop",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Pick => "Keep the commit as it is",
+            Self::Squash => "Fold into the commit below, keeping both messages",
+            Self::Fixup => "Fold into the commit below, keeping only its message",
+            Self::Edit => "Stop at the commit to amend it, then continue",
+            Self::Drop => "Remove the commit and its changes",
+        }
+    }
+
+    fn command(self) -> &'static str {
+        match self {
+            Self::Pick => "pick",
+            Self::Squash => "squash",
+            Self::Fixup => "fixup",
+            Self::Edit => "edit",
+            Self::Drop => "drop",
+        }
+    }
+
+    fn folds_into_previous(self) -> bool {
+        matches!(self, Self::Squash | Self::Fixup)
+    }
+}
+
+struct RebaseRow {
+    sha: Oid,
+    subject: SharedString,
+    action: RebaseAction,
+}
+
+/// Lets the commits from one commit up to HEAD be reordered, squashed, fixed
+/// up, stopped at or dropped, and hands the resulting `git rebase -i` todo
+/// list to `on_confirm`. Rows are newest first, like the graph, while the
+/// todo list git reads is oldest first.
+pub(crate) struct InteractiveRebaseModal {
+    rows: Vec<RebaseRow>,
+    original_order: Vec<Oid>,
+    on_confirm: Option<InteractiveRebaseConfirm>,
+    focus_handle: FocusHandle,
+}
+
+impl InteractiveRebaseModal {
+    pub(crate) fn new(
+        commits: Vec<(Oid, SharedString)>,
+        on_confirm: InteractiveRebaseConfirm,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            original_order: commits.iter().map(|(sha, _)| *sha).collect(),
+            rows: commits
+                .into_iter()
+                .map(|(sha, subject)| RebaseRow {
+                    sha,
+                    subject,
+                    action: RebaseAction::Pick,
+                })
+                .collect(),
+            on_confirm: Some(on_confirm),
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    /// The todo list, oldest commit first, or why it can't be run.
+    fn todo(&self) -> Result<String, &'static str> {
+        let mut lines = Vec::with_capacity(self.rows.len());
+        let mut has_kept_commit = false;
+        for row in self.rows.iter().rev() {
+            if row.action.folds_into_previous() && !has_kept_commit {
+                return Err(
+                    "The oldest kept commit can't be squashed or fixed up, as there is nothing below it to fold into",
+                );
+            }
+            if row.action != RebaseAction::Drop {
+                has_kept_commit = true;
+            }
+            lines.push(format!("{} {}", row.action.command(), row.sha));
+        }
+        if !self.has_changes() {
+            return Err("Nothing to do yet");
+        }
+        Ok(lines.join("\n"))
+    }
+
+    fn has_changes(&self) -> bool {
+        self.rows.iter().any(|row| row.action != RebaseAction::Pick)
+            || self.rows.iter().enumerate().any(|(index, row)| {
+                self.original_order
+                    .get(index)
+                    .is_some_and(|original| *original != row.sha)
+            })
+    }
+
+    fn set_action(&mut self, index: usize, action: RebaseAction, cx: &mut Context<Self>) {
+        if let Some(row) = self.rows.get_mut(index) {
+            row.action = action;
+            cx.notify();
+        }
+    }
+
+    fn move_row(&mut self, index: usize, toward_newer: bool, cx: &mut Context<Self>) {
+        let other = if toward_newer {
+            index.checked_sub(1)
+        } else {
+            Some(index + 1).filter(|other| *other < self.rows.len())
+        };
+        if let Some(other) = other
+            && index < self.rows.len()
+        {
+            self.rows.swap(index, other);
+            cx.notify();
+        }
+    }
+
+    fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let Ok(todo) = self.todo() else {
+            return;
+        };
+        if let Some(on_confirm) = self.on_confirm.take() {
+            on_confirm(todo, window, cx);
+        }
+        cx.emit(DismissEvent);
+    }
+
+    fn render_row(&self, index: usize, row: &RebaseRow, cx: &mut Context<Self>) -> AnyElement {
+        let this = cx.weak_entity();
+        let is_dropped = row.action == RebaseAction::Drop;
+        let action_menu = PopoverMenu::new(("rebase-action", index))
+            .trigger(
+                Button::new(("rebase-action-button", index), row.action.label())
+                    .label_size(LabelSize::Small)
+                    .style(ButtonStyle::OutlinedGhost)
+                    .end_icon(
+                        Icon::new(IconName::ChevronDown)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            )
+            .menu(move |window, cx| {
+                let this = this.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    for action in RebaseAction::ALL {
+                        let this = this.clone();
+                        menu = menu.item(
+                            ui::ContextMenuEntry::new(action.label())
+                                .handler(move |_, cx| {
+                                    this.update(cx, |this, cx| {
+                                        this.set_action(index, action, cx);
+                                    })
+                                    .log_err();
+                                })
+                                .documentation_aside(ui::DocumentationSide::Right, move |_| {
+                                    Label::new(action.description()).into_any_element()
+                                }),
+                        );
+                    }
+                    menu
+                }))
+            });
+
+        h_flex()
+            .w_full()
+            .px_3()
+            .py_0p5()
+            .gap_2()
+            .child(div().w(rems(6.)).child(action_menu))
+            .child(
+                Label::new(row.sha.display_short())
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                div().flex_1().min_w_0().child(
+                    Label::new(row.subject.clone())
+                        .size(LabelSize::Small)
+                        .when(is_dropped, |label| {
+                            label.strikethrough().color(Color::Disabled)
+                        })
+                        .truncate(),
+                ),
+            )
+            .child(
+                IconButton::new(("rebase-move-up", index), IconName::ArrowUp)
+                    .icon_size(IconSize::Small)
+                    .disabled(index == 0)
+                    .tooltip(Tooltip::text("Move toward newer"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.move_row(index, true, cx);
+                    })),
+            )
+            .child(
+                IconButton::new(("rebase-move-down", index), IconName::ArrowDown)
+                    .icon_size(IconSize::Small)
+                    .disabled(index + 1 == self.rows.len())
+                    .tooltip(Tooltip::text("Move toward older"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.move_row(index, false, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+}
+
+impl EventEmitter<DismissEvent> for InteractiveRebaseModal {}
+impl ModalView for InteractiveRebaseModal {}
+impl Focusable for InteractiveRebaseModal {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for InteractiveRebaseModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let focus_handle = self.focus_handle.clone();
+        let todo = self.todo();
+        let rows = self
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| self.render_row(index, row, cx))
+            .collect::<Vec<_>>();
+
+        v_flex()
+            .key_context("GitInteractiveRebaseModal")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .elevation_2(cx)
+            .w(rems(44.))
+            .child(
+                v_flex()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .gap_0p5()
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .child(Icon::new(IconName::GitBranch).size(IconSize::XSmall))
+                            .child(
+                                Headline::new("Interactive Rebase").size(HeadlineSize::XSmall),
+                            ),
+                    )
+                    .child(
+                        Label::new(
+                            "Newest commit at the top. Squash and fixup fold a commit into the one below it.",
+                        )
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .id("interactive-rebase-rows")
+                    .max_h(rems(28.))
+                    .overflow_y_scroll()
+                    .children(rows),
+            )
+            .child(
+                h_flex()
+                    .p_3()
+                    .w_full()
+                    .gap_1()
+                    .child(div().flex_1().min_w_0().when_some(
+                        todo.as_ref().err().copied(),
+                        |this, blocker| {
+                            this.child(
+                                Label::new(blocker)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            )
+                        },
+                    ))
+                    .child(
+                        Button::new("interactive-rebase-cancel", "Cancel")
+                            .key_binding(ui::KeyBinding::for_action_in(&Cancel, &focus_handle, cx))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.cancel(&Cancel, window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("interactive-rebase-confirm", "Start Rebase")
+                            .style(ButtonStyle::Filled)
+                            .disabled(todo.is_err())
                             .key_binding(ui::KeyBinding::for_action_in(&Confirm, &focus_handle, cx))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.confirm(&Confirm, window, cx);
