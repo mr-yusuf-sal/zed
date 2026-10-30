@@ -87,6 +87,12 @@ actions!(
         StashTracked,
         /// Stashes staged changes in the repository, leaving unstaged changes in place.
         StashStaged,
+        /// Stashes the selected files, untracked ones included, leaving other changes in place.
+        StashSelected,
+        /// Initializes and updates the repository's submodules, recursively.
+        UpdateSubmodules,
+        /// Starts the commit message from one of the last commits' messages.
+        UseRecentCommitMessage,
         /// Pops the most recent stash.
         StashPop,
         /// Apply the most recent stash.

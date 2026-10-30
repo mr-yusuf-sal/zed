@@ -1,19 +1,22 @@
 use askpass::AskPassDelegate;
 use editor::Editor;
 use git::{
-    repository::{CommitOptions, RepoPath},
+    repository::{CommitOptions, LogSource, RepoPath},
     status::FileStatus,
 };
 use git_ui_core::{askpass_modal::AskPassModal, notifications::show_error_toast};
 use gpui::{
-    AnyElement, App, AsyncApp, Context, Entity, FocusHandle, Focusable, PromptLevel, Render,
-    SharedString, Subscription, Task, WeakEntity, Window,
+    AnyElement, App, AsyncApp, ClipboardItem, Context, Entity, FocusHandle, Focusable, PromptLevel,
+    Render, SharedString, Subscription, Task, WeakEntity, Window,
 };
 use project::{
     Project, ProjectPath,
     git_store::{GitStore, GitStoreEvent, Repository, RepositoryEvent, RepositoryId},
 };
-use ui::{DiffStat, ListItem, ListItemSpacing, Tooltip, prelude::*};
+use ui::{
+    ContextMenu, ContextMenuEntry, DiffStat, ListItem, ListItemSpacing, Tooltip, prelude::*,
+    right_click_menu,
+};
 use util::ResultExt as _;
 use workspace::Workspace;
 
@@ -241,6 +244,9 @@ impl WorkingTreeChanges {
         let repository_handle = repository.repository.clone();
         let diff_repository = repository.repository.clone();
         let repo_path = file.repo_path.clone();
+        let menu_this = cx.weak_entity();
+        let menu_repository = repository.repository.clone();
+        let menu_file = file.clone();
         let (id, stat_id, icon, tooltip) = if staged {
             (
                 "staged-change",
@@ -256,7 +262,7 @@ impl WorkingTreeChanges {
                 "Stage File",
             )
         };
-        ListItem::new((id, row_index))
+        let list_item = ListItem::new((id, row_index))
             .spacing(ListItemSpacing::Dense)
             .start_slot(git_status_icon(file.status))
             .child(
@@ -346,8 +352,211 @@ impl WorkingTreeChanges {
                         })
                         .log_err();
                 });
+            });
+
+        right_click_menu((
+            if staged {
+                "staged-change-menu"
+            } else {
+                "unstaged-change-menu"
+            },
+            row_index,
+        ))
+        .trigger(move |_, _, _| list_item)
+        .maybe_menu(move |window, cx| {
+            let this = menu_this.upgrade()?;
+            Some(this.update(cx, |this, cx| {
+                this.file_context_menu(
+                    menu_repository.clone(),
+                    menu_file.clone(),
+                    staged,
+                    window,
+                    cx,
+                )
+            }))
+        })
+        .into_any_element()
+    }
+
+    fn file_context_menu(
+        &self,
+        repository: WeakEntity<Repository>,
+        file: ChangedFile,
+        staged: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ContextMenu> {
+        let this = cx.entity();
+        let is_untracked = file.status.is_untracked();
+        ContextMenu::build(window, cx, move |menu, window, _| {
+            menu.entry("Open File", None, {
+                let project_path = file.project_path.clone();
+                window.handler_for(&this, move |this, window, cx| {
+                    this.open_file(project_path.clone(), window, cx);
+                })
             })
-            .into_any_element()
+            .item(
+                ContextMenuEntry::new("File History")
+                    .disabled(is_untracked)
+                    .handler({
+                        let repository = repository.clone();
+                        let repo_path = file.repo_path.clone();
+                        window.handler_for(&this, move |this, window, cx| {
+                            this.open_file_history(&repository, repo_path.clone(), window, cx);
+                        })
+                    }),
+            )
+            .separator()
+            .entry(if staged { "Unstage File" } else { "Stage File" }, None, {
+                let repository = repository.clone();
+                let repo_path = file.repo_path.clone();
+                window.handler_for(&this, move |this, _, cx| {
+                    this.set_staged(&repository, vec![repo_path.clone()], !staged, cx);
+                })
+            })
+            .entry(
+                if file.status.is_created() {
+                    "Trash File…"
+                } else {
+                    "Discard Changes…"
+                },
+                None,
+                {
+                    let repository = repository.clone();
+                    let file = file.clone();
+                    window.handler_for(&this, move |this, window, cx| {
+                        this.discard(&repository, vec![file.clone()], window, cx);
+                    })
+                },
+            )
+            .entry("Stash File", None, {
+                let repository = repository.clone();
+                let repo_path = file.repo_path.clone();
+                window.handler_for(&this, move |this, _, cx| {
+                    this.stash_files(&repository, vec![repo_path.clone()], cx);
+                })
+            })
+            .when(is_untracked, |menu| {
+                menu.entry("Add to .gitignore", None, {
+                    let repository = repository.clone();
+                    let repo_path = file.repo_path.clone();
+                    window.handler_for(&this, move |this, _, cx| {
+                        this.add_to_gitignore(&repository, repo_path.clone(), cx);
+                    })
+                })
+            })
+            .separator()
+            .entry("Copy Relative Path", None, {
+                let repo_path = file.repo_path.as_unix_str().to_string();
+                move |_, cx| cx.write_to_clipboard(ClipboardItem::new_string(repo_path.clone()))
+            })
+        })
+    }
+
+    fn open_file(
+        &self,
+        project_path: Option<ProjectPath>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project_path) = project_path else {
+            return;
+        };
+        let workspace = self.workspace.clone();
+        window.defer(cx, move |window, cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace
+                        .open_path(project_path, None, true, window, cx)
+                        .detach_and_log_err(cx);
+                })
+                .log_err();
+        });
+    }
+
+    fn open_file_history(
+        &self,
+        repository: &WeakEntity<Repository>,
+        repo_path: RepoPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = repository.upgrade() else {
+            return;
+        };
+        let repo_id = repository.read(cx).id;
+        let git_store = self.git_store.clone();
+        let workspace = self.workspace.clone();
+        // This list is shown inside the git graph, which opening the history
+        // updates, and the menu is handled while that graph may be updating.
+        window.defer(cx, move |window, cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    crate::git_graph::open_or_reuse_graph(
+                        workspace,
+                        repo_id,
+                        git_store,
+                        LogSource::Path(repo_path),
+                        None,
+                        window,
+                        cx,
+                    );
+                })
+                .log_err();
+        });
+    }
+
+    /// Stashes just these files, untracked ones included, leaving the rest
+    /// of the work tree as it is.
+    fn stash_files(
+        &mut self,
+        repository: &WeakEntity<Repository>,
+        repo_paths: Vec<RepoPath>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = repository.upgrade() else {
+            return;
+        };
+        let task = repository.update(cx, |repository, cx| {
+            repository.stash_entries(repo_paths, None, cx)
+        });
+        let workspace = self.workspace.clone();
+        cx.spawn(async move |_, cx| {
+            if let Err(error) = task.await {
+                cx.update(|cx| {
+                    if let Some(workspace) = workspace.upgrade() {
+                        show_error_toast(workspace, "stash", error, cx);
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn add_to_gitignore(
+        &mut self,
+        repository: &WeakEntity<Repository>,
+        repo_path: RepoPath,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = repository.upgrade() else {
+            return;
+        };
+        let receiver = repository.update(cx, |repository, _| {
+            repository.add_path_to_gitignore(&repo_path, false)
+        });
+        let workspace = self.workspace.clone();
+        cx.spawn(async move |_, cx| {
+            if let Err(error) = receiver.await? {
+                cx.update(|cx| {
+                    if let Some(workspace) = workspace.upgrade() {
+                        show_error_toast(workspace, "add to .gitignore", error, cx);
+                    }
+                });
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn set_staged(
