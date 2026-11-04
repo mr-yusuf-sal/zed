@@ -612,9 +612,8 @@ impl TerminalPanel {
         };
         // Like a new terminal, a split asks which project it starts in.
         let directories = working_directory_choices(workspace, cx);
-        let picked = (directories.len() > 1).then(|| {
-            pick_working_directory(directories, weak_workspace.clone(), window, cx)
-        });
+        let picked = (directories.len() > 1)
+            .then(|| pick_working_directory(directories, weak_workspace.clone(), window, cx));
         cx.spawn_in(window, async move |panel, cx| {
             let working_directory = match picked {
                 Some(picked) => Some(picked.await?),
