@@ -2353,7 +2353,10 @@ impl MarkdownElement {
                             }
                         }
 
-                        if markdown.pressed_footnote_ref.is_none()
+                        // Only the left button selects text; a middle click would otherwise
+                        // highlight everything the mouse passes over until it is released.
+                        if event.button == MouseButton::Left
+                            && markdown.pressed_footnote_ref.is_none()
                             && markdown.pressed_link.is_none()
                         {
                             let source_index = match position_result {
