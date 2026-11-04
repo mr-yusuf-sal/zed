@@ -560,8 +560,7 @@ fn redis_preview_every_type() {
             // cannot be edited in place: every one of their columns is a key or read-only.
             let target = result.edit_target.as_ref().expect("an edit target");
             let editable = (0..result.columns.len()).any(|column| {
-                !target.key_columns.contains(&column)
-                    && !target.read_only_columns.contains(&column)
+                !target.key_columns.contains(&column) && !target.read_only_columns.contains(&column)
             });
             assert_eq!(
                 editable,
@@ -1302,11 +1301,19 @@ fn clickhouse_and_mongodb_explain() {
         let mongo = mongo_driver().await;
         let plan = single(
             mongo
-                .explain("{\"find\": \"orders\", \"filter\": {\"status\": \"paid\"}}", Some("app"), true)
+                .explain(
+                    "{\"find\": \"orders\", \"filter\": {\"status\": \"paid\"}}",
+                    Some("app"),
+                    true,
+                )
                 .await
                 .expect("mongodb explain"),
         );
-        let text: Vec<&str> = plan.rows.iter().filter_map(|row| row[0].as_deref()).collect();
+        let text: Vec<&str> = plan
+            .rows
+            .iter()
+            .filter_map(|row| row[0].as_deref())
+            .collect();
         assert!(text.iter().any(|line| line.contains("queryPlanner")));
         assert!(text.iter().any(|line| line.contains("executionStats")));
     });
@@ -1323,14 +1330,21 @@ fn redis_find_and_change_keys() {
             "SET quarry_live_keys:b 2",
             "SET quarry_live_keys:other 3",
         ] {
-            driver.query(statement, Some("db0"), 10).await.expect(statement);
+            driver
+                .query(statement, Some("db0"), 10)
+                .await
+                .expect(statement);
         }
 
         let found = driver
             .search(&path(&["db0", "quarry_live_keys"]), "?")
             .await
             .expect("searching");
-        let keys: Vec<&str> = found.rows.iter().filter_map(|row| row[0].as_deref()).collect();
+        let keys: Vec<&str> = found
+            .rows
+            .iter()
+            .filter_map(|row| row[0].as_deref())
+            .collect();
         assert_eq!(keys, ["quarry_live_keys:a", "quarry_live_keys:b"]);
 
         let a = path(&["db0", "quarry_live_keys", "a"]);
@@ -1338,13 +1352,23 @@ fn redis_find_and_change_keys() {
             .key_action(&a, &KeyAction::Expire(Some(600)))
             .await
             .expect("expiring");
-        let ttl = single(driver.query("TTL quarry_live_keys:a", Some("db0"), 10).await.unwrap());
+        let ttl = single(
+            driver
+                .query("TTL quarry_live_keys:a", Some("db0"), 10)
+                .await
+                .unwrap(),
+        );
         assert!(cell(&ttl, 0, "reply").is_some_and(|seconds| seconds != "-1"));
         driver
             .key_action(&a, &KeyAction::Expire(None))
             .await
             .expect("persisting");
-        let ttl = single(driver.query("TTL quarry_live_keys:a", Some("db0"), 10).await.unwrap());
+        let ttl = single(
+            driver
+                .query("TTL quarry_live_keys:a", Some("db0"), 10)
+                .await
+                .unwrap(),
+        );
         assert_eq!(cell(&ttl, 0, "reply"), Some("-1"));
 
         // Renaming onto an existing key is refused rather than overwriting it.
@@ -1359,11 +1383,18 @@ fn redis_find_and_change_keys() {
             .await
             .expect("renaming");
         let c = path(&["db0", "quarry_live_keys", "c"]);
-        driver.key_action(&c, &KeyAction::Delete).await.expect("deleting");
+        driver
+            .key_action(&c, &KeyAction::Delete)
+            .await
+            .expect("deleting");
         assert!(driver.key_action(&c, &KeyAction::Delete).await.is_err());
 
         driver
-            .query("DEL quarry_live_keys:b quarry_live_keys:other", Some("db0"), 10)
+            .query(
+                "DEL quarry_live_keys:b quarry_live_keys:other",
+                Some("db0"),
+                10,
+            )
             .await
             .expect("cleaning up");
     });
@@ -1374,7 +1405,10 @@ fn redis_find_and_change_keys() {
 fn mongodb_rows_keep_their_documents() {
     runtime().block_on(async {
         let driver = mongo_driver().await;
-        let preview = driver.preview(&path(&["app", "orders"]), 5).await.expect("preview");
+        let preview = driver
+            .preview(&path(&["app", "orders"]), 5)
+            .await
+            .expect("preview");
         assert_eq!(preview.documents.len(), preview.rows.len());
         let first = preview.documents[0].as_deref().expect("a document");
         let json: serde_json::Value = serde_json::from_str(first).expect("indented JSON");

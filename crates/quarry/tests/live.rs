@@ -1394,7 +1394,11 @@ fn postgres_explain() {
         let driver = postgres().await;
         let plan = only(
             driver
-                .explain("SELECT * FROM shop.orders WHERE id = 1;", Some("app"), false)
+                .explain(
+                    "SELECT * FROM shop.orders WHERE id = 1;",
+                    Some("app"),
+                    false,
+                )
                 .await
                 .expect("explain"),
         );
@@ -1406,12 +1410,11 @@ fn postgres_explain() {
                 .await
                 .expect("explain analyze"),
         );
-        assert!(
-            measured
-                .rows
-                .iter()
-                .any(|row| row[0].as_deref().is_some_and(|line| line.contains("actual")))
-        );
+        assert!(measured.rows.iter().any(|row| {
+            row[0]
+                .as_deref()
+                .is_some_and(|line| line.contains("actual"))
+        }));
     });
 }
 
@@ -1421,17 +1424,35 @@ fn sqlserver_explain_leaves_the_session_as_it_was() {
     runtime().block_on(async {
         let driver = sqlserver().await;
         let plan = driver
-            .explain("SELECT * FROM sales.Stores WHERE StoreId = 1", Some("app"), false)
+            .explain(
+                "SELECT * FROM sales.Stores WHERE StoreId = 1",
+                Some("app"),
+                false,
+            )
             .await
             .expect("explain");
-        assert!(plan[0].columns.iter().any(|column| column.as_ref() == "StmtText"));
+        assert!(
+            plan[0]
+                .columns
+                .iter()
+                .any(|column| column.as_ref() == "StmtText")
+        );
         let measured = driver
             .explain("SELECT COUNT(*) FROM sales.Stores", Some("app"), true)
             .await
             .expect("explain analyze");
-        assert_eq!(measured.len(), 2, "the result, then its profile: {measured:#?}");
+        assert_eq!(
+            measured.len(),
+            2,
+            "the result, then its profile: {measured:#?}"
+        );
         // SHOWPLAN_ALL and STATISTICS PROFILE are switched off again, so a query runs.
-        let after = only(driver.query("SELECT 1 AS one", Some("app"), 10).await.expect("after"));
+        let after = only(
+            driver
+                .query("SELECT 1 AS one", Some("app"), 10)
+                .await
+                .expect("after"),
+        );
         assert_eq!(after.columns, vec![SharedString::from("one")]);
         assert_eq!(cell(&after, 0, 0).as_deref(), Some("1"));
     });
@@ -1634,10 +1655,22 @@ fn tls_modes_reach_the_drivers() {
     use quarry::driver::TlsMode;
     runtime().block_on(async {
         let postgres = |tls| {
-            PostgresDriver::connect_with("localhost", 55432, Some("app"), Some("app"), Some("app"), tls)
+            PostgresDriver::connect_with(
+                "localhost",
+                55432,
+                Some("app"),
+                Some("app"),
+                Some("app"),
+                tls,
+            )
         };
-        postgres(TlsMode::Disable).await.expect("postgres without TLS");
-        let refused = postgres(TlsMode::Require).await.err().expect("TLS is required");
+        postgres(TlsMode::Disable)
+            .await
+            .expect("postgres without TLS");
+        let refused = postgres(TlsMode::Require)
+            .await
+            .err()
+            .expect("TLS is required");
         println!("postgres require: {refused:#}");
 
         let sqlserver = |tls| {
@@ -1650,8 +1683,12 @@ fn tls_modes_reach_the_drivers() {
                 tls,
             )
         };
-        sqlserver(TlsMode::Default).await.expect("sql server trusting its certificate");
-        sqlserver(TlsMode::Disable).await.expect("sql server without TLS");
+        sqlserver(TlsMode::Default)
+            .await
+            .expect("sql server trusting its certificate");
+        sqlserver(TlsMode::Disable)
+            .await
+            .expect("sql server without TLS");
         // The container's certificate is self-signed, so checking it has to fail.
         let refused = sqlserver(TlsMode::Verify)
             .await
@@ -1686,8 +1723,15 @@ fn only_commented_out_drops(remaining: &quarry::schema_diff::SchemaDiff) {
     let [change] = remaining.changed.as_slice() else {
         panic!("only the dropped column should differ: {remaining:#?}");
     };
-    assert!(change.added.is_empty() && change.changed.is_empty(), "{remaining:#?}");
-    let dropped: Vec<&str> = change.dropped.iter().map(|column| column.name.as_str()).collect();
+    assert!(
+        change.added.is_empty() && change.changed.is_empty(),
+        "{remaining:#?}"
+    );
+    let dropped: Vec<&str> = change
+        .dropped
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect();
     assert_eq!(dropped, ["legacy"]);
 }
 
@@ -1760,7 +1804,10 @@ fn sqlserver_schema_compare() {
                  legacy nvarchar(max) NULL);
              CREATE TABLE quarry_cmp_b.audit (id int);",
         ] {
-            driver.query(statement, Some("app"), 10).await.expect(statement);
+            driver
+                .query(statement, Some("app"), 10)
+                .await
+                .expect(statement);
         }
         let remaining = compare_and_apply(
             driver.as_ref(),
@@ -1778,7 +1825,11 @@ fn sqlserver_schema_compare() {
         let [change] = remaining.changed.as_slice() else {
             panic!("only orders should differ: {remaining:#?}");
         };
-        let dropped: Vec<&str> = change.dropped.iter().map(|column| column.name.as_str()).collect();
+        let dropped: Vec<&str> = change
+            .dropped
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect();
         assert_eq!(dropped, ["legacy"]);
         assert!(change.added.is_empty(), "{remaining:#?}");
         let changed: Vec<&str> = change
