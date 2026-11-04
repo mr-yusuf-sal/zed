@@ -147,7 +147,7 @@ impl MainPage {
         }
     }
 
-    fn is_active(&self, cx: &App) -> bool {
+    fn is_active(&self, cx: &Context<Self>) -> bool {
         self.workspace
             .upgrade()
             .and_then(|workspace| workspace.read(cx).active_item(cx))
