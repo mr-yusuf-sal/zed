@@ -28,7 +28,8 @@ use multi_buffer::PathKey;
 use project::{
     Project, ProjectPath, WorktreeId,
     git_store::{
-        CommitDiff, CommitFile, GitGraphEvent, Repository, RepositoryEvent, UnshallowState,
+        CommitDiff, CommitFile, GitGraphEvent, Repository, RepositoryEvent, RepositoryId,
+        UnshallowState,
     },
 };
 use settings::{DiffViewStyle, Settings};
@@ -421,6 +422,7 @@ impl CommitView {
             .clone()
             .filter(|_| stash.is_none() && older_commit.is_none());
         let commit_sha = commit.sha.clone();
+        let weak_editor = editor.downgrade();
 
         let load_diff_task = cx.spawn_in(window, async move |this, cx| {
             let mut binary_buffer_ids: HashSet<language::BufferId> = HashSet::default();
@@ -428,7 +430,7 @@ impl CommitView {
 
             for file in commit_diff.files {
                 let loaded = add_commit_file(
-                    &this,
+                    &weak_editor,
                     file,
                     &short_revision,
                     None,
@@ -466,9 +468,9 @@ impl CommitView {
 
             if let Some(history_path) = history_path {
                 add_file_history(
-                    &this,
+                    &weak_editor,
                     history_path,
-                    &commit_sha,
+                    Some(&commit_sha),
                     &repository_clone,
                     &project_clone,
                     &language_registry,
@@ -1249,7 +1251,7 @@ struct LoadedCommitFile {
 /// the view under `sort_prefix`, which keeps the same path from different commits
 /// in separate excerpts.
 async fn add_commit_file(
-    this: &WeakEntity<CommitView>,
+    editor: &WeakEntity<SplittableEditor>,
     file: CommitFile,
     revision_label: &str,
     commit_subject: Option<&str>,
@@ -1353,20 +1355,18 @@ async fn add_commit_file(
         let is_first_batch = batch_end == 0;
         batch_end = (batch_end + EXCERPT_BATCH_SIZE).min(total);
         let ranges = excerpt_ranges[..batch_end].to_vec();
-        this.update_in(cx, |this, window, cx| {
-            this.editor.update(cx, |editor, cx| {
-                editor.update_excerpts_for_path(
-                    path.clone(),
-                    buffer.clone(),
-                    ranges,
-                    multibuffer_context_lines(cx),
-                    buffer_diff.clone(),
-                    cx,
-                );
-                if is_first_batch && editor.diff_view_style() == DiffViewStyle::Split {
-                    editor.split(window, cx);
-                }
-            });
+        editor.update_in(cx, |editor, window, cx| {
+            editor.update_excerpts_for_path(
+                path.clone(),
+                buffer.clone(),
+                ranges,
+                multibuffer_context_lines(cx),
+                buffer_diff.clone(),
+                cx,
+            );
+            if is_first_batch && editor.diff_view_style() == DiffViewStyle::Split {
+                editor.split(window, cx);
+            }
         })?;
         if batch_end < total {
             yield_now().await;
@@ -1387,10 +1387,11 @@ const FILE_HISTORY_COMMIT_LIMIT: usize = 50;
 
 /// Appends, newest first, what the commits before `commit_sha` changed in
 /// `path`, taken from the same path history the git graph shows for a file.
+/// Without `commit_sha` it starts at the newest commit that changed the file.
 async fn add_file_history(
-    this: &WeakEntity<CommitView>,
+    editor: &WeakEntity<SplittableEditor>,
     path: RepoPath,
-    commit_sha: &str,
+    commit_sha: Option<&str>,
     repository: &Entity<Repository>,
     project: &Entity<Project>,
     language_registry: &Arc<LanguageRegistry>,
@@ -1436,14 +1437,18 @@ async fn add_file_history(
         if let Some(error) = &graph_data.error {
             anyhow::bail!("failed to load file history: {error}");
         }
-        Ok(graph_data
+        let shas = graph_data
             .commit_data
             .iter()
-            .map(|commit| commit.sha.to_string())
-            .skip_while(|sha| sha != commit_sha)
-            .skip(1)
-            .take(FILE_HISTORY_COMMIT_LIMIT)
-            .collect())
+            .map(|commit| commit.sha.to_string());
+        Ok(match commit_sha {
+            Some(commit_sha) => shas
+                .skip_while(|sha| sha != commit_sha)
+                .skip(1)
+                .take(FILE_HISTORY_COMMIT_LIMIT)
+                .collect(),
+            None => shas.take(FILE_HISTORY_COMMIT_LIMIT).collect(),
+        })
     })??;
 
     for (index, sha) in earlier_shas.into_iter().enumerate() {
@@ -1469,7 +1474,7 @@ async fn add_file_history(
             .filter(|file| file.path == path)
         {
             let loaded = add_commit_file(
-                this,
+                editor,
                 file,
                 short_sha(&sha),
                 subject.as_deref(),
@@ -1480,22 +1485,300 @@ async fn add_file_history(
                 cx,
             )
             .await?;
-            this.update(cx, |this, cx| {
-                this.editor.update(cx, |editor, cx| {
-                    editor.rhs_editor().update(cx, |editor, cx| {
-                        if let Some(addon) = editor.addon_mut::<CommitDiffAddon>() {
-                            addon.file_statuses.insert(loaded.buffer_id, loaded.status);
-                        }
-                        if loaded.is_binary {
-                            editor.fold_buffers([loaded.buffer_id], cx);
-                        }
-                    });
+            editor.update(cx, |editor, cx| {
+                editor.rhs_editor().update(cx, |editor, cx| {
+                    if let Some(addon) = editor.addon_mut::<CommitDiffAddon>() {
+                        addon.file_statuses.insert(loaded.buffer_id, loaded.status);
+                    }
+                    if loaded.is_binary {
+                        editor.fold_buffers([loaded.buffer_id], cx);
+                    }
                 });
             })?;
         }
     }
 
     Ok(())
+}
+
+/// A file's uncommitted changes against HEAD, followed by what the commits
+/// before them changed in it, the way a commit view opened for one file shows
+/// that file's earlier commits.
+pub struct FileHistoryView {
+    path: RepoPath,
+    repository_id: RepositoryId,
+    editor: Entity<SplittableEditor>,
+    _load_task: Task<()>,
+}
+
+impl FileHistoryView {
+    pub fn open(
+        path: RepoPath,
+        repository: Entity<Repository>,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let repository_id = repository.read(cx).id;
+        let existing = workspace.items_of_type::<Self>(cx).find(|view| {
+            let view = view.read(cx);
+            view.path == path && view.repository_id == repository_id
+        });
+        if let Some(existing) = existing {
+            workspace.activate_item(&existing, true, true, window, cx);
+            return;
+        }
+        let project = workspace.project().clone();
+        let workspace_entity = cx.entity();
+        let view = cx.new(|cx| Self::new(path, repository, project, workspace_entity, window, cx));
+        workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+    }
+
+    fn new(
+        path: RepoPath,
+        repository: Entity<Repository>,
+        project: Entity<Project>,
+        workspace_entity: Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let language_registry = project.read(cx).languages().clone();
+        let multibuffer = cx.new(|cx| {
+            let mut multibuffer = MultiBuffer::new(Capability::ReadOnly);
+            multibuffer.set_all_diff_hunks_expanded(cx);
+            multibuffer
+        });
+        let editor = cx.new(|cx| {
+            let editor = SplittableEditor::new(
+                EditorSettings::get_global(cx).diff_view_style,
+                multibuffer,
+                project.clone(),
+                workspace_entity,
+                window,
+                cx,
+            );
+            editor.set_diff_hunk_renderer(Some(Arc::new(HiddenDiffHunkRenderer)), cx);
+            editor.rhs_editor().update(cx, |editor, cx| {
+                editor.set_show_bookmarks(false, cx);
+                editor.set_show_breakpoints(false, cx);
+                // The earlier commits' buffers are not on disk, so their status
+                // comes from this addon, which has no commit view to open files from.
+                editor.register_addon(CommitDiffAddon {
+                    file_statuses: HashMap::default(),
+                    commit_view: WeakEntity::new_invalid(),
+                });
+            });
+            editor
+        });
+        let repository_id = repository.read(cx).id;
+        let weak_editor = editor.downgrade();
+        let load_task = cx.spawn_in(window, {
+            let path = path.clone();
+            async move |_, cx| {
+                add_uncommitted_changes(&weak_editor, &path, &repository, &project, cx)
+                    .await
+                    .log_err();
+                add_file_history(
+                    &weak_editor,
+                    path,
+                    None,
+                    &repository,
+                    &project,
+                    &language_registry,
+                    cx,
+                )
+                .await
+                .log_err();
+            }
+        });
+        Self {
+            path,
+            repository_id,
+            editor,
+            _load_task: load_task,
+        }
+    }
+
+    fn file_name(&self) -> SharedString {
+        self.path
+            .file_name()
+            .map(|name| SharedString::from(name.to_string()))
+            .unwrap_or_else(|| SharedString::from(self.path.as_unix_str().to_string()))
+    }
+}
+
+/// Adds the file's live buffer with its diff against HEAD, so the view shows
+/// the uncommitted changes and keeps up as the file is edited.
+async fn add_uncommitted_changes(
+    editor: &WeakEntity<SplittableEditor>,
+    path: &RepoPath,
+    repository: &Entity<Repository>,
+    project: &Entity<Project>,
+    cx: &mut AsyncWindowContext,
+) -> Result<()> {
+    let project_path = repository
+        .read_with(cx, |repository, cx| {
+            repository.repo_path_to_project_path(path, cx)
+        })
+        .context("file is outside the project's worktrees")?;
+    let buffer = project
+        .update(cx, |project, cx| project.open_buffer(project_path, cx))
+        .await?;
+    let buffer_diff = project
+        .update(cx, |project, cx| {
+            project.open_uncommitted_diff(buffer.clone(), cx)
+        })
+        .await?;
+    let excerpt_ranges = cx.update(|_, cx| {
+        let snapshot = buffer.read(cx).snapshot();
+        let diff_snapshot = buffer_diff.read(cx).snapshot(cx);
+        let mut hunks = diff_snapshot.hunks(&snapshot).peekable();
+        if hunks.peek().is_none() {
+            vec![language::Point::zero()..snapshot.max_point()]
+        } else {
+            hunks
+                .map(|hunk| hunk.buffer_range.to_point(&snapshot))
+                .collect::<Vec<_>>()
+        }
+    })?;
+    let rel_path: &Arc<RelPath> = path.as_ref();
+    let path_key = PathKey::with_sort_prefix(FILE_NAMESPACE_SORT_PREFIX, rel_path.clone());
+    editor.update_in(cx, |editor, window, cx| {
+        editor.update_excerpts_for_path(
+            path_key,
+            buffer,
+            excerpt_ranges,
+            multibuffer_context_lines(cx),
+            buffer_diff,
+            cx,
+        );
+        if editor.diff_view_style() == DiffViewStyle::Split {
+            editor.split(window, cx);
+        }
+    })?;
+    Ok(())
+}
+
+impl EventEmitter<EditorEvent> for FileHistoryView {}
+
+impl Focusable for FileHistoryView {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Item for FileHistoryView {
+    type Event = EditorEvent;
+
+    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
+        Some(Icon::new(IconName::Diff).color(Color::Muted))
+    }
+
+    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        format!("{} — History", self.file_name()).into()
+    }
+
+    fn tab_tooltip_text(&self, _: &App) -> Option<SharedString> {
+        Some(
+            format!(
+                "Uncommitted changes and history of {}",
+                self.path.as_unix_str()
+            )
+            .into(),
+        )
+    }
+
+    fn to_item_events(event: &EditorEvent, f: &mut dyn FnMut(ItemEvent)) {
+        Editor::to_item_events(event, f)
+    }
+
+    fn deactivated(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor
+            .update(cx, |editor, cx| editor.deactivated(window, cx));
+    }
+
+    fn act_as_type<'a>(
+        &'a self,
+        type_id: TypeId,
+        self_handle: &'a Entity<Self>,
+        cx: &'a App,
+    ) -> Option<gpui::AnyEntity> {
+        if type_id == TypeId::of::<Self>() {
+            Some(self_handle.clone().into())
+        } else if type_id == TypeId::of::<SplittableEditor>() {
+            Some(self.editor.clone().into())
+        } else if type_id == TypeId::of::<Editor>() {
+            Some(self.editor.read(cx).rhs_editor().clone().into())
+        } else {
+            None
+        }
+    }
+
+    fn as_searchable(&self, _: &Entity<Self>, _: &App) -> Option<Box<dyn SearchableItemHandle>> {
+        Some(Box::new(self.editor.clone()))
+    }
+
+    fn set_nav_history(
+        &mut self,
+        nav_history: ItemNavHistory,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor.update(cx, |editor, cx| {
+            editor.rhs_editor().update(cx, |editor, _| {
+                editor.set_nav_history(Some(nav_history));
+            });
+        });
+    }
+
+    fn navigate(
+        &mut self,
+        data: Arc<dyn Any + Send>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.editor
+            .update(cx, |editor, cx| editor.navigate(data, window, cx))
+    }
+
+    fn added_to_workspace(
+        &mut self,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor.update(cx, |editor, cx| {
+            editor.added_to_workspace(workspace, window, cx)
+        });
+    }
+}
+
+impl Render for FileHistoryView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .size_full()
+            .bg(cx.theme().colors().editor_background)
+            .child(
+                h_flex()
+                    .px_3()
+                    .py_2()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(
+                        Icon::new(IconName::Diff)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new(self.path.as_unix_str().to_string()).truncate())
+                    .child(
+                        Label::new("Uncommitted changes, then earlier commits")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+            .child(div().flex_grow(1.).min_h_0().child(self.editor.clone()))
+    }
 }
 
 impl EventEmitter<EditorEvent> for CommitView {}
