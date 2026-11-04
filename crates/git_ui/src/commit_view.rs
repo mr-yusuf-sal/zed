@@ -16,8 +16,8 @@ use git::{
 use gpui::{
     AnyElement, App, AppContext as _, AsyncWindowContext, ClipboardItem, Context, Entity,
     EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
-    PromptLevel, Render, ScrollHandle, StatefulInteractiveElement as _, Styled, Task, WeakEntity,
-    Window, actions,
+    PromptLevel, Render, ScrollHandle, StatefulInteractiveElement as _, Styled, Subscription, Task,
+    WeakEntity, Window, actions,
 };
 use language::{
     Buffer, Capability, DiskState, File, LanguageRegistry, LineEnding, OffsetRangeExt as _,
@@ -28,8 +28,7 @@ use multi_buffer::PathKey;
 use project::{
     Project, ProjectPath, WorktreeId,
     git_store::{
-        CommitDiff, CommitFile, GitGraphEvent, Repository, RepositoryEvent, RepositoryId,
-        UnshallowState,
+        CommitDiff, CommitFile, GitGraphEvent, Repository, RepositoryEvent, UnshallowState,
     },
 };
 use settings::{DiffViewStyle, Settings};
@@ -418,10 +417,6 @@ impl CommitView {
         let repository_clone = repository.clone();
         let project_clone = project.clone();
 
-        let history_path = file_filter
-            .clone()
-            .filter(|_| stash.is_none() && older_commit.is_none());
-        let commit_sha = commit.sha.clone();
         let weak_editor = editor.downgrade();
 
         let load_diff_task = cx.spawn_in(window, async move |this, cx| {
@@ -465,20 +460,6 @@ impl CommitView {
                     });
                 }
             })?;
-
-            if let Some(history_path) = history_path {
-                add_file_history(
-                    &weak_editor,
-                    history_path,
-                    Some(&commit_sha),
-                    &repository_clone,
-                    &project_clone,
-                    &language_registry,
-                    cx,
-                )
-                .await
-                .log_err();
-            }
 
             anyhow::Ok(())
         });
@@ -1380,15 +1361,16 @@ async fn add_commit_file(
     })
 }
 
-/// How many earlier commits of the file a single-file commit view appends.
-/// Each one loads that commit's whole diff, so the full history of a file with
-/// thousands of commits would take long and fill the view with excerpts.
+/// How many earlier commits of the file a file history view appends. Each one
+/// loads that commit's whole diff, so the full history of a file with thousands
+/// of commits would take long and fill the view with excerpts.
 const FILE_HISTORY_COMMIT_LIMIT: usize = 50;
 
 /// Appends, newest first, what the commits before `commit_sha` changed in
 /// `path`, taken from the same path history the git graph shows for a file.
 /// Without `commit_sha` it starts at the newest commit that changed the file.
 async fn add_file_history(
+    this: &WeakEntity<FileHistoryView>,
     editor: &WeakEntity<SplittableEditor>,
     path: RepoPath,
     commit_sha: Option<&str>,
@@ -1452,66 +1434,123 @@ async fn add_file_history(
     })??;
 
     for (index, sha) in earlier_shas.into_iter().enumerate() {
-        let (commit_diff, commit_details) = repository.update(cx, |repository, cx| {
-            (
-                repository.load_commit_diff(sha.clone(), false, cx),
-                repository.show_commit(sha.clone(), cx),
-            )
-        });
-        let (commit_diff, commit_details) = futures::join!(commit_diff, commit_details);
-        let Some(commit_diff) = commit_diff.log_err() else {
-            continue;
-        };
-        let subject = commit_details
-            .log_err()
-            .map(|details| truncate_and_trailoff(commit_subject(&details.message), 50));
         let sort_prefix = FILE_NAMESPACE_SORT_PREFIX + 1 + index as u64;
-        // `--follow` also lists the commits from before a rename, whose diffs
-        // have the file under its old path, so those are left out.
-        for file in commit_diff
-            .files
-            .into_iter()
-            .filter(|file| file.path == path)
-        {
-            let loaded = add_commit_file(
-                editor,
-                file,
-                short_sha(&sha),
-                subject.as_deref(),
-                sort_prefix,
-                repository,
-                project,
-                language_registry,
-                cx,
-            )
-            .await?;
-            editor.update(cx, |editor, cx| {
-                editor.rhs_editor().update(cx, |editor, cx| {
-                    if let Some(addon) = editor.addon_mut::<CommitDiffAddon>() {
-                        addon.file_statuses.insert(loaded.buffer_id, loaded.status);
-                    }
-                    if loaded.is_binary {
-                        editor.fold_buffers([loaded.buffer_id], cx);
-                    }
-                });
-            })?;
-        }
+        add_commit_section(
+            this,
+            editor,
+            sha,
+            None,
+            &path,
+            sort_prefix,
+            repository,
+            project,
+            language_registry,
+            cx,
+        )
+        .await
+        .log_err();
     }
 
     Ok(())
 }
 
-/// A file's uncommitted changes against HEAD, followed by what the commits
-/// before them changed in it, the way a commit view opened for one file shows
-/// that file's earlier commits.
+/// Adds what the commit changed in `path` as one section of the view.
+/// `preloaded_file` is that change when the caller already read it from git.
+async fn add_commit_section(
+    this: &WeakEntity<FileHistoryView>,
+    editor: &WeakEntity<SplittableEditor>,
+    sha: String,
+    preloaded_file: Option<CommitFile>,
+    path: &RepoPath,
+    sort_prefix: u64,
+    repository: &Entity<Repository>,
+    project: &Entity<Project>,
+    language_registry: &Arc<LanguageRegistry>,
+    cx: &mut AsyncWindowContext,
+) -> Result<()> {
+    let commit_details =
+        repository.update(cx, |repository, cx| repository.show_commit(sha.clone(), cx));
+    let file = match preloaded_file {
+        Some(file) => Some(file),
+        None => {
+            let commit_diff = repository
+                .update(cx, |repository, cx| {
+                    repository.load_commit_diff(sha.clone(), false, cx)
+                })
+                .await?;
+            // `--follow` also lists the commits from before a rename, whose diffs
+            // have the file under its old path, so those find nothing here.
+            commit_diff
+                .files
+                .into_iter()
+                .find(|file| &file.path == path)
+        }
+    };
+    let Some(file) = file else {
+        return Ok(());
+    };
+    let commit_details = commit_details.await?;
+    let subject = truncate_and_trailoff(commit_subject(&commit_details.message), 50);
+    let loaded = add_commit_file(
+        editor,
+        file,
+        short_sha(&sha),
+        Some(&subject),
+        sort_prefix,
+        repository,
+        project,
+        language_registry,
+        cx,
+    )
+    .await?;
+    editor.update(cx, |editor, cx| {
+        editor.rhs_editor().update(cx, |editor, cx| {
+            if let Some(addon) = editor.addon_mut::<CommitDiffAddon>() {
+                addon.file_statuses.insert(loaded.buffer_id, loaded.status);
+            }
+            if loaded.is_binary {
+                editor.fold_buffers([loaded.buffer_id], cx);
+            }
+        });
+    })?;
+    this.update(cx, |this, cx| {
+        this.sections.push(FileHistorySection {
+            buffer_id: loaded.buffer_id,
+            commit: Some(commit_details),
+        });
+        this.update_current_section(cx);
+        cx.notify();
+    })?;
+    Ok(())
+}
+
+/// One file's changes over time: either its uncommitted changes or one
+/// commit's changes to it, followed by what the commits before changed in it.
+/// The header shows the commit of the section at the top of the scroll.
 pub struct FileHistoryView {
     path: RepoPath,
-    repository_id: RepositoryId,
+    repository: Entity<Repository>,
+    /// The commit the view starts at, or `None` when it starts at the
+    /// uncommitted changes.
+    start_sha: Option<SharedString>,
+    workspace: WeakEntity<Workspace>,
+    remote: Option<GitRemote>,
     editor: Entity<SplittableEditor>,
+    /// In the order they appear in the editor.
+    sections: Vec<FileHistorySection>,
+    current_section: usize,
+    _subscriptions: Vec<Subscription>,
     _load_task: Task<()>,
 }
 
+struct FileHistorySection {
+    buffer_id: language::BufferId,
+    /// `None` for the uncommitted changes.
+    commit: Option<CommitDetails>,
+}
+
 impl FileHistoryView {
+    /// Opens the file's uncommitted changes with its earlier commits below.
     pub fn open(
         path: RepoPath,
         repository: Entity<Repository>,
@@ -1519,10 +1558,46 @@ impl FileHistoryView {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        Self::open_at(path, repository, None, None, workspace, window, cx);
+    }
+
+    /// Opens what the commit changed in the file with its earlier commits below.
+    /// `preloaded_file` is that change when the caller already read it from git.
+    pub fn open_at_commit(
+        path: RepoPath,
+        repository: Entity<Repository>,
+        sha: SharedString,
+        preloaded_file: Option<CommitFile>,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        Self::open_at(
+            path,
+            repository,
+            Some(sha),
+            preloaded_file,
+            workspace,
+            window,
+            cx,
+        );
+    }
+
+    fn open_at(
+        path: RepoPath,
+        repository: Entity<Repository>,
+        start_sha: Option<SharedString>,
+        preloaded_file: Option<CommitFile>,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
         let repository_id = repository.read(cx).id;
         let existing = workspace.items_of_type::<Self>(cx).find(|view| {
             let view = view.read(cx);
-            view.path == path && view.repository_id == repository_id
+            view.path == path
+                && view.start_sha == start_sha
+                && view.repository.read(cx).id == repository_id
         });
         if let Some(existing) = existing {
             workspace.activate_item(&existing, true, true, window, cx);
@@ -1530,19 +1605,33 @@ impl FileHistoryView {
         }
         let project = workspace.project().clone();
         let workspace_entity = cx.entity();
-        let view = cx.new(|cx| Self::new(path, repository, project, workspace_entity, window, cx));
+        let view = cx.new(|cx| {
+            Self::new(
+                path,
+                repository,
+                start_sha,
+                preloaded_file,
+                project,
+                workspace_entity,
+                window,
+                cx,
+            )
+        });
         workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
     }
 
     fn new(
         path: RepoPath,
         repository: Entity<Repository>,
+        start_sha: Option<SharedString>,
+        preloaded_file: Option<CommitFile>,
         project: Entity<Project>,
         workspace_entity: Entity<Workspace>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let language_registry = project.read(cx).languages().clone();
+        let workspace = workspace_entity.downgrade();
         let multibuffer = cx.new(|cx| {
             let mut multibuffer = MultiBuffer::new(Capability::ReadOnly);
             multibuffer.set_all_diff_hunks_expanded(cx);
@@ -1561,8 +1650,8 @@ impl FileHistoryView {
             editor.rhs_editor().update(cx, |editor, cx| {
                 editor.set_show_bookmarks(false, cx);
                 editor.set_show_breakpoints(false, cx);
-                // The earlier commits' buffers are not on disk, so their status
-                // comes from this addon, which has no commit view to open files from.
+                // The commits' buffers are not on disk, so their status comes
+                // from this addon, which has no commit view to open files from.
                 editor.register_addon(CommitDiffAddon {
                     file_statuses: HashMap::default(),
                     commit_view: WeakEntity::new_invalid(),
@@ -1570,18 +1659,61 @@ impl FileHistoryView {
             });
             editor
         });
-        let repository_id = repository.read(cx).id;
+        let rhs_editor = editor.read(cx).rhs_editor().clone();
+        let scroll_subscription = cx.subscribe(&rhs_editor, |this, _, event: &EditorEvent, cx| {
+            if matches!(event, EditorEvent::ScrollPositionChanged { .. }) {
+                this.update_current_section(cx);
+            }
+        });
+
+        let snapshot = repository.read(cx).snapshot();
+        let remote = snapshot
+            .remote_upstream_url
+            .as_ref()
+            .or(snapshot.remote_origin_url.as_ref())
+            .and_then(|url| {
+                let provider_registry = GitHostingProviderRegistry::default_global(cx);
+                parse_git_remote_url(provider_registry, url).map(|(host, parsed)| GitRemote {
+                    host,
+                    owner: parsed.owner.into(),
+                    repo: parsed.repo.into(),
+                })
+            });
+
         let weak_editor = editor.downgrade();
         let load_task = cx.spawn_in(window, {
             let path = path.clone();
-            async move |_, cx| {
-                add_uncommitted_changes(&weak_editor, &path, &repository, &project, cx)
-                    .await
-                    .log_err();
+            let repository = repository.clone();
+            let start_sha = start_sha.clone();
+            async move |this, cx| {
+                match &start_sha {
+                    Some(start_sha) => {
+                        add_commit_section(
+                            &this,
+                            &weak_editor,
+                            start_sha.to_string(),
+                            preloaded_file,
+                            &path,
+                            FILE_NAMESPACE_SORT_PREFIX,
+                            &repository,
+                            &project,
+                            &language_registry,
+                            cx,
+                        )
+                        .await
+                        .log_err();
+                    }
+                    None => {
+                        add_uncommitted_changes(&this, &weak_editor, &path, &project, cx)
+                            .await
+                            .log_err();
+                    }
+                }
                 add_file_history(
+                    &this,
                     &weak_editor,
                     path,
-                    None,
+                    start_sha.as_deref(),
                     &repository,
                     &project,
                     &language_registry,
@@ -1593,8 +1725,14 @@ impl FileHistoryView {
         });
         Self {
             path,
-            repository_id,
+            repository,
+            start_sha,
+            workspace,
+            remote,
             editor,
+            sections: Vec::new(),
+            current_section: 0,
+            _subscriptions: vec![scroll_subscription],
             _load_task: load_task,
         }
     }
@@ -1605,21 +1743,213 @@ impl FileHistoryView {
             .map(|name| SharedString::from(name.to_string()))
             .unwrap_or_else(|| SharedString::from(self.path.as_unix_str().to_string()))
     }
+
+    /// Points the header at the section whose sticky buffer header is at the
+    /// top of the editor. Between two sections, where no header is sticky, the
+    /// header keeps showing the last one.
+    fn update_current_section(&mut self, cx: &mut Context<Self>) {
+        let rhs_editor = self.editor.read(cx).rhs_editor().clone();
+        let top_buffer_id = rhs_editor.update(cx, |editor, cx| {
+            let scroll_top = editor.scroll_position(cx).y;
+            editor
+                .display_snapshot(cx)
+                .sticky_header_excerpt(scroll_top)
+                .map(|header| header.excerpt.buffer_id())
+        });
+        let Some(index) = top_buffer_id.and_then(|buffer_id| {
+            self.sections
+                .iter()
+                .position(|section| section.buffer_id == buffer_id)
+        }) else {
+            return;
+        };
+        if index != self.current_section {
+            self.current_section = index;
+            cx.notify();
+        }
+    }
+
+    fn render_section_header(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let section_count = self.sections.len();
+        let position = Label::new(if section_count == 0 {
+            "Loading…".to_string()
+        } else {
+            format!("{} of {}", self.current_section + 1, section_count)
+        })
+        .size(LabelSize::Small)
+        .color(Color::Muted);
+        let path_row = h_flex()
+            .w_full()
+            .gap_2()
+            .justify_between()
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::Diff)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new(self.path.as_unix_str().to_string()).truncate()),
+            )
+            .child(position);
+
+        let commit = self
+            .sections
+            .get(self.current_section)
+            .map(|section| section.commit.as_ref());
+        let details = match commit {
+            Some(Some(commit)) => self.render_commit_details(commit, window, cx),
+            Some(None) => h_flex()
+                .gap_2()
+                .child(
+                    Icon::new(IconName::Pencil)
+                        .size(IconSize::Small)
+                        .color(Color::Modified),
+                )
+                .child(Label::new("Uncommitted Changes"))
+                .into_any_element(),
+            None => div().into_any_element(),
+        };
+
+        v_flex()
+            .w_full()
+            .px_3()
+            .py_2()
+            .gap_2()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(path_row)
+            .child(details)
+    }
+
+    fn render_commit_details(
+        &self,
+        commit: &CommitDetails,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let commit_date = time::OffsetDateTime::from_unix_timestamp(commit.commit_timestamp)
+            .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+        let local_offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+        let date_string = time_format::format_localized_timestamp(
+            commit_date,
+            time::OffsetDateTime::now_utc(),
+            local_offset,
+            time_format::TimestampFormat::MediumAbsolute,
+        );
+        let avatar = CommitAvatar::new(
+            &commit.sha,
+            Some(commit.author_email.clone()),
+            self.remote.as_ref(),
+        )
+        .size(rems_from_px(32.))
+        .render(window, cx);
+        let sha = commit.sha.clone();
+        let repository = self.repository.downgrade();
+        let workspace = self.workspace.clone();
+
+        h_flex()
+            .w_full()
+            .gap_2()
+            .justify_between()
+            .child(
+                h_flex().min_w_0().gap_2().child(avatar).child(
+                    v_flex()
+                        .min_w_0()
+                        .child(Label::new(commit_subject(&commit.message).to_string()).truncate())
+                        .child(
+                            h_flex()
+                                .gap_1p5()
+                                .child(
+                                    Label::new(commit.author_name.clone())
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Label::new("•")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .alpha(0.5),
+                                )
+                                .child(
+                                    Label::new(date_string)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                        ),
+                ),
+            )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_1()
+                    .child(
+                        Button::new("file-history-copy-sha", short_sha(&commit.sha).to_string())
+                            .label_size(LabelSize::Small)
+                            .start_icon(
+                                Icon::new(IconName::Copy)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .tooltip({
+                                let sha = sha.clone();
+                                move |_, cx| {
+                                    Tooltip::with_meta("Copy Commit SHA", None, sha.clone(), cx)
+                                }
+                            })
+                            .on_click({
+                                let sha = sha.clone();
+                                move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        sha.to_string(),
+                                    ));
+                                }
+                            }),
+                    )
+                    .child(
+                        Button::new("file-history-view-commit", "View Commit")
+                            .label_size(LabelSize::Small)
+                            .start_icon(
+                                Icon::new(IconName::GitCommit)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .on_click(move |_, window, cx| {
+                                CommitView::open(
+                                    sha.to_string(),
+                                    repository.clone(),
+                                    workspace.clone(),
+                                    None,
+                                    None,
+                                    window,
+                                    cx,
+                                );
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
 }
 
 /// Adds the file's live buffer with its diff against HEAD, so the view shows
 /// the uncommitted changes and keeps up as the file is edited.
 async fn add_uncommitted_changes(
+    this: &WeakEntity<FileHistoryView>,
     editor: &WeakEntity<SplittableEditor>,
     path: &RepoPath,
-    repository: &Entity<Repository>,
     project: &Entity<Project>,
     cx: &mut AsyncWindowContext,
 ) -> Result<()> {
-    let project_path = repository
-        .read_with(cx, |repository, cx| {
-            repository.repo_path_to_project_path(path, cx)
-        })
+    let project_path = this
+        .read_with(cx, |this, cx| {
+            this.repository.read(cx).repo_path_to_project_path(path, cx)
+        })?
         .context("file is outside the project's worktrees")?;
     let buffer = project
         .update(cx, |project, cx| project.open_buffer(project_path, cx))
@@ -1629,17 +1959,18 @@ async fn add_uncommitted_changes(
             project.open_uncommitted_diff(buffer.clone(), cx)
         })
         .await?;
-    let excerpt_ranges = cx.update(|_, cx| {
+    let (buffer_id, excerpt_ranges) = cx.update(|_, cx| {
         let snapshot = buffer.read(cx).snapshot();
         let diff_snapshot = buffer_diff.read(cx).snapshot(cx);
         let mut hunks = diff_snapshot.hunks(&snapshot).peekable();
-        if hunks.peek().is_none() {
+        let ranges = if hunks.peek().is_none() {
             vec![language::Point::zero()..snapshot.max_point()]
         } else {
             hunks
                 .map(|hunk| hunk.buffer_range.to_point(&snapshot))
                 .collect::<Vec<_>>()
-        }
+        };
+        (snapshot.remote_id(), ranges)
     })?;
     let rel_path: &Arc<RelPath> = path.as_ref();
     let path_key = PathKey::with_sort_prefix(FILE_NAMESPACE_SORT_PREFIX, rel_path.clone());
@@ -1655,6 +1986,13 @@ async fn add_uncommitted_changes(
         if editor.diff_view_style() == DiffViewStyle::Split {
             editor.split(window, cx);
         }
+    })?;
+    this.update(cx, |this, cx| {
+        this.sections.push(FileHistorySection {
+            buffer_id,
+            commit: None,
+        });
+        cx.notify();
     })?;
     Ok(())
 }
@@ -1675,17 +2013,26 @@ impl Item for FileHistoryView {
     }
 
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        format!("{} — History", self.file_name()).into()
+        match &self.start_sha {
+            Some(sha) => format!("{} — {}", self.file_name(), short_sha(sha)).into(),
+            None => format!("{} — History", self.file_name()).into(),
+        }
     }
 
     fn tab_tooltip_text(&self, _: &App) -> Option<SharedString> {
-        Some(
-            format!(
+        Some(match &self.start_sha {
+            Some(sha) => format!(
+                "History of {} from {}",
+                self.path.as_unix_str(),
+                short_sha(sha)
+            )
+            .into(),
+            None => format!(
                 "Uncommitted changes and history of {}",
                 self.path.as_unix_str()
             )
             .into(),
-        )
+        })
     }
 
     fn to_item_events(event: &EditorEvent, f: &mut dyn FnMut(ItemEvent)) {
@@ -1754,29 +2101,11 @@ impl Item for FileHistoryView {
 }
 
 impl Render for FileHistoryView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .size_full()
             .bg(cx.theme().colors().editor_background)
-            .child(
-                h_flex()
-                    .px_3()
-                    .py_2()
-                    .gap_2()
-                    .border_b_1()
-                    .border_color(cx.theme().colors().border_variant)
-                    .child(
-                        Icon::new(IconName::Diff)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(Label::new(self.path.as_unix_str().to_string()).truncate())
-                    .child(
-                        Label::new("Uncommitted changes, then earlier commits")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
-            )
+            .child(self.render_section_header(window, cx))
             .child(div().flex_grow(1.).min_h_0().child(self.editor.clone()))
     }
 }

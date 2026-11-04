@@ -6,7 +6,7 @@ use crate::{
         CommitMenuEntries, commit_context_menu, git_context_menu_tasks, git_task_context,
     },
     commit_tooltip::CommitAvatar,
-    commit_view::CommitView,
+    commit_view::{CommitView, FileHistoryView},
     create_branch_at_commit,
     git_panel::GitPanel,
     git_status_icon,
@@ -324,36 +324,36 @@ impl ChangedFileEntry {
                 .files
                 .iter()
                 .find(|file| file.path == self.repo_path)?;
-            Some(CommitDiff {
-                files: vec![CommitFile {
-                    path: file.path.clone(),
-                    old_text: file.old_text.clone(),
-                    new_text: file.new_text.clone(),
-                    is_binary: file.is_binary,
-                }],
-                is_shallow_boundary: changes.diff.is_shallow_boundary,
+            Some(CommitFile {
+                path: file.path.clone(),
+                old_text: file.old_text.clone(),
+                new_text: file.new_text.clone(),
+                is_binary: file.is_binary,
             })
         });
-        match loaded_file {
-            Some(commit_diff) => CommitView::open_with_diff(
-                commit_sha.to_string(),
-                commit_diff,
-                repository.clone(),
-                workspace.clone(),
-                Some(self.repo_path.clone()),
-                window,
-                cx,
-            ),
-            None => CommitView::open(
-                commit_sha.to_string(),
-                repository.clone(),
-                workspace.clone(),
-                None,
-                Some(self.repo_path.clone()),
-                window,
-                cx,
-            ),
-        }
+        let Some(repository) = repository.upgrade() else {
+            return;
+        };
+        let repo_path = self.repo_path.clone();
+        let commit_sha = commit_sha.clone();
+        let workspace = workspace.clone();
+        // Opening the view deactivates the tab showing the graph, which updates
+        // it, and the click is handled while the graph may still be updating.
+        window.defer(cx, move |window, cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    FileHistoryView::open_at_commit(
+                        repo_path,
+                        repository,
+                        commit_sha,
+                        loaded_file,
+                        workspace,
+                        window,
+                        cx,
+                    );
+                })
+                .log_err();
+        });
     }
 
     fn render(
