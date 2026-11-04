@@ -22,11 +22,12 @@ use gpui::{
     ClipboardEntry as GpuiClipboardEntry, ClipboardItem, Context, CursorStyle, DismissEvent, Div,
     DragMoveEvent, Entity, EventEmitter, ExternalDragPayload, ExternalPaths, FileDragPaths,
     FileDropEvent, FocusHandle, Focusable, FontWeight, Hsla, InteractiveElement, KeyContext,
-    ListHorizontalSizingBehavior, ListSizingBehavior, Modifiers, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseExitEvent, ParentElement, PathPromptOptions, Pixels, Point,
-    PromptLevel, Render, ScrollStrategy, Stateful, Styled, Subscription, Task,
-    UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred, div, hsla,
-    linear_color_stop, linear_gradient, point, px, size, transparent_white, uniform_list,
+    KeyDownEvent, ListHorizontalSizingBehavior, ListSizingBehavior, Modifiers,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, ParentElement,
+    PathPromptOptions, Pixels, Point, PromptLevel, Render, ScrollStrategy, Stateful, Styled,
+    Subscription, Task, UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred,
+    div, hsla, linear_color_stop, linear_gradient, point, px, size, transparent_white,
+    uniform_list,
 };
 use itertools::Itertools;
 use language::DiagnosticSeverity;
@@ -61,9 +62,10 @@ use std::{
 use svg_preview::svg_preview_view::SvgPreviewView;
 use theme_settings::ThemeSettings;
 use ui::{
-    ContextMenu, DecoratedIcon, IconDecoration, IconDecorationKind, IndentGuideColors,
-    IndentGuideLayout, Indicator, KeyBinding, ListItem, ListItemSpacing, ProjectEmptyState,
-    ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip, WithScrollbar, prelude::*,
+    ContextMenu, DecoratedIcon, HighlightedLabel, IconDecoration, IconDecorationKind,
+    IndentGuideColors, IndentGuideLayout, Indicator, KeyBinding, ListItem, ListItemSpacing,
+    ProjectEmptyState, ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip,
+    WithScrollbar, prelude::*,
 };
 use util::{
     ResultExt, TryFutureExt,
@@ -151,6 +153,12 @@ pub struct ProjectPanel {
     selection: Option<SelectedEntry>,
     context_menu: Option<DeployedContextMenu>,
     filename_editor: Entity<Editor>,
+    filter_editor: Entity<Editor>,
+    /// `Some` while the type-to-filter bar is open, holding its text, which may be empty.
+    filter_query: Option<String>,
+    /// Set when the filter text changes, so the next visible entries update selects the first
+    /// match instead of keeping a selection the filter may have hidden.
+    filter_selects_first_match: bool,
     clipboard: Option<ClipboardEntry>,
     _dragged_entry_destination: Option<Arc<Path>>,
     workspace: WeakEntity<Workspace>,
@@ -845,6 +853,28 @@ impl ProjectPanel {
             )
             .detach();
 
+            let filter_editor = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_placeholder_text("Filter", window, cx);
+                editor
+            });
+
+            cx.subscribe_in(
+                &filter_editor,
+                window,
+                |project_panel, filter_editor, editor_event, window, cx| {
+                    // Closing the filter clears the editor, and that edit must not reopen it.
+                    if let EditorEvent::BufferEdited = editor_event
+                        && project_panel.filter_query.is_some()
+                    {
+                        project_panel.filter_query = Some(filter_editor.read(cx).text(cx));
+                        project_panel.filter_selects_first_match = true;
+                        project_panel.update_visible_entries(None, false, false, window, cx);
+                    }
+                },
+            )
+            .detach();
+
             cx.observe_global::<FileIcons>(|_, cx| {
                 cx.notify();
             })
@@ -893,6 +923,9 @@ impl ProjectPanel {
                 selection: None,
                 context_menu: None,
                 filename_editor,
+                filter_editor,
+                filter_query: None,
+                filter_selects_first_match: false,
                 clipboard: None,
                 _dragged_entry_destination: None,
                 workspace: workspace.weak_handle(),
@@ -1969,6 +2002,18 @@ impl ProjectPanel {
     }
 
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        if self.filter_editor.focus_handle(cx).is_focused(window) {
+            window.focus(&self.focus_handle, cx);
+            let selected_file_id = self
+                .selected_sub_entry(cx)
+                .and_then(|(_, entry)| entry.is_file().then_some(entry.id));
+            if let Some(entry_id) = selected_file_id {
+                let preview_tabs_enabled =
+                    PreviewTabsSettings::get_global(cx).enable_preview_from_project_panel;
+                self.open_entry(entry_id, true, preview_tabs_enabled, cx);
+            }
+            return;
+        }
         if let Some(task) = self.confirm_edit(true, window, cx) {
             task.detach_and_notify_err(self.workspace.clone(), window, cx);
         }
@@ -2424,10 +2469,86 @@ impl ProjectPanel {
             self.clear_drag_state(cx);
             return;
         }
+        if self.state.edit_state.is_none() && self.filter_query.is_some() {
+            self.close_filter(window, cx);
+            return;
+        }
         self.marked_entries.clear();
         cx.notify();
         self.discard_edit_state(window, cx);
         window.focus(&self.focus_handle, cx);
+    }
+
+    fn start_filter_on_type(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Only keys typed at the entry list start or extend the filter, not ones typed into the
+        // filter or filename editors, which bubble up to this listener too.
+        if !self.focus_handle.is_focused(window) {
+            return;
+        }
+        let keystroke = &event.keystroke;
+        let modifiers = keystroke.modifiers;
+        // AltGr arrives as ctrl+alt on Windows and types characters like `@` on many layouts.
+        let is_alt_gr = modifiers.control && modifiers.alt;
+        if modifiers.platform
+            || modifiers.function
+            || ((modifiers.control || modifiers.alt) && !is_alt_gr)
+        {
+            return;
+        }
+        let Some(text) = keystroke.key_char.as_deref() else {
+            return;
+        };
+        if text.is_empty() || text.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            return;
+        }
+
+        if self.filter_query.is_none() {
+            self.filter_query = Some(String::new());
+        }
+        self.filter_editor.update(cx, |editor, cx| {
+            editor.move_to_end(&editor::actions::MoveToEnd, window, cx);
+            editor.insert(text, window, cx);
+        });
+        window.focus(&self.filter_editor.focus_handle(cx), cx);
+        // Handling the key down here keeps the platform from also delivering the character as
+        // text input, which would type it a second time.
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn close_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.filter_query = None;
+        self.filter_selects_first_match = false;
+        self.filter_editor
+            .update(cx, |editor, cx| editor.set_text("", window, cx));
+        // The filter shows every match expanded, so expand the way to the selected entry to
+        // keep it in view once the tree goes back to its own expansion state.
+        if let Some(selection) = self.selection {
+            self.expand_entry(selection.worktree_id, selection.entry_id, cx);
+        }
+        self.update_visible_entries(
+            self.selection
+                .map(|selection| (selection.worktree_id, selection.entry_id)),
+            false,
+            true,
+            window,
+            cx,
+        );
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    fn active_filter_query(&self) -> Option<Vec<char>> {
+        let query = self.filter_query.as_deref()?;
+        if query.is_empty() {
+            return None;
+        }
+        Some(query.chars().flat_map(char::to_lowercase).collect())
     }
 
     fn open_entry(
@@ -4630,12 +4751,38 @@ impl ProjectPanel {
             .collect();
         let hide_root = settings.hide_root && visible_worktrees.len() == 1;
         let hide_hidden = settings.hide_hidden;
+        let filter_query = self.active_filter_query();
 
         let visible_entries_task = cx.spawn_in(window, async move |this, cx| {
-            let new_state = cx
+            let (new_state, first_filter_match) = cx
                 .background_spawn(async move {
+                    let mut first_filter_match = None;
                     for worktree_snapshot in visible_worktrees {
                         let worktree_id = worktree_snapshot.id();
+
+                        // Paths of every entry whose name matches the filter, plus all of their
+                        // ancestors, which have to stay visible for the matches to be reachable.
+                        let filter_kept_paths = filter_query.as_deref().map(|query| {
+                            let mut kept_paths: HashSet<&RelPath> = HashSet::default();
+                            for entry in worktree_snapshot.entries(true, 0) {
+                                if (hide_gitignore && entry.is_ignored)
+                                    || (hide_hidden && entry.is_hidden)
+                                {
+                                    continue;
+                                }
+                                let is_match = entry.path.file_name().is_some_and(|name| {
+                                    filter_match_indices(name, query).is_some()
+                                });
+                                if is_match {
+                                    for ancestor in entry.path.ancestors() {
+                                        if !kept_paths.insert(ancestor) {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            kept_paths
+                        });
 
                         let mut new_entry_parent_id = None;
                         let mut new_entry_kind = EntryKind::Dir;
@@ -4669,7 +4816,23 @@ impl ProjectPanel {
                                 entry_iter.advance();
                                 continue;
                             }
-                            if auto_collapse_dirs && entry.kind.is_dir() {
+                            if let Some(kept_paths) = &filter_kept_paths
+                                && Some(entry.entry) != worktree_snapshot.root_entry()
+                                && !kept_paths.contains(&*entry.path)
+                            {
+                                // Nothing below a directory that is not kept matches either.
+                                if entry.is_dir() && entry_iter.advance_to_sibling() {
+                                    continue;
+                                }
+                                entry_iter.advance();
+                                continue;
+                            }
+                            // Folding would hide the directories a match sits in behind a single
+                            // row, so the filtered tree is shown unfolded.
+                            if auto_collapse_dirs
+                                && filter_kept_paths.is_none()
+                                && entry.kind.is_dir()
+                            {
                                 auto_folded_ancestors.push(entry.id);
                                 if !new_state.is_unfolded(&entry.id)
                                     && let Some(root_path) = worktree_snapshot.root_entry()
@@ -4836,7 +4999,8 @@ impl ProjectPanel {
                                     }
                                 };
 
-                            if expanded_dir_ids.binary_search(&entry.id).is_err()
+                            if filter_kept_paths.is_none()
+                                && expanded_dir_ids.binary_search(&entry.id).is_err()
                                 && entry_iter.advance_to_sibling()
                             {
                                 continue;
@@ -4849,6 +5013,21 @@ impl ProjectPanel {
                             sort_mode,
                             sort_order,
                         );
+                        if first_filter_match.is_none()
+                            && let Some(query) = filter_query.as_deref()
+                        {
+                            first_filter_match = visible_worktree_entries
+                                .iter()
+                                .find(|entry| {
+                                    entry.path.file_name().is_some_and(|name| {
+                                        filter_match_indices(name, query).is_some()
+                                    })
+                                })
+                                .map(|entry| SelectedEntry {
+                                    worktree_id,
+                                    entry_id: entry.id,
+                                });
+                        }
                         new_state.visible_entries.push(VisibleEntriesForWorktree {
                             worktree_id,
                             entries: visible_worktree_entries,
@@ -4875,7 +5054,7 @@ impl ProjectPanel {
                             new_state.max_width_item_index = Some(visited_worktrees_length + index);
                         }
                     }
-                    new_state
+                    (new_state, first_filter_match)
                 })
                 .await;
             this.update_in(cx, |this, window, cx| {
@@ -4885,6 +5064,14 @@ impl ProjectPanel {
                         worktree_id,
                         entry_id,
                     });
+                }
+                if this.filter_selects_first_match {
+                    this.filter_selects_first_match = false;
+                    if let Some(first_filter_match) = first_filter_match {
+                        this.selection = Some(first_filter_match);
+                        this.marked_entries.clear();
+                        this.update_visible_entries_task.autoscroll = true;
+                    }
                 }
                 let elapsed = now.elapsed();
                 if this.last_reported_update.elapsed() > Duration::from_secs(3600) {
@@ -6586,7 +6773,8 @@ impl ProjectPanel {
                         } else {
                             project_panel.toggle_expanded(entry_id, window, cx);
                         }
-                    } else if event.click_count() > 1 || project_panel.selection == Some(selection) {
+                    } else if event.click_count() > 1 || project_panel.selection == Some(selection)
+                    {
                         // Opening a file covers the Main tab holding the panel, so a first click
                         // only selects it and a click on the selected file (a double click is
                         // one too) opens it.
@@ -6600,8 +6788,8 @@ impl ProjectPanel {
                     }
                 }),
             )
-            .on_aux_click(
-                cx.listener(move |project_panel, event: &gpui::ClickEvent, window, cx| {
+            .on_aux_click(cx.listener(
+                move |project_panel, event: &gpui::ClickEvent, window, cx| {
                     if !event.is_middle_click() || show_editor {
                         return;
                     }
@@ -6614,8 +6802,8 @@ impl ProjectPanel {
                         return;
                     }
                     cx.stop_propagation();
-                }),
-            )
+                },
+            ))
             .child(
                 ListItem::new(id)
                     .indent_level(depth)
@@ -6797,16 +6985,28 @@ impl ProjectPanel {
                                     ))
                                 }
 
-                                None => this.child(
-                                    Label::new(file_name)
-                                        .single_line()
-                                        .color(filename_text_color)
-                                        .when(
-                                            settings.bold_folder_labels && kind.is_dir(),
-                                            |this| this.weight(FontWeight::SEMIBOLD),
-                                        )
-                                        .into_any_element(),
-                                ),
+                                None => {
+                                    let is_bold = settings.bold_folder_labels && kind.is_dir();
+                                    let filter_highlights = self
+                                        .active_filter_query()
+                                        .and_then(|query| filter_match_indices(&file_name, &query));
+                                    this.child(match filter_highlights {
+                                        Some(highlights) => {
+                                            HighlightedLabel::new(file_name, highlights)
+                                                .single_line()
+                                                .color(filename_text_color)
+                                                .when(is_bold, |this| {
+                                                    this.weight(FontWeight::SEMIBOLD)
+                                                })
+                                                .into_any_element()
+                                        }
+                                        None => Label::new(file_name)
+                                            .single_line()
+                                            .color(filename_text_color)
+                                            .when(is_bold, |this| this.weight(FontWeight::SEMIBOLD))
+                                            .into_any_element(),
+                                    })
+                                }
                             })
                     })
                     .on_secondary_mouse_down(cx.listener(
@@ -7130,7 +7330,9 @@ impl ProjectPanel {
             .get(&worktree_id)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let is_expanded = expanded_entry_ids.binary_search(&entry.id).is_ok();
+        // The filter shows every directory on the way to a match open, whatever its own state.
+        let is_expanded = (entry.is_dir() && self.active_filter_query().is_some())
+            || expanded_entry_ids.binary_search(&entry.id).is_ok();
 
         let (chevron, icon) = Self::entry_icons(entry, is_expanded, cx);
 
@@ -7228,6 +7430,14 @@ impl ProjectPanel {
 
     fn dispatch_context(&self, window: &Window, cx: &Context<Self>) -> KeyContext {
         let mut dispatch_context = KeyContext::new_with_defaults();
+        // While typing a filter, the `ProjectPanel` bindings must not apply: `enter` would start a
+        // rename and `ctrl-n` would create a file. `menu` keeps `up`/`down` moving the selection
+        // and `enter`/`escape` reaching `menu::Confirm`/`menu::Cancel`.
+        if self.filter_editor.focus_handle(cx).is_focused(window) {
+            dispatch_context.add("ProjectPanelFilter");
+            dispatch_context.add("menu");
+            return dispatch_context;
+        }
         dispatch_context.add("ProjectPanel");
         dispatch_context.add("menu");
 
@@ -7517,6 +7727,37 @@ fn item_width_estimate(depth: usize, item_text_chars: usize, is_symlink: bool) -
     item_width
 }
 
+/// Finds `query`, already lowercased, in `name` without regard to case, returning the byte
+/// offsets of the matched characters of `name`.
+fn filter_match_indices(name: &str, query: &[char]) -> Option<Vec<usize>> {
+    if query.is_empty() {
+        return None;
+    }
+    // A character can lowercase to several (`İ` becomes `i̇`), so each lowered character keeps
+    // the offset of the character of `name` it came from.
+    let lowered_name: Vec<(usize, char)> = name
+        .char_indices()
+        .flat_map(|(offset, character)| {
+            character
+                .to_lowercase()
+                .map(move |lowered| (offset, lowered))
+        })
+        .collect();
+    let match_start = lowered_name.windows(query.len()).position(|window| {
+        window
+            .iter()
+            .map(|(_, character)| character)
+            .eq(query.iter())
+    })?;
+    let mut offsets: Vec<usize> = lowered_name
+        .get(match_start..match_start + query.len())?
+        .iter()
+        .map(|(offset, _)| *offset)
+        .collect();
+    offsets.dedup();
+    Some(offsets)
+}
+
 impl Render for ProjectPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !cx.has_active_drag() {
@@ -7647,6 +7888,7 @@ impl Render for ProjectPanel {
                     },
                 ))
                 .key_context(self.dispatch_context(window, cx))
+                .on_key_down(cx.listener(Self::start_filter_on_type))
                 .on_action(cx.listener(Self::scroll_up))
                 .on_action(cx.listener(Self::scroll_down))
                 .on_action(cx.listener(Self::scroll_cursor_center))
@@ -7720,6 +7962,36 @@ impl Render for ProjectPanel {
                 .track_focus(&self.focus_handle(cx))
                 .child(
                     v_flex()
+                        .when(self.filter_query.is_some(), |this| {
+                            this.child(
+                                h_flex()
+                                    .flex_none()
+                                    .w_full()
+                                    .gap_1()
+                                    .px_2()
+                                    .py_1()
+                                    .border_b_1()
+                                    .border_color(cx.theme().colors().border_variant)
+                                    .child(
+                                        Icon::new(IconName::MagnifyingGlass)
+                                            .size(IconSize::Small)
+                                            .color(Color::Muted),
+                                    )
+                                    .child(div().flex_1().child(self.filter_editor.clone()))
+                                    .child(
+                                        IconButton::new(
+                                            "project-panel-close-filter",
+                                            IconName::Close,
+                                        )
+                                        .icon_size(IconSize::Small)
+                                        .on_click(
+                                            cx.listener(|this, _, window, cx| {
+                                                this.close_filter(window, cx);
+                                            }),
+                                        ),
+                                    ),
+                            )
+                        })
                         .child(
                             uniform_list("entries", item_count, {
                                 cx.processor(|this, range: Range<usize>, window, cx| {
