@@ -1100,7 +1100,7 @@ async fn discard_files(
         let repo_paths = tracked.iter().map(|file| file.repo_path.clone()).collect();
         repository
             .update(cx, |repository, cx| {
-                repository.checkout_files("HEAD", repo_paths, cx)
+                repository.checkout_files(Some("HEAD"), repo_paths, cx)
             })
             .await?;
         // A buffer with unsaved edits keeps them over the restored file, and saving it would
