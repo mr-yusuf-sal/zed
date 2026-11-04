@@ -1,4 +1,5 @@
 use askpass::AskPassDelegate;
+use db::kvp::KeyValueStore;
 use editor::Editor;
 use git::{
     repository::{CommitOptions, LogSource, RepoPath},
@@ -22,6 +23,8 @@ use workspace::Workspace;
 
 use crate::{commit_view::FileHistoryView, git_status_icon, project_diff::ProjectDiff};
 
+const SECTIONS_SIDE_BY_SIDE_KEY: &str = "working_tree_changes_sections_side_by_side";
+
 /// The uncommitted and staged changes of a project's repositories, with buttons to stage,
 /// unstage and discard them, and a form to commit the staged ones and push.
 pub struct WorkingTreeChanges {
@@ -36,6 +39,9 @@ pub struct WorkingTreeChanges {
     commit_title_editor: Entity<Editor>,
     commit_description_editor: Entity<Editor>,
     pending_commit: Option<Task<()>>,
+    /// Whether the uncommitted and staged lists sit next to each other rather than one
+    /// above the other.
+    sections_side_by_side: bool,
     focus_handle: FocusHandle,
     _git_store_subscription: Subscription,
 }
@@ -100,6 +106,7 @@ impl WorkingTreeChanges {
             commit_title_editor,
             commit_description_editor,
             pending_commit: None,
+            sections_side_by_side: Self::restore_sections_side_by_side(cx),
             focus_handle: cx.focus_handle(),
             _git_store_subscription: git_store_subscription,
         };
@@ -1000,10 +1007,47 @@ impl WorkingTreeChanges {
             .into_any_element()
     }
 
+    /// The layout is global and survives restarts, like the git graph's detail panel position,
+    /// so it applies to the Main tab's list and every git graph's alike.
+    fn restore_sections_side_by_side(cx: &App) -> bool {
+        KeyValueStore::global(cx)
+            .read_kvp(SECTIONS_SIDE_BY_SIDE_KEY)
+            .log_err()
+            .flatten()
+            .is_some_and(|value| value == "true")
+    }
+
+    fn toggle_sections_layout(&mut self, cx: &mut Context<Self>) {
+        self.sections_side_by_side = !self.sections_side_by_side;
+        let value = self.sections_side_by_side.to_string();
+        let kvp = KeyValueStore::global(cx);
+        cx.background_spawn(async move {
+            kvp.write_kvp(SECTIONS_SIDE_BY_SIDE_KEY.to_string(), value)
+                .await
+                .log_err()
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn render_sections_layout_toggle(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (icon, tooltip) = if self.sections_side_by_side {
+            (IconName::Split, "Stack Staged Changes Below")
+        } else {
+            (IconName::SplitAlt, "Show Staged Changes Side by Side")
+        };
+        IconButton::new("toggle-sections-layout", icon)
+            .icon_size(IconSize::Small)
+            .tooltip(Tooltip::text(tooltip))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_sections_layout(cx)))
+            .into_any_element()
+    }
+
     fn render_section(
         id: &'static str,
         title: &'static str,
         content: AnyElement,
+        header_end: Option<AnyElement>,
         cx: &App,
     ) -> AnyElement {
         v_flex()
@@ -1014,9 +1058,11 @@ impl WorkingTreeChanges {
                 h_flex()
                     .px_2()
                     .py_1()
+                    .justify_between()
                     .border_b_1()
                     .border_color(cx.theme().colors().border_variant)
-                    .child(Label::new(title).size(LabelSize::Small).color(Color::Muted)),
+                    .child(Label::new(title).size(LabelSize::Small).color(Color::Muted))
+                    .children(header_end),
             )
             .child(
                 div()
@@ -1166,14 +1212,18 @@ impl Render for WorkingTreeChanges {
             "working-tree-unstaged-changes",
             "Uncommitted Changes",
             self.render_changes(false, cx),
+            Some(self.render_sections_layout_toggle(cx)),
             cx,
         );
         let staged_changes = Self::render_section(
             "working-tree-staged-changes",
             "Staged Changes",
             self.render_changes(true, cx),
+            None,
             cx,
         );
+        let side_by_side = self.sections_side_by_side;
+        let border_color = cx.theme().colors().border_variant;
         v_flex()
             .key_context("WorkingTreeChanges")
             .track_focus(&self.focus_handle)
@@ -1187,14 +1237,34 @@ impl Render for WorkingTreeChanges {
                 this.commit(window, cx);
             }))
             .size_full()
-            .child(div().flex_1().min_h_0().child(unstaged_changes))
             .child(
                 div()
+                    .flex()
                     .flex_1()
                     .min_h_0()
-                    .border_t_1()
-                    .border_color(cx.theme().colors().border_variant)
-                    .child(staged_changes),
+                    .map(|this| {
+                        if side_by_side {
+                            this.flex_row()
+                        } else {
+                            this.flex_col()
+                        }
+                    })
+                    .child(div().flex_1().min_h_0().min_w_0().child(unstaged_changes))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .min_w_0()
+                            .map(|this| {
+                                if side_by_side {
+                                    this.border_l_1()
+                                } else {
+                                    this.border_t_1()
+                                }
+                            })
+                            .border_color(border_color)
+                            .child(staged_changes),
+                    ),
             )
             .child(self.render_commit_form(cx))
     }
