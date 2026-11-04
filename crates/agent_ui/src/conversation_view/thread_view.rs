@@ -36,6 +36,10 @@ use db::kvp::KeyValueStore;
 use gpui::List;
 use gpui::Stateful;
 use gpui::TaskExt;
+use gpui::{
+    DispatchPhase, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Point,
+    ScrollWheelEvent, anchored, canvas, deferred, point,
+};
 use heapless::Vec as ArrayVec;
 use itertools::Itertools;
 use language_model::{
@@ -712,6 +716,7 @@ pub struct ThreadView {
     /// The user message pinned over the top of the list, because the list is
     /// scrolled past its start.
     sticky_user_message_ix: Option<usize>,
+    middle_click_autoscroll: Option<MiddleClickAutoscroll>,
     pub session_capabilities: SharedSessionCapabilities,
     pub expanded_tool_call_raw_inputs: HashSet<acp_v1::ToolCallId>,
     /// Agent tool calls whose subagent's tool calls are all shown, rather than
@@ -1244,6 +1249,7 @@ impl ThreadView {
             profile_selector,
             list_state,
             sticky_user_message_ix: None,
+            middle_click_autoscroll: None,
             session_capabilities,
             resumed_without_history,
             _subscriptions: subscriptions,
@@ -7343,7 +7349,181 @@ fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
     }
 }
 
+/// Browser-style autoscroll of the conversation, started with the middle mouse
+/// button: the list scrolls toward the cursor, faster the farther the cursor
+/// is from where the button was pressed.
+struct MiddleClickAutoscroll {
+    origin: Point<Pixels>,
+    cursor: Point<Pixels>,
+    started_at: Instant,
+    /// Whether the press that started the autoscroll is still down. Releasing
+    /// it after dragging or holding ends the autoscroll; releasing it right
+    /// away leaves it running until the next click or key press.
+    button_held: bool,
+    _scroll_task: Task<()>,
+}
+
+const AUTOSCROLL_DEAD_ZONE: Pixels = px(12.);
+const AUTOSCROLL_FRAME: Duration = Duration::from_millis(16);
+const AUTOSCROLL_HOLD_THRESHOLD: Duration = Duration::from_millis(300);
+/// Pixels scrolled per frame for each pixel the cursor is past the dead zone.
+const AUTOSCROLL_SPEED: f32 = 0.125;
+const AUTOSCROLL_INDICATOR_SIZE: Pixels = px(26.);
+
 impl ThreadView {
+    fn start_middle_click_autoscroll(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let scroll_task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(AUTOSCROLL_FRAME).await;
+                let still_active = this.update(cx, |this, cx| {
+                    let Some(autoscroll) = &this.middle_click_autoscroll else {
+                        return false;
+                    };
+                    let distance = autoscroll.cursor.y - autoscroll.origin.y;
+                    let speed =
+                        (distance.abs() - AUTOSCROLL_DEAD_ZONE).max(px(0.)) * AUTOSCROLL_SPEED;
+                    if speed > px(0.) {
+                        this.list_state
+                            .scroll_by(if distance < px(0.) { -speed } else { speed });
+                        cx.notify();
+                    }
+                    true
+                });
+                if !matches!(still_active, Ok(true)) {
+                    break;
+                }
+            }
+        });
+        self.middle_click_autoscroll = Some(MiddleClickAutoscroll {
+            origin: position,
+            cursor: position,
+            started_at: Instant::now(),
+            button_held: true,
+            _scroll_task: scroll_task,
+        });
+        cx.notify();
+    }
+
+    fn stop_middle_click_autoscroll(&mut self, cx: &mut Context<Self>) {
+        if self.middle_click_autoscroll.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn render_middle_click_autoscroll(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let origin = self.middle_click_autoscroll.as_ref()?.origin;
+        let view = cx.entity();
+
+        // The autoscroll follows the cursor and ends on the next click or key
+        // press anywhere in the window, not only over the conversation, so it
+        // listens on the window rather than on an element's hitbox.
+        let listeners = canvas(
+            |_, _, _| {},
+            move |_, (), window, _| {
+                window.set_window_cursor_style(CursorStyle::ResizeUpDown);
+
+                window.on_mouse_event({
+                    let view = view.clone();
+                    move |event: &MouseMoveEvent, phase, _, cx| {
+                        if phase != DispatchPhase::Capture {
+                            return;
+                        }
+                        view.update(cx, |this, _| {
+                            if let Some(autoscroll) = &mut this.middle_click_autoscroll {
+                                autoscroll.cursor = event.position;
+                            }
+                        });
+                    }
+                });
+
+                window.on_mouse_event({
+                    let view = view.clone();
+                    move |_: &MouseDownEvent, phase, _, cx| {
+                        if phase != DispatchPhase::Capture {
+                            return;
+                        }
+                        view.update(cx, |this, cx| this.stop_middle_click_autoscroll(cx));
+                        cx.stop_propagation();
+                    }
+                });
+
+                window.on_mouse_event({
+                    let view = view.clone();
+                    move |event: &MouseUpEvent, phase, _, cx| {
+                        if phase != DispatchPhase::Capture || event.button != MouseButton::Middle {
+                            return;
+                        }
+                        view.update(cx, |this, cx| {
+                            let Some(autoscroll) = &mut this.middle_click_autoscroll else {
+                                return;
+                            };
+                            if !autoscroll.button_held {
+                                return;
+                            }
+                            let offset = autoscroll.cursor - autoscroll.origin;
+                            let dragged = offset.x.abs().max(offset.y.abs()) > AUTOSCROLL_DEAD_ZONE;
+                            if dragged
+                                || autoscroll.started_at.elapsed() >= AUTOSCROLL_HOLD_THRESHOLD
+                            {
+                                this.stop_middle_click_autoscroll(cx);
+                            } else {
+                                autoscroll.button_held = false;
+                            }
+                        });
+                        cx.stop_propagation();
+                    }
+                });
+
+                window.on_mouse_event({
+                    let view = view.clone();
+                    move |_: &ScrollWheelEvent, phase, _, cx| {
+                        if phase == DispatchPhase::Capture {
+                            view.update(cx, |this, cx| this.stop_middle_click_autoscroll(cx));
+                        }
+                    }
+                });
+
+                window.on_key_event(move |event: &KeyDownEvent, phase, _, cx| {
+                    if phase != DispatchPhase::Capture {
+                        return;
+                    }
+                    view.update(cx, |this, cx| this.stop_middle_click_autoscroll(cx));
+                    if event.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_0();
+
+        let colors = cx.theme().colors();
+        let indicator = deferred(
+            anchored()
+                .position(
+                    origin - point(AUTOSCROLL_INDICATOR_SIZE, AUTOSCROLL_INDICATOR_SIZE) * 0.5,
+                )
+                .child(
+                    h_flex()
+                        .size(AUTOSCROLL_INDICATOR_SIZE)
+                        .justify_center()
+                        .rounded_full()
+                        .border_1()
+                        .border_color(colors.border)
+                        .bg(colors.elevated_surface_background)
+                        .shadow_md()
+                        .child(
+                            Icon::new(IconName::ChevronUpDown)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        ),
+                ),
+        )
+        .with_priority(1);
+
+        Some(div().child(listeners).child(indicator))
+    }
+
     fn render_entries(&mut self, cx: &mut Context<Self>) -> List {
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let centered_container = move |content: AnyElement| {
@@ -14005,6 +14185,15 @@ impl Render for ThreadView {
                     this.flex_1()
                         .size_full()
                         .relative()
+                        .on_mouse_down(
+                            MouseButton::Middle,
+                            cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                if this.middle_click_autoscroll.is_none() {
+                                    this.start_middle_click_autoscroll(event.position, cx);
+                                }
+                                cx.stop_propagation();
+                            }),
+                        )
                         .child(self.render_entries(cx))
                         .children(sticky_user_message)
                         .vertical_scrollbar_for(&list_state, window, cx)
@@ -14325,6 +14514,7 @@ impl Render for ThreadView {
                 |this, bar| this.child(bar),
             )
             .child(conversation)
+            .children(self.render_middle_click_autoscroll(cx))
             .children(self.render_multi_root_callout(cx))
             .children(self.render_activity_bar(window, cx))
             .when_some(
