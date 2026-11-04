@@ -383,6 +383,7 @@ dependencies = [
  "smol",
  "tempfile",
  "util",
+ "windows 0.62.2",
 ]
 
 [[package]]
