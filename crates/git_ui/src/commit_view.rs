@@ -8,8 +8,9 @@ use editor::{
     hover_markdown_style, multibuffer_context_lines,
     scroll::ScrollAnchor,
 };
+use futures::StreamExt as _;
 use futures_lite::future::yield_now;
-use git::repository::{CommitDetails, RepoPath};
+use git::repository::{CommitDetails, LogOrder, LogSource, RepoPath};
 use git::status::{FileStatus, StatusCode, TrackedStatus};
 use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, ParsedGitRemote,
@@ -29,7 +30,9 @@ use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use multi_buffer::PathKey;
 use project::{
     Project, ProjectPath, WorktreeId,
-    git_store::{CommitDiff, CommitFile, Repository, UnshallowState},
+    git_store::{
+        CommitDiff, CommitFile, GitGraphEvent, Repository, RepositoryEvent, UnshallowState,
+    },
 };
 use settings::{DiffViewStyle, Settings};
 use std::{
@@ -437,6 +440,11 @@ impl CommitView {
         // A view filtered to a single file is opened to look at that file, so keep it expanded.
         let collapse_files = !commit_view_settings.expand_files && file_filter.is_none();
 
+        let history_path = file_filter
+            .clone()
+            .filter(|_| stash.is_none() && older_commit.is_none());
+        let commit_sha = commit.sha.clone();
+
         let load_diff_task = cx.spawn_in(window, async move |this, cx| {
             let mut file_statuses: HashMap<language::BufferId, FileStatus> = HashMap::default();
 
@@ -457,6 +465,8 @@ impl CommitView {
                     &repository_clone,
                     &project_clone,
                     &short_revision,
+                    None,
+                    FILE_NAMESPACE_SORT_PREFIX,
                     &language_registry,
                     // We'll only want to collapse the target file if it is a
                     // binary file, otherwise we'll always want it expanded,
@@ -483,6 +493,8 @@ impl CommitView {
                     &repository_clone,
                     &project_clone,
                     &short_revision,
+                    None,
+                    FILE_NAMESPACE_SORT_PREFIX,
                     &language_registry,
                     is_binary || collapse_files,
                     cx,
@@ -504,6 +516,20 @@ impl CommitView {
                     });
                 });
             })?;
+
+            if let Some(history_path) = history_path {
+                add_file_history(
+                    &this,
+                    history_path,
+                    &commit_sha,
+                    &repository_clone,
+                    &project_clone,
+                    &language_registry,
+                    cx,
+                )
+                .await
+                .log_err();
+            }
 
             anyhow::Ok(())
         });
@@ -543,12 +569,17 @@ impl CommitView {
         }
     }
 
+    /// Builds the buffer and diff of one file a commit changed and adds its hunks to
+    /// the view under `sort_prefix`, which keeps the same path from different commits
+    /// in separate excerpts.
     async fn append_commit_file(
         commit_view: &WeakEntity<Self>,
         file: CommitFile,
         repository: &Entity<Repository>,
         project: &Entity<Project>,
         short_revision: &str,
+        commit_subject: Option<&str>,
+        sort_prefix: u64,
         language_registry: &Arc<LanguageRegistry>,
         fold: bool,
         cx: &mut AsyncWindowContext,
@@ -576,7 +607,10 @@ impl CommitView {
             .file_name()
             .map(|name| name.to_string())
             .unwrap_or_else(|| file.path.display(PathStyle::local()).to_string());
-        let display_name = format!("{short_revision} - {file_name}");
+        let display_name = match commit_subject {
+            Some(subject) => format!("{short_revision} - {file_name} · {subject}"),
+            None => format!("{short_revision} - {file_name}"),
+        };
         let file = Arc::new(GitBlob {
             path: file.path.clone(),
             is_deleted,
@@ -617,10 +651,8 @@ impl CommitView {
 
         let (excerpt_ranges, path) = cx.update(|_window, cx| {
             let snapshot = buffer.read(cx).snapshot();
-            let path = PathKey::with_sort_prefix(
-                FILE_NAMESPACE_SORT_PREFIX,
-                snapshot.file().unwrap().path().clone(),
-            );
+            let path =
+                PathKey::with_sort_prefix(sort_prefix, snapshot.file().unwrap().path().clone());
 
             let ranges = if is_binary {
                 vec![language::Point::zero()..snapshot.max_point()]
@@ -1471,6 +1503,123 @@ async fn build_buffer_diff(
     .await;
 
     Ok(diff)
+}
+
+/// How many earlier commits of the file a single-file commit view appends.
+/// Each one loads that commit's whole diff, so the full history of a file with
+/// thousands of commits would take long and fill the view with excerpts.
+const FILE_HISTORY_COMMIT_LIMIT: usize = 50;
+
+/// Appends, newest first, what the commits before `commit_sha` changed in
+/// `path`, taken from the same path history the git graph shows for a file.
+async fn add_file_history(
+    this: &WeakEntity<CommitView>,
+    path: RepoPath,
+    commit_sha: &str,
+    repository: &Entity<Repository>,
+    project: &Entity<Project>,
+    language_registry: &Arc<LanguageRegistry>,
+    cx: &mut AsyncWindowContext,
+) -> Result<()> {
+    let log_source = LogSource::Path(path.clone());
+    let log_order = LogOrder::default();
+    let (loaded_tx, mut loaded_rx) = futures::channel::mpsc::unbounded::<()>();
+    // Subscribing in the same update that starts or reads the load means the
+    // event that ends it cannot be missed.
+    let (subscription, is_loading) = cx.update(|_, cx| {
+        let subscription = cx.subscribe(repository, {
+            let log_source = log_source.clone();
+            move |_, event: &RepositoryEvent, _| {
+                if let RepositoryEvent::GraphEvent(
+                    (event_source, event_order),
+                    GitGraphEvent::FullyLoaded | GitGraphEvent::LoadingError,
+                ) = event
+                    && *event_source == log_source
+                    && *event_order == log_order
+                {
+                    loaded_tx.unbounded_send(()).ok();
+                }
+            }
+        });
+        let is_loading = repository.update(cx, |repository, cx| {
+            repository
+                .graph_data(log_source.clone(), log_order, 0..0, cx)
+                .is_loading
+        });
+        (subscription, is_loading)
+    })?;
+    if is_loading {
+        loaded_rx.next().await;
+    }
+    drop(subscription);
+
+    let earlier_shas = cx.update(|_, cx| -> Result<Vec<String>> {
+        let graph_data = repository
+            .read(cx)
+            .get_graph_data(log_source, log_order)
+            .context("file history was not loaded")?;
+        if let Some(error) = &graph_data.error {
+            anyhow::bail!("failed to load file history: {error}");
+        }
+        Ok(graph_data
+            .commit_data
+            .iter()
+            .map(|commit| commit.sha.to_string())
+            .skip_while(|sha| sha != commit_sha)
+            .skip(1)
+            .take(FILE_HISTORY_COMMIT_LIMIT)
+            .collect())
+    })??;
+
+    for (index, sha) in earlier_shas.into_iter().enumerate() {
+        let (commit_diff, commit_details) = repository.update(cx, |repository, cx| {
+            (
+                repository.load_commit_diff(sha.clone(), false, cx),
+                repository.show_commit(sha.clone(), cx),
+            )
+        });
+        let (commit_diff, commit_details) = futures::join!(commit_diff, commit_details);
+        let Some(commit_diff) = commit_diff.log_err() else {
+            continue;
+        };
+        let subject = commit_details
+            .log_err()
+            .map(|details| truncate_and_trailoff(commit_subject(&details.message), 50));
+        let sort_prefix = FILE_NAMESPACE_SORT_PREFIX + 1 + index as u64;
+        // `--follow` also lists the commits from before a rename, whose diffs
+        // have the file under its old path, so those are left out.
+        for file in commit_diff
+            .files
+            .into_iter()
+            .filter(|file| file.path == path)
+        {
+            let is_binary = file.is_binary;
+            let (buffer_id, file_status) = CommitView::append_commit_file(
+                this,
+                file,
+                repository,
+                project,
+                short_sha(&sha),
+                subject.as_deref(),
+                sort_prefix,
+                language_registry,
+                is_binary,
+                cx,
+            )
+            .await?;
+            this.update(cx, |this, cx| {
+                this.editor.update(cx, |editor, cx| {
+                    editor.rhs_editor().update(cx, |editor, _cx| {
+                        if let Some(addon) = editor.addon_mut::<CommitDiffAddon>() {
+                            addon.file_statuses.insert(buffer_id, file_status);
+                        }
+                    });
+                });
+            })?;
+        }
+    }
+
+    Ok(())
 }
 
 impl EventEmitter<EditorEvent> for CommitView {}
