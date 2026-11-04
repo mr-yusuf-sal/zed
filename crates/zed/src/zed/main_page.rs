@@ -19,15 +19,16 @@ use workspace::{
 };
 
 /// The permanent "Main" tab: the project panel, the project's uncommitted and staged changes
-/// with a commit form, side by side. The git graph and Quarry open in its place instead of in
-/// tabs of their own.
+/// with a commit form, and Quarry, side by side. The git graph opens in its place instead of in
+/// a tab of its own.
 pub struct MainPage {
     workspace: WeakEntity<Workspace>,
     view: MainView,
     project_panel: Entity<ProjectPanel>,
     working_tree_changes: Entity<WorkingTreeChanges>,
-    /// Kept while another view is shown, so coming back finds them as they were left.
+    /// Kept while the overview is shown, so coming back finds it as it was left.
     git_graph: Option<Entity<GitGraph>>,
+    /// `None` only when the Quarry connection store failed to start.
     quarry: Option<Entity<QuarryPanel>>,
     nav_history: Option<ItemNavHistory>,
     _project_panel_focus: Subscription,
@@ -37,7 +38,6 @@ pub struct MainPage {
 enum MainView {
     Overview,
     GitGraph,
-    Quarry,
 }
 
 impl MainView {
@@ -47,7 +47,6 @@ impl MainView {
         match self {
             MainView::Overview => 0,
             MainView::GitGraph => 1,
-            MainView::Quarry => 2,
         }
     }
 }
@@ -62,6 +61,16 @@ impl MainPage {
     ) -> Self {
         let working_tree_changes =
             cx.new(|cx| WorkingTreeChanges::new(workspace.clone(), git_store, None, window, cx));
+        let quarry = match ConnectionStore::global(cx) {
+            Some(store) => {
+                let workspace = workspace.clone();
+                Some(cx.new(|cx| QuarryPanel::new(workspace, store, window, cx)))
+            }
+            None => {
+                log::error!("the Quarry connection store is unavailable");
+                None
+            }
+        };
         let project_panel_focus_handle = project_panel.read(cx).focus_handle(cx);
         // The project panel is only on screen in the overview, so whatever focuses it while the
         // tab shows something else, like Reveal in Project Panel, means to see it.
@@ -78,7 +87,7 @@ impl MainPage {
             project_panel,
             working_tree_changes,
             git_graph: None,
-            quarry: None,
+            quarry,
             nav_history: None,
             _project_panel_focus: project_panel_focus,
         }
@@ -190,26 +199,17 @@ fn show_git_graph(
     show(workspace, &main_page, MainView::GitGraph, window, cx);
 }
 
+/// Quarry is always on screen in the overview, so its shortcut only brings the overview up and
+/// moves focus into it.
 fn show_quarry(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     let Some(main_page) = workspace.items_of_type::<MainPage>(cx).next() else {
         quarry::panel::open(workspace, window, cx);
         return;
     };
-    if hide_if_shown(workspace, &main_page, MainView::Quarry, window, cx) {
-        return;
+    show(workspace, &main_page, MainView::Overview, window, cx);
+    if let Some(quarry) = main_page.read(cx).quarry.clone() {
+        window.focus(&quarry.focus_handle(cx), cx);
     }
-    if main_page.read(cx).quarry.is_none() {
-        let Some(store) = ConnectionStore::global(cx) else {
-            log::error!("the Quarry connection store is unavailable");
-            return;
-        };
-        let workspace_handle = workspace.weak_handle();
-        main_page.update(cx, |main_page, cx| {
-            main_page.quarry =
-                Some(cx.new(|cx| QuarryPanel::new(workspace_handle, store, window, cx)));
-        });
-    }
-    show(workspace, &main_page, MainView::Quarry, window, cx);
 }
 
 fn is_active_item(workspace: &Workspace, main_page: &Entity<MainPage>, cx: &App) -> bool {
@@ -278,15 +278,23 @@ impl MainPage {
                     .border_color(border_color)
                     .child(self.working_tree_changes.clone()),
             )
+            .children(self.quarry.clone().map(|quarry| {
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .border_l_1()
+                    .border_color(border_color)
+                    .child(quarry)
+            }))
             .into_any_element()
     }
 }
 
 impl Render for MainPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        match (self.view, &self.git_graph, &self.quarry) {
-            (MainView::GitGraph, Some(git_graph), _) => git_graph.clone().into_any_element(),
-            (MainView::Quarry, _, Some(quarry)) => quarry.clone().into_any_element(),
+        match (self.view, &self.git_graph) {
+            (MainView::GitGraph, Some(git_graph)) => git_graph.clone().into_any_element(),
             _ => self.render_overview(cx),
         }
     }
@@ -294,9 +302,8 @@ impl Render for MainPage {
 
 impl Focusable for MainPage {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        match (self.view, &self.git_graph, &self.quarry) {
-            (MainView::GitGraph, Some(git_graph), _) => git_graph.focus_handle(cx),
-            (MainView::Quarry, _, Some(quarry)) => quarry.focus_handle(cx),
+        match (self.view, &self.git_graph) {
+            (MainView::GitGraph, Some(git_graph)) => git_graph.focus_handle(cx),
             _ => self.project_panel.read(cx).focus_handle(cx),
         }
     }
@@ -308,11 +315,10 @@ impl Item for MainPage {
     type Event = ItemEvent;
 
     fn tab_content_text(&self, detail: usize, cx: &App) -> SharedString {
-        match (self.view, &self.git_graph, &self.quarry) {
-            (MainView::GitGraph, Some(git_graph), _) => {
+        match (self.view, &self.git_graph) {
+            (MainView::GitGraph, Some(git_graph)) => {
                 git_graph.read(cx).tab_content_text(detail, cx)
             }
-            (MainView::Quarry, _, Some(_)) => "Quarry".into(),
             _ => "Main".into(),
         }
     }
@@ -321,7 +327,6 @@ impl Item for MainPage {
         let icon = match self.view {
             MainView::Overview => IconName::FileTree,
             MainView::GitGraph => IconName::GitGraph,
-            MainView::Quarry => IconName::Server,
         };
         Some(Icon::new(icon))
     }

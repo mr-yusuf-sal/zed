@@ -137,7 +137,7 @@ fn connection_menu(
     )
 }
 
-/// `ToggleFocus` is handled by the zed crate, which shows Quarry in the Main tab and falls back
+/// `ToggleFocus` is handled by the zed crate, which focuses Quarry in the Main tab and falls back
 /// to `open` when there is none.
 pub fn init(cx: &mut App) {
     workspace::register_serializable_item::<QuarryPanel>(cx);
