@@ -137,19 +137,15 @@ fn connection_menu(
     )
 }
 
+/// `ToggleFocus` is handled by the zed crate, which shows Quarry in the Main tab and falls back
+/// to `open` when there is none.
 pub fn init(cx: &mut App) {
     workspace::register_serializable_item::<QuarryPanel>(cx);
-    cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
-        workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-            open(workspace, window, cx);
-        });
-    })
-    .detach();
 }
 
 /// Shows Quarry as a tab in the center, where there is room for its tree: the one already open
 /// in this workspace if there is one, or a new one in the active pane.
-fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+pub fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     let existing = workspace.items_of_type::<QuarryPanel>(cx).next();
     if let Some(existing) = existing {
         workspace.activate_item(&existing, true, true, window, cx);
