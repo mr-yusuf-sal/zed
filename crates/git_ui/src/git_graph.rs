@@ -1371,66 +1371,50 @@ pub fn init(cx: &mut App) {
                     })
                 },
             )
-            .when(
-                workspace.project().read(cx).active_repository(cx).is_some(),
-                |div| {
-                    let workspace = workspace.weak_handle();
-
-                    div.on_action({
-                        let workspace = workspace.clone();
-                        move |_: &Open, window, cx| {
-                            workspace
-                                .update(cx, |workspace, cx| {
-                                    let Some(repo) =
-                                        workspace.project().read(cx).active_repository(cx)
-                                    else {
-                                        return;
-                                    };
-                                    let selected_repo_id = repo.read(cx).id;
-
-                                    let git_store =
-                                        workspace.project().read(cx).git_store().clone();
-                                    open_or_reuse_graph(
-                                        workspace,
-                                        selected_repo_id,
-                                        git_store,
-                                        LogSource::All,
-                                        None,
-                                        window,
-                                        cx,
-                                    );
-                                })
-                                .ok();
-                        }
-                    })
-                    .on_action(move |action: &OpenAtCommit, window, cx| {
-                        let sha = action.sha.clone();
-                        workspace
-                            .update(cx, |workspace, cx| {
-                                let Some(repo) = workspace.project().read(cx).active_repository(cx)
-                                else {
-                                    return;
-                                };
-                                let selected_repo_id = repo.read(cx).id;
-
-                                let git_store = workspace.project().read(cx).git_store().clone();
-                                open_or_reuse_graph(
-                                    workspace,
-                                    selected_repo_id,
-                                    git_store,
-                                    LogSource::All,
-                                    Some(sha),
-                                    window,
-                                    cx,
-                                );
-                            })
-                            .ok();
-                    })
-                },
-            )
         });
     })
     .detach();
+}
+
+/// What `Open` and `OpenAtCommit` show. The zed crate handles those actions: it shows the
+/// project's graph in the Main tab, and falls back to `open_or_reuse_graph` without one.
+pub fn active_repository_target(
+    workspace: &Workspace,
+    cx: &App,
+) -> Option<(RepositoryId, Entity<GitStore>)> {
+    let project = workspace.project().read(cx);
+    let repository = project.active_repository(cx)?;
+    Some((repository.read(cx).id, project.git_store().clone()))
+}
+
+/// Points the project's graph, which is reused rather than opened again, at `repo_id`, and
+/// selects `sha` once it is loaded.
+pub fn retarget_project_graph(
+    git_graph: &Entity<GitGraph>,
+    repo_id: RepositoryId,
+    sha: Option<String>,
+    cx: &mut App,
+) {
+    git_graph.update(cx, |graph, cx| {
+        let switches_repository = graph.repo_id != repo_id;
+        graph.set_repo_id(repo_id, cx);
+        // A branch filter names a branch of the previous repository, and the commit to select
+        // may be outside the branch the graph is narrowed to.
+        if switches_repository || sha.is_some() {
+            graph.set_log_source(LogSource::All, cx);
+        }
+    });
+    select_commit_when_loaded(git_graph.clone(), sha, cx);
+}
+
+fn select_commit_when_loaded(git_graph: Entity<GitGraph>, sha: Option<String>, cx: &mut App) {
+    if let Some(sha) = sha {
+        cx.defer(move |cx| {
+            git_graph.update(cx, |graph, cx| {
+                graph.select_commit_by_sha(sha.as_str(), cx);
+            });
+        });
+    }
 }
 
 /// Resolves a `git::FileHistory` target from a known project path (used by
@@ -1512,20 +1496,13 @@ pub fn open_or_reuse_graph(
         }
     };
 
-    let git_graph = if let Some(existing) = existing {
-        if !matches!(log_source, LogSource::Path(_)) {
-            existing.update(cx, |graph, cx| {
-                let switches_repository = graph.repo_id != repo_id;
-                graph.set_repo_id(repo_id, cx);
-                // A branch filter names a branch of the previous repository, and the commit to
-                // select may be outside the branch the graph is narrowed to.
-                if switches_repository || sha.is_some() {
-                    graph.set_log_source(log_source.clone(), cx);
-                }
-            });
-        }
+    if let Some(existing) = existing {
         workspace.activate_item(&existing, true, true, window, cx);
-        existing
+        if matches!(log_source, LogSource::Path(_)) {
+            select_commit_when_loaded(existing, sha, cx);
+        } else {
+            retarget_project_graph(&existing, repo_id, sha, cx);
+        }
     } else {
         let workspace_handle = workspace.weak_handle();
         let git_graph = cx.new(|cx| {
@@ -1539,15 +1516,7 @@ pub fn open_or_reuse_graph(
             )
         });
         workspace.add_item_to_active_pane(Box::new(git_graph.clone()), None, true, window, cx);
-        git_graph
-    };
-
-    if let Some(sha) = sha {
-        cx.defer(move |cx| {
-            git_graph.update(cx, |graph, cx| {
-                graph.select_commit_by_sha(sha.as_str(), cx);
-            });
-        });
+        select_commit_when_loaded(git_graph, sha, cx);
     }
 }
 
