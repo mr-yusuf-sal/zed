@@ -3492,18 +3492,18 @@ pub struct AcpThread {
     available_commands: Vec<acp_v2::AvailableCommand>,
     _observe_prompt_capabilities: Task<anyhow::Result<()>>,
     _idle_sleep_subscriptions: Vec<Subscription>,
-    terminals: HashMap<acp_v1::TerminalId, Entity<Terminal>>,
-    pending_terminal_output: HashMap<acp_v1::TerminalId, Vec<Vec<u8>>>,
-    pending_terminal_exit: HashMap<acp_v1::TerminalId, acp_v1::TerminalExitStatus>,
+    terminals: HashMap<acp_v2::TerminalId, Entity<Terminal>>,
+    pending_terminal_output: HashMap<acp_v2::TerminalId, Vec<Vec<u8>>>,
+    pending_terminal_exit: HashMap<acp_v2::TerminalId, acp_v1::TerminalExitStatus>,
     /// The tool calls whose subagent the agent reports as still working. A
     /// subagent launched in the background outlives its tool call, which
     /// completes as soon as the launch does.
-    running_subagent_tool_calls: HashSet<acp_v1::ToolCallId>,
+    running_subagent_tool_calls: HashSet<acp_v2::ToolCallId>,
     /// The tool calls whose subagent the user asked to stop and that the
     /// agent has not yet reported as stopped. The agent sends nothing back
     /// for the request itself, so without this the subagent would still show
     /// as running until its stop arrives.
-    stopping_subagent_tool_calls: HashSet<acp_v1::ToolCallId>,
+    stopping_subagent_tool_calls: HashSet<acp_v2::ToolCallId>,
     had_error: bool,
     local_execution_error: Option<Arc<anyhow::Error>>,
     /// The user's unsent prompt text, persisted so it can be restored when reloading the thread.
@@ -3984,20 +3984,20 @@ impl AcpThread {
         &self.entries
     }
 
-    pub fn is_subagent_running(&self, tool_call_id: &acp_v1::ToolCallId) -> bool {
+    pub fn is_subagent_running(&self, tool_call_id: &acp_v2::ToolCallId) -> bool {
         self.running_subagent_tool_calls.contains(tool_call_id)
     }
 
-    pub fn can_stop_subagent(&self, tool_call_id: &acp_v1::ToolCallId) -> bool {
+    pub fn can_stop_subagent(&self, tool_call_id: &acp_v2::ToolCallId) -> bool {
         self.connection
             .can_stop_subagent(self.session_id(), tool_call_id)
     }
 
-    pub fn is_subagent_stopping(&self, tool_call_id: &acp_v1::ToolCallId) -> bool {
+    pub fn is_subagent_stopping(&self, tool_call_id: &acp_v2::ToolCallId) -> bool {
         self.stopping_subagent_tool_calls.contains(tool_call_id)
     }
 
-    pub fn stop_subagent(&mut self, tool_call_id: &acp_v1::ToolCallId, cx: &mut Context<Self>) {
+    pub fn stop_subagent(&mut self, tool_call_id: &acp_v2::ToolCallId, cx: &mut Context<Self>) {
         self.connection
             .stop_subagent(self.session_id(), tool_call_id, cx);
         if self
@@ -4011,7 +4011,7 @@ impl AcpThread {
 
     pub fn set_subagent_running(
         &mut self,
-        tool_call_id: acp_v1::ToolCallId,
+        tool_call_id: acp_v2::ToolCallId,
         running: bool,
         cx: &mut Context<Self>,
     ) {
@@ -4134,7 +4134,7 @@ impl AcpThread {
         cx.emit(AcpThreadEvent::AgentLocationChanged);
     }
 
-    pub fn session_id(&self) -> &acp_v1::SessionId {
+    pub fn session_id(&self) -> &acp_v2::SessionId {
         &self.session_info.session_id
     }
 
@@ -7226,8 +7226,12 @@ impl AcpThread {
         .detach();
     }
 
-    pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<()> {
-        self.cancel_inner(RequestPermissionOutcome::Cancelled, cx)
+    /// Receipt sessions wait for reported Idle without withdrawing pending prompt RPCs.
+    pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        match self.request_cancellation(RequestPermissionOutcome::Cancelled, cx) {
+            Ok(task) => task,
+            Err(error) => Task::ready(Err(error)),
+        }
     }
 
     fn request_cancellation(

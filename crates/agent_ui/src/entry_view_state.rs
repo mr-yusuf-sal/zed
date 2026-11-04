@@ -52,8 +52,8 @@ pub struct EntryViewState {
     auto_expanded_thinking_block: Option<(usize, usize)>,
     user_toggled_thinking_blocks: HashSet<(usize, usize)>,
     expanded_compactions: HashSet<usize>,
-    expanded_tool_calls: HashSet<acp_v1::ToolCallId>,
-    fully_shown_blocks: HashSet<(acp_v1::ToolCallId, ToolCallBlock)>,
+    expanded_tool_calls: HashSet<acp_v2::ToolCallId>,
+    fully_shown_blocks: HashSet<(acp_v2::ToolCallId, ToolCallBlock)>,
 }
 
 /// A multi-line part of a tool call card that is cut down to a few lines
@@ -114,7 +114,7 @@ impl EntryViewState {
 
     pub(crate) fn is_block_fully_shown(
         &self,
-        tool_call_id: &acp_v1::ToolCallId,
+        tool_call_id: &acp_v2::ToolCallId,
         block: ToolCallBlock,
     ) -> bool {
         self.fully_shown_blocks
@@ -123,7 +123,7 @@ impl EntryViewState {
 
     pub(crate) fn toggle_block_fully_shown(
         &mut self,
-        tool_call_id: &acp_v1::ToolCallId,
+        tool_call_id: &acp_v2::ToolCallId,
         block: ToolCallBlock,
     ) {
         let key = (tool_call_id.clone(), block);

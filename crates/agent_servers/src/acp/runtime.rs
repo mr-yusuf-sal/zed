@@ -209,6 +209,7 @@ mod tests {
             request_elicitations: store.clone(),
             active_request_scopes: None,
             pending_session_updates: None,
+            subagents: Rc::default(),
         };
         let (mut runtime, shutdown) = ClientRuntime::new(context, &mut cx.to_async());
         let retained_sender = runtime.sender();

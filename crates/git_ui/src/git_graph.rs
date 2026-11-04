@@ -33,7 +33,7 @@ use gpui::{
     Action, Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, DefiniteLength,
     DismissEvent, Div, DragMoveEvent, ElementId, Empty, Entity, EventEmitter, FocusHandle,
     Focusable, Hsla, MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, PromptLevel,
-    ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, Subscription, Task, TextRun,
+    ScrollEvent, ScrollHandle, ScrollStrategy, SharedString, Subscription, Task, TextRun,
     TextStyleRefinement, UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred,
     point, prelude::*, px, uniform_list,
 };

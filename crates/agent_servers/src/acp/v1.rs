@@ -3,8 +3,9 @@ use super::{
     ForegroundWork, UnsupportedVersion, drain_foreground_queue, enqueue_notification,
     enqueue_request, first_class_terminal_auth_task, handle_v2_complete_elicitation,
     handle_v2_create_elicitation, map_acp_error, mcp_configurations_for_project, respond_err,
-    respond_result, runtime, session_thread, terminal_auth_task_id, transport,
-    with_v2_client_ingress, work_dirs_from_session_info,
+    respond_result, root_session_id, root_subagent_session, runtime, session_thread,
+    terminal_auth_task_id, transport, with_v2_client_ingress, work_dirs_from_session_info,
+    SubagentSession,
 };
 use acp_thread::{
     AgentConnection, AgentSessionInfo, AgentSessionList, AgentSessionListRequest,
@@ -17,7 +18,8 @@ use agent_client_protocol::schema::{
     v2 as acp_v2,
 };
 use agent_client_protocol::{
-    Agent, Builder, Client, ConnectionTo, HandleDispatchFrom, Lines, Responder, V2Builder,
+    Agent, Builder, Client, ConnectionTo, HandleDispatchFrom, Handled, JsonRpcMessage, Lines,
+    Responder, UntypedMessage, V2Builder,
 };
 use anyhow::anyhow;
 use async_channel;
@@ -46,7 +48,7 @@ use acp_thread::{AcpThread, LoadError, TerminalProviderEvent};
 use terminal::TerminalBuilder;
 use terminal::terminal_settings::{AlternateScroll, CursorShape};
 
-use crate::{CURSOR_ID, GEMINI_ID};
+use crate::{CLAUDE_AGENT_ID, CURSOR_ID, GEMINI_ID};
 
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
 const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
@@ -75,6 +77,7 @@ pub struct AcpConnection {
     connection: ConnectionTo<Agent>,
     sessions: Rc<RefCell<HashMap<acp_v2::SessionId, AcpSession>>>,
     pending_sessions: RefCell<HashMap<acp_v2::SessionId, PendingAcpSession>>,
+    subagents: Rc<RefCell<HashMap<acp_v2::SessionId, SubagentSession>>>,
     auth_methods: Vec<acp_v2::AuthMethod>,
     agent_server_store: WeakEntity<AgentServerStore>,
     agent_capabilities: acp::AgentCapabilities,
@@ -174,6 +177,53 @@ struct PendingAcpSession {
 struct SessionConfigResponse {
     modes: Option<acp::SessionModeState>,
     config_options: Option<Vec<acp::SessionConfigOption>>,
+    /// The session's agent host reported a turn that an earlier Zed started
+    /// and that is still running.
+    turn_running: bool,
+}
+
+/// Shows the turn the agent host reported as running, and asks the host to
+/// say when it ends.
+fn adopt_agent_host_turn(
+    connection: &ConnectionTo<Agent>,
+    session_id: &acp_v2::SessionId,
+    thread: &Entity<AcpThread>,
+    cx: &mut AsyncApp,
+) {
+    let request = match UntypedMessage::new(
+        agent_host::AWAIT_TURN_METHOD,
+        serde_json::json!({ "sessionId": session_id.0 }),
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            log::error!("Failed to build the agent host turn request: {error:?}");
+            return;
+        }
+    };
+    let (stop_reason_sender, stop_reason_receiver) = futures::channel::oneshot::channel();
+    thread.update(cx, |thread, cx| {
+        thread.adopt_running_turn(stop_reason_receiver, cx)
+    });
+    let response = connection.send_request(request);
+    cx.spawn(async move |_| {
+        let stop_reason = match response.block_task().await {
+            Ok(response) => serde_json::from_value::<acp::PromptResponse>(response)
+                .map(|response| response.stop_reason)
+                .unwrap_or(acp::StopReason::EndTurn),
+            Err(error) => {
+                log::warn!("The agent host did not report the end of a running turn: {error:?}");
+                acp::StopReason::EndTurn
+            }
+        };
+        stop_reason_sender.send(stop_reason).ok();
+    })
+    .detach();
+}
+
+fn agent_host_turn_running(meta: Option<&acp::Meta>) -> bool {
+    meta.and_then(|meta| meta.get(agent_host::TURN_RUNNING_META_KEY))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 impl ConfigOptions {
@@ -395,6 +445,29 @@ fn client_builder(
     Client
         .builder()
         .name(name)
+        // Ahead of the typed session update handler, which cannot parse the
+        // subagent updates.
+        .on_receive_notification(
+            {
+                let dispatch_sender = dispatch_sender.clone();
+                async move |message: UntypedMessage, connection: ConnectionTo<Agent>| {
+                    if !acp::SessionNotification::matches_method(message.method())
+                        || !matches!(
+                            session_update_kind(&message),
+                            Some(SUBAGENT_UPDATE | SESSION_MESSAGE)
+                        )
+                    {
+                        return Ok(Handled::No {
+                            message: (message, connection),
+                            retry: false,
+                        });
+                    }
+                    enqueue_notification(&dispatch_sender, message, handle_subagent_notification);
+                    Ok(Handled::Yes)
+                }
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
         // --- Request handlers (agent→client) ---
         .on_receive_request(
             on_request!(handle_request_permission),
@@ -476,7 +549,59 @@ fn client_capabilities_for_agent(agent_id: &AgentId) -> acp::ClientCapabilities 
         .meta(meta)
 }
 
+const SUBAGENT_UPDATE: &str = "subagent_update";
+const SESSION_MESSAGE: &str = "session_message";
+
+/// The `initialize` request for `request`. Claude Code reports when a subagent
+/// it launched in the background stops only to a client that advertises
+/// `subagents`, which the protocol crate does not model yet; without it, Zed
+/// learns of such a subagent only that its tool call completed at launch.
+fn initialize_message(
+    agent_id: &AgentId,
+    request: acp::InitializeRequest,
+) -> Result<UntypedMessage> {
+    let mut params = serde_json::to_value(&request)?;
+    if agent_id.as_ref() == CLAUDE_AGENT_ID
+        && let Some(capabilities) = params
+            .get_mut("clientCapabilities")
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        capabilities.insert("subagents".into(), serde_json::json!({}));
+    }
+    Ok(UntypedMessage::new(
+        acp::AGENT_METHOD_NAMES.initialize,
+        params,
+    )?)
+}
+
+fn session_update_kind(message: &UntypedMessage) -> Option<&str> {
+    message
+        .params()
+        .get("update")?
+        .get("sessionUpdate")?
+        .as_str()
+}
+
 impl AcpConnection {
+    /// The session of the running subagent that does the work of
+    /// `tool_call_id` in `session_id`, when the agent stops it on its own.
+    fn cancellable_subagent(
+        &self,
+        session_id: &acp_v2::SessionId,
+        tool_call_id: &acp_v2::ToolCallId,
+    ) -> Option<acp_v2::SessionId> {
+        let subagents = self.subagents.borrow();
+        subagents
+            .iter()
+            .find(|(subagent_id, subagent)| {
+                subagent.running
+                    && subagent.cancellable
+                    && subagent.tool_call_id.as_ref() == Some(tool_call_id)
+                    && root_subagent_session(&subagents, subagent_id) == *session_id
+            })
+            .map(|(subagent_id, _)| subagent_id.clone())
+    }
+
     /// Binds supported v2 client handlers to the existing foreground owners.
     /// This does not change the protocol used by the connection's transport.
     pub fn with_v2_client_ingress<Handler: HandleDispatchFrom<Agent>>(
@@ -505,15 +630,20 @@ impl AcpConnection {
         cx: &mut AsyncApp,
     ) -> Result<Self> {
         let original_command = command.clone();
+        // Claude Code's turns can run for a long time, so its sessions are kept
+        // going in an agent host when Zed quits.
+        let hosted = agent_id.as_ref() == CLAUDE_AGENT_ID;
         let transport::StdioProcess {
             child,
+            status,
             incoming,
             outgoing,
             stderr,
             debug_log,
-        } = transport::spawn_stdio(&project, command, cx)?;
-        let mut child = transport::OwnedChild(child);
+        } = transport::spawn_stdio(&project, command, hosted, cx).await?;
+        let child = child.map(transport::OwnedChild);
         let sessions = Rc::new(RefCell::new(HashMap::default()));
+        let subagents = Rc::new(RefCell::new(HashMap::default()));
 
         let (release_channel, version): (Option<&str>, String) = cx.update(|cx| {
             (
@@ -533,6 +663,7 @@ impl AcpConnection {
             request_elicitations: request_elicitations.clone(),
             active_request_scopes: None,
             pending_session_updates: None,
+            subagents: subagents.clone(),
         };
         let (mut runtime, shutdown) = runtime::ClientRuntime::new(dispatch_context, cx);
         let dispatch_tx = runtime.sender();
@@ -560,9 +691,7 @@ impl AcpConnection {
                 .context("Failed to receive ACP connection handle")
         }
         .boxed_local();
-        let status_fut = child
-            .0
-            .status()
+        let status_fut = status
             .map(|status| {
                 status.map_err(|error| anyhow!("failed to wait for agent server exit: {error}"))
             })
@@ -584,18 +713,21 @@ impl AcpConnection {
             )
         };
 
-        let initialize_response = connection
-            .send_request(
-                acp::InitializeRequest::new(ProtocolVersion::V1)
-                    .client_capabilities(client_capabilities_for_agent(&agent_id))
-                    .client_info(
-                        acp::Implementation::new("zed", version)
-                            .title(release_channel.map(ToOwned::to_owned)),
-                    ),
-            )
-            .block_task()
-            .map(|response| response.map_err(anyhow::Error::from))
-            .boxed_local();
+        let initialize_request = initialize_message(
+            &agent_id,
+            acp::InitializeRequest::new(ProtocolVersion::V1)
+                .client_capabilities(client_capabilities_for_agent(&agent_id))
+                .client_info(
+                    acp::Implementation::new("zed", version)
+                        .title(release_channel.map(ToOwned::to_owned)),
+                ),
+        )?;
+        let initialize_response = connection.send_request(initialize_request).block_task();
+        let initialize_response = async move {
+            let response = initialize_response.await?;
+            Ok(serde_json::from_value::<acp::InitializeResponse>(response)?)
+        }
+        .boxed_local();
         let (response, status_fut, drained) =
             runtime::race_startup(initialize_response, status_fut, drained, &debug_log, cx).await?;
 
@@ -682,6 +814,7 @@ impl AcpConnection {
             agent_version,
             sessions,
             pending_sessions: RefCell::new(HashMap::default()),
+            subagents,
             agent_capabilities: response.agent_capabilities,
             request_elicitations,
             defaults,
@@ -692,7 +825,7 @@ impl AcpConnection {
             dispatch_tx,
             _wait_task: wait_task,
             _stderr_task: stderr_task,
-            _child: Some(child),
+            _child: child,
         })
     }
 
@@ -706,6 +839,7 @@ impl AcpConnection {
     fn new_for_test(
         connection: ConnectionTo<Agent>,
         sessions: Rc<RefCell<HashMap<acp_v2::SessionId, AcpSession>>>,
+        subagents: Rc<RefCell<HashMap<acp_v2::SessionId, SubagentSession>>>,
         agent_capabilities: acp::AgentCapabilities,
         request_elicitations: Entity<ElicitationStore>,
         agent_server_store: WeakEntity<AgentServerStore>,
@@ -725,6 +859,7 @@ impl AcpConnection {
             connection,
             sessions,
             pending_sessions: RefCell::new(HashMap::default()),
+            subagents,
             auth_methods: vec![],
             agent_server_store,
             agent_capabilities,
@@ -942,7 +1077,7 @@ impl AcpConnection {
                 let connection = self.connection.clone();
                 let dispatch_tx = self.dispatch_tx.clone();
                 let supports_close = self.agent_supports_session_close();
-                async move |_cx| {
+                async move |cx| {
                     if thread.upgrade().is_none() {
                         if let Some(this) = this.upgrade() {
                             this.remove_session(&session_id, thread.entity_id());
@@ -960,6 +1095,9 @@ impl AcpConnection {
                     let Some(connection_state) = this.upgrade() else {
                         return Ok(());
                     };
+                    let turn_running = response
+                        .as_ref()
+                        .is_ok_and(|response| response.turn_running);
                     let (modes, config_options) = match response
                         .and_then(|response| config_state(response.modes, response.config_options))
                     {
@@ -972,7 +1110,7 @@ impl AcpConnection {
                         }
                     };
 
-                    if let Some(_thread) = thread.upgrade() {
+                    if let Some(thread) = thread.upgrade() {
                         {
                             let mut sessions = connection_state.sessions.borrow_mut();
                             let Some(session) = sessions
@@ -989,6 +1127,9 @@ impl AcpConnection {
                             session.config_options = config_options;
                         }
                         connection_state.remove_pending_session(&session_id, thread.entity_id());
+                        if turn_running {
+                            adopt_agent_host_turn(&connection, &session_id, &thread, cx);
+                        }
                         return Ok(());
                     }
 
@@ -1441,6 +1582,7 @@ impl AgentConnection for AcpConnection {
                         .map_err(map_acp_error)?;
                     Ok(SessionConfigResponse {
                         modes: response.modes,
+                        turn_running: agent_host_turn_running(response.meta.as_ref()),
                         config_options: response.config_options,
                     })
                 })
@@ -1486,6 +1628,7 @@ impl AgentConnection for AcpConnection {
                         .map_err(map_acp_error)?;
                     Ok(SessionConfigResponse {
                         modes: response.modes,
+                        turn_running: agent_host_turn_running(response.meta.as_ref()),
                         config_options: response.config_options,
                     })
                 })
@@ -1632,6 +1775,30 @@ impl AgentConnection for AcpConnection {
             session.suppress_abort_err = true;
         }
         Ok(())
+    }
+
+    fn can_stop_subagent(
+        &self,
+        session_id: &acp_v2::SessionId,
+        tool_call_id: &acp_v2::ToolCallId,
+    ) -> bool {
+        self.cancellable_subagent(session_id, tool_call_id)
+            .is_some()
+    }
+
+    fn stop_subagent(
+        &self,
+        session_id: &acp_v2::SessionId,
+        tool_call_id: &acp_v2::ToolCallId,
+        _cx: &mut App,
+    ) {
+        if let Some(subagent_id) = self.cancellable_subagent(session_id, tool_call_id) {
+            self.connection
+                .send_notification(acp::CancelNotification::new(acp::SessionId::new(
+                    subagent_id.0,
+                )))
+                .log_err();
+        }
     }
 
     fn request_elicitations(&self) -> Option<Entity<ElicitationStore>> {
@@ -1954,6 +2121,23 @@ pub mod test_support {
             self.inner.cancel(session_id, cx)
         }
 
+        fn can_stop_subagent(
+            &self,
+            session_id: &acp_v2::SessionId,
+            tool_call_id: &acp_v2::ToolCallId,
+        ) -> bool {
+            self.inner.can_stop_subagent(session_id, tool_call_id)
+        }
+
+        fn stop_subagent(
+            &self,
+            session_id: &acp_v2::SessionId,
+            tool_call_id: &acp_v2::ToolCallId,
+            cx: &mut App,
+        ) {
+            self.inner.stop_subagent(session_id, tool_call_id, cx)
+        }
+
         fn request_elicitations(&self) -> Option<Entity<ElicitationStore>> {
             self.inner.request_elicitations()
         }
@@ -2175,12 +2359,14 @@ pub mod test_support {
         let auth_methods = acp_thread::auth_methods::from_v1(response.auth_methods)?;
 
         let request_elicitations = cx.new(|_| ElicitationStore::default());
+        let subagents = Rc::new(RefCell::new(HashMap::default()));
         let dispatch_context = ClientContext {
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
             active_request_scopes: None,
             pending_session_updates: None,
+            subagents: subagents.clone(),
         };
         let dispatch_task = cx.spawn({
             let mut dispatch_rx = dispatch_rx;
@@ -2198,6 +2384,7 @@ pub mod test_support {
             AcpConnection::new_for_test(
                 client_conn,
                 sessions,
+                subagents,
                 agent_capabilities,
                 request_elicitations,
                 agent_server_store,
@@ -6298,6 +6485,7 @@ mod tests {
                             async move {
                                 Ok(SessionConfigResponse {
                                     modes: None,
+                                    turn_running: false,
                                     config_options: Some(returned),
                                 })
                             }
@@ -6648,6 +6836,7 @@ mod tests {
                         async move {
                             Ok(SessionConfigResponse {
                                 modes: None,
+                                turn_running: false,
                                 config_options: Some(initial_options),
                             })
                         }
@@ -6696,6 +6885,7 @@ mod tests {
                         async move {
                             Ok(SessionConfigResponse {
                                 modes: None,
+                                turn_running: false,
                                 config_options: Some(replacement_options),
                             })
                         }
@@ -6879,6 +7069,7 @@ mod tests {
             AcpConnection::new_for_test(
                 client_conn,
                 sessions,
+                Rc::default(),
                 acp::AgentCapabilities::default(),
                 request_elicitations,
                 WeakEntity::new_invalid(),
@@ -7244,6 +7435,31 @@ exit 7
         Arc<std::sync::Mutex<Option<async_channel::Receiver<()>>>>,
         Task<anyhow::Result<()>>,
     ) {
+        connect_fake_agent_recording_cancels(
+            close_session_gate,
+            agent_sender,
+            new_session_behavior,
+            Arc::default(),
+            cx,
+        )
+        .await
+    }
+
+    async fn connect_fake_agent_recording_cancels(
+        close_session_gate: Option<async_channel::Receiver<()>>,
+        agent_sender: Option<futures::channel::oneshot::Sender<ConnectionTo<Client>>>,
+        new_session_behavior: Option<NewSessionTestBehavior>,
+        cancelled_sessions: Arc<std::sync::Mutex<Vec<acp::SessionId>>>,
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Rc<AcpConnection>,
+        Entity<project::Project>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<acp::SessionUpdate>>>,
+        Arc<std::sync::Mutex<Option<async_channel::Receiver<()>>>>,
+        Task<anyhow::Result<()>>,
+    ) {
         cx.update(|cx| {
             let store = settings::SettingsStore::test(cx);
             cx.set_global(store);
@@ -7397,7 +7613,16 @@ exit 7
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_notification(
-                async move |_notif: acp::CancelNotification, _cx| Ok(()),
+                {
+                    let cancelled_sessions = cancelled_sessions.clone();
+                    async move |notification: acp::CancelNotification, _cx| {
+                        cancelled_sessions
+                            .lock()
+                            .expect("cancelled sessions lock should not be poisoned")
+                            .push(notification.session_id);
+                        Ok(())
+                    }
+                },
                 agent_client_protocol::on_receive_notification!(),
             )
             .connect_with(agent_transport, async move |agent| {
@@ -7443,12 +7668,14 @@ exit 7
         let agent_capabilities = response.agent_capabilities;
 
         let request_elicitations = cx.new(|_| ElicitationStore::default());
+        let subagents = Rc::new(RefCell::new(HashMap::default()));
         let dispatch_context = ClientContext {
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
             active_request_scopes: None,
             pending_session_updates: None,
+            subagents: subagents.clone(),
         };
         // `TestAppContext::spawn` hands out an `AsyncApp` by value, whereas the
         // production path uses `Context::spawn` which hands out `&mut AsyncApp`.
@@ -7471,6 +7698,7 @@ exit 7
             AcpConnection::new_for_test(
                 client_conn,
                 sessions,
+                subagents,
                 agent_capabilities,
                 request_elicitations,
                 agent_server_store,
@@ -7832,6 +8060,7 @@ exit 7
             request_elicitations: store.clone(),
             active_request_scopes: None,
             pending_session_updates: None,
+            subagents: Rc::default(),
         };
         let (dispatch_tx, mut dispatch_rx) = mpsc::unbounded::<ForegroundWork>();
         let dispatch_task = cx.spawn(move |mut cx| async move {
@@ -7955,6 +8184,7 @@ exit 7
             request_elicitations: cx.new(|_| ElicitationStore::default()),
             active_request_scopes: None,
             pending_session_updates: None,
+            subagents: Rc::default(),
         };
         let (sender, mut receiver) = mpsc::unbounded::<ForegroundWork>();
         let cleanup = settle_after_disconnect(sender.clone()).boxed().shared();
@@ -8650,6 +8880,249 @@ exit 7
         );
     }
 
+    fn send_session_update(
+        agent: &ConnectionTo<Client>,
+        session_id: &str,
+        update: serde_json::Value,
+    ) {
+        agent
+            .send_notification(
+                agent_client_protocol::UntypedMessage::new(
+                    "session/update",
+                    serde_json::json!({ "sessionId": session_id, "update": update }),
+                )
+                .expect("build session update"),
+            )
+            .expect("send session update");
+    }
+
+    #[gpui::test]
+    async fn test_subagent_sessions_show_in_their_parent_session(cx: &mut gpui::TestAppContext) {
+        let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
+        let (connection, project, _, _, _, _, _keep_agent_alive) =
+            connect_fake_agent_with_handle(None, Some(agent_sender), cx).await;
+        let agent = agent_receiver.await.expect("receive fake agent handle");
+
+        let thread = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    acp_v2::SessionId::new("parent"),
+                    project.clone(),
+                    PathList::new(&[std::path::Path::new("/a")]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("session should load");
+
+        let launch_id = acp_v2::ToolCallId::new("launch");
+        send_session_update(
+            &agent,
+            "parent",
+            serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "launch",
+                "title": "Agent",
+                "status": "completed",
+                "_meta": { "claudeCode": { "toolName": "Agent" } },
+            }),
+        );
+        send_session_update(
+            &agent,
+            "parent",
+            serde_json::json!({
+                "sessionUpdate": "subagent_update",
+                "sessionId": "child",
+                "title": "general-purpose",
+                "state": { "state": "running" },
+            }),
+        );
+        send_session_update(
+            &agent,
+            "child",
+            serde_json::json!({
+                "sessionUpdate": "session_message",
+                "messageId": "launch",
+                "senderSessionId": "parent",
+                "recipientSessionId": "child",
+                "content": [{ "type": "text", "text": "Look around" }],
+            }),
+        );
+        send_session_update(
+            &agent,
+            "child",
+            serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "Looking around" },
+            }),
+        );
+        send_session_update(
+            &agent,
+            "child",
+            serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "read",
+                "title": "Read",
+                "status": "in_progress",
+            }),
+        );
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _| {
+            assert!(
+                thread.is_subagent_running(&launch_id),
+                "the subagent outlives its completed launch"
+            );
+            assert!(
+                !thread.can_stop_subagent(&launch_id),
+                "the announcement did not offer to cancel the subagent"
+            );
+            let parent_tool_use_ids = thread
+                .entries()
+                .iter()
+                .map(|entry| match entry {
+                    acp_thread::AgentThreadEntry::ToolCall(tool_call) => tool_call
+                        .meta
+                        .as_ref()
+                        .and_then(|meta| meta.get("claudeCode")?.get("parentToolUseId")?.as_str())
+                        .map(ToOwned::to_owned),
+                    _ => panic!("the subagent's messages are not the conversation's"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(parent_tool_use_ids, vec![None, Some("launch".to_owned())]);
+        });
+
+        send_session_update(
+            &agent,
+            "parent",
+            serde_json::json!({
+                "sessionUpdate": "subagent_update",
+                "sessionId": "child",
+                "state": { "state": "idle", "stopReason": "end_turn" },
+            }),
+        );
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, _| {
+            assert!(!thread.is_subagent_running(&launch_id));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_stopping_a_subagent_cancels_only_its_session(cx: &mut gpui::TestAppContext) {
+        let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
+        let cancelled_sessions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (connection, project, _, _, _, _, _keep_agent_alive) =
+            connect_fake_agent_recording_cancels(
+                None,
+                Some(agent_sender),
+                None,
+                cancelled_sessions.clone(),
+                cx,
+            )
+            .await;
+        let agent = agent_receiver.await.expect("receive fake agent handle");
+
+        let thread = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    acp_v2::SessionId::new("parent"),
+                    project,
+                    PathList::new(&[std::path::Path::new("/a")]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("session should load");
+
+        let launch_id = acp_v2::ToolCallId::new("launch");
+        send_session_update(
+            &agent,
+            "parent",
+            serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "launch",
+                "title": "Agent",
+                "status": "in_progress",
+                "_meta": { "claudeCode": { "toolName": "Agent" } },
+            }),
+        );
+        send_session_update(
+            &agent,
+            "parent",
+            serde_json::json!({
+                "sessionUpdate": "subagent_update",
+                "sessionId": "child",
+                "title": "general-purpose",
+                "capabilities": { "cancel": {} },
+                "state": { "state": "running" },
+            }),
+        );
+        send_session_update(
+            &agent,
+            "child",
+            serde_json::json!({
+                "sessionUpdate": "session_message",
+                "messageId": "launch",
+                "senderSessionId": "parent",
+                "recipientSessionId": "child",
+                "content": [{ "type": "text", "text": "Look around" }],
+            }),
+        );
+        send_session_update(
+            &agent,
+            "parent",
+            serde_json::json!({
+                "sessionUpdate": "subagent_update",
+                "sessionId": "child",
+                "state": { "state": "requires_action" },
+            }),
+        );
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _| {
+            assert!(thread.is_subagent_running(&launch_id));
+            assert!(
+                thread.can_stop_subagent(&launch_id),
+                "an update without capabilities keeps the announced cancel"
+            );
+            assert!(!thread.can_stop_subagent(&acp_v2::ToolCallId::new("other")));
+        });
+
+        thread.update(cx, |thread, cx| thread.stop_subagent(&launch_id, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            *cancelled_sessions
+                .lock()
+                .expect("cancelled sessions lock should not be poisoned"),
+            vec![acp::SessionId::new("child")],
+            "only the subagent's session is cancelled, not its parent's"
+        );
+        thread.read_with(cx, |thread, _| {
+            assert!(
+                thread.is_subagent_stopping(&launch_id),
+                "the subagent leaves the running list before the agent reports its stop"
+            );
+        });
+
+        send_session_update(
+            &agent,
+            "parent",
+            serde_json::json!({
+                "sessionUpdate": "subagent_update",
+                "sessionId": "child",
+                "state": { "state": "idle", "stopReason": "cancelled" },
+            }),
+        );
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, _| {
+            assert!(!thread.is_subagent_running(&launch_id));
+            assert!(!thread.is_subagent_stopping(&launch_id));
+            assert!(!thread.can_stop_subagent(&launch_id));
+        });
+    }
+
     #[gpui::test]
     async fn test_load_initializes_config_before_draining_queued_updates(
         cx: &mut gpui::TestAppContext,
@@ -8687,6 +9160,7 @@ exit 7
                                 );
                                 Ok(SessionConfigResponse {
                                     modes: None,
+                                    turn_running: false,
                                     config_options: Some(vec![acp::SessionConfigOption::boolean(
                                         "web_search",
                                         "Web Search",
@@ -9556,12 +10030,180 @@ fn handle_read_text_file(
     .detach();
 }
 
+/// The session's subagent updates. Claude Code sends them as `session/update`
+/// notifications that the typed handler cannot parse.
+fn handle_subagent_notification(message: UntypedMessage, cx: &mut AsyncApp, ctx: &ClientContext) {
+    let params = message.params();
+    let Some(session_id) = params.get("sessionId").and_then(serde_json::Value::as_str) else {
+        return;
+    };
+    let session_id = acp_v2::SessionId::new(session_id);
+    let Some(update) = params.get("update") else {
+        return;
+    };
+    match session_update_kind(&message) {
+        Some(SUBAGENT_UPDATE) => {
+            let Some(subagent_id) = update.get("sessionId").and_then(serde_json::Value::as_str)
+            else {
+                return;
+            };
+            let subagent_id = acp_v2::SessionId::new(subagent_id);
+            if subagent_id == session_id {
+                return;
+            }
+            // Without a state, the update restores an ancestor of a resumed
+            // subagent, which says nothing about whether it works.
+            let running = update
+                .get("state")
+                .and_then(|state| state.get("state"))
+                .and_then(serde_json::Value::as_str)
+                .map(|state| matches!(state, "running" | "requires_action"));
+            let tool_call_id = {
+                let mut subagents = ctx.subagents.borrow_mut();
+                let subagent =
+                    subagents
+                        .entry(subagent_id.clone())
+                        .or_insert_with(|| SubagentSession {
+                            parent_session_id: session_id,
+                            tool_call_id: None,
+                            running: false,
+                            cancellable: false,
+                        });
+                // Only the announcement lists the capabilities.
+                if let Some(capabilities) = update.get("capabilities") {
+                    subagent.cancellable = capabilities.get("cancel").is_some();
+                }
+                if let Some(running) = running {
+                    subagent.running = running;
+                }
+                subagent.tool_call_id.clone()
+            };
+            if let (Some(tool_call_id), Some(running)) = (tool_call_id, running) {
+                set_subagent_running(ctx, &subagent_id, tool_call_id, running, cx);
+            }
+        }
+        // The message that launched or resumed a subagent. Its id is the tool
+        // call that sent it, unless the agent did not know that call.
+        Some(SESSION_MESSAGE) => {
+            let Some(message_id) = update.get("messageId").and_then(serde_json::Value::as_str)
+            else {
+                return;
+            };
+            if message_id.starts_with(&format!("{session_id}:")) {
+                return;
+            }
+            link_subagent_tool_call(ctx, &session_id, acp_v2::ToolCallId::new(message_id), cx);
+        }
+        _ => {}
+    }
+}
+
+/// Makes `tool_call_id` the tool call whose work the subagent of
+/// `subagent_id` does, in place of the one it did before.
+fn link_subagent_tool_call(
+    ctx: &ClientContext,
+    subagent_id: &acp_v2::SessionId,
+    tool_call_id: acp_v2::ToolCallId,
+    cx: &mut AsyncApp,
+) {
+    let (previous_tool_call_id, running) = {
+        let mut subagents = ctx.subagents.borrow_mut();
+        let Some(subagent) = subagents.get_mut(subagent_id) else {
+            return;
+        };
+        if subagent.tool_call_id.as_ref() == Some(&tool_call_id) {
+            return;
+        }
+        (
+            subagent.tool_call_id.replace(tool_call_id.clone()),
+            subagent.running,
+        )
+    };
+    if let Some(previous_tool_call_id) = previous_tool_call_id {
+        set_subagent_running(ctx, subagent_id, previous_tool_call_id, false, cx);
+    }
+    if running {
+        set_subagent_running(ctx, subagent_id, tool_call_id, true, cx);
+    }
+}
+
+fn set_subagent_running(
+    ctx: &ClientContext,
+    subagent_id: &acp_v2::SessionId,
+    tool_call_id: acp_v2::ToolCallId,
+    running: bool,
+    cx: &mut AsyncApp,
+) {
+    let Ok(thread) = session_thread(ctx, subagent_id) else {
+        return;
+    };
+    thread
+        .update(cx, |thread, cx| {
+            thread.set_subagent_running(tool_call_id, running, cx)
+        })
+        .ok();
+}
+
+/// Shows an update of a subagent session in the session it runs under. Only
+/// its tool calls are shown, under the tool call that delegated to it; the
+/// subagent's own messages are not the conversation's.
+fn handle_subagent_session_notification(
+    mut notification: acp::SessionNotification,
+    subagent_id: acp_v2::SessionId,
+    cx: &mut AsyncApp,
+    ctx: &ClientContext,
+) {
+    let meta = match &mut notification.update {
+        acp::SessionUpdate::ToolCall(tool_call) => &mut tool_call.meta,
+        acp::SessionUpdate::ToolCallUpdate(tool_call_update) => &mut tool_call_update.meta,
+        _ => return,
+    };
+    let parent_tool_use_id = meta
+        .as_ref()
+        .and_then(|meta| meta.get("claudeCode")?.get("parentToolUseId")?.as_str())
+        .map(acp_v2::ToolCallId::new);
+    match parent_tool_use_id {
+        Some(parent_tool_use_id) => {
+            let unlinked = ctx
+                .subagents
+                .borrow()
+                .get(&subagent_id)
+                .is_some_and(|subagent| subagent.tool_call_id.is_none());
+            if unlinked {
+                link_subagent_tool_call(ctx, &subagent_id, parent_tool_use_id, cx);
+            }
+        }
+        None => {
+            let tool_call_id = ctx
+                .subagents
+                .borrow()
+                .get(&subagent_id)
+                .and_then(|subagent| subagent.tool_call_id.clone());
+            if let Some(tool_call_id) = tool_call_id {
+                let claude_code = meta
+                    .get_or_insert_with(Default::default)
+                    .entry("claudeCode")
+                    .or_insert_with(|| serde_json::json!({}));
+                if let Some(claude_code) = claude_code.as_object_mut() {
+                    claude_code.insert("parentToolUseId".into(), tool_call_id.0.to_string().into());
+                }
+            }
+        }
+    }
+    notification.session_id = acp::SessionId::new(root_session_id(ctx, &subagent_id).0);
+    handle_session_notification(notification, cx, ctx);
+}
+
 fn handle_session_notification(
     notification: acp::SessionNotification,
     cx: &mut AsyncApp,
     ctx: &ClientContext,
 ) {
-    let session_id = acp_v2::SessionId::new(notification.session_id.0);
+    let session_id = acp_v2::SessionId::new(notification.session_id.0.clone());
+    if ctx.subagents.borrow().contains_key(&session_id) {
+        handle_subagent_session_notification(notification, session_id, cx, ctx);
+        return;
+    }
     // Extract everything we need from the session while briefly borrowing.
     let (thread, session_modes, config_opts_data) = {
         let sessions = ctx.sessions.borrow();

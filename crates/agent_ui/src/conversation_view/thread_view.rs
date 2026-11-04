@@ -338,14 +338,14 @@ struct ParsedCatNumberedCode {
 
 /// The Agent/Task tool call whose subagent made `tool_call`, as Claude Code
 /// tags it in `_meta.claudeCode.parentToolUseId`.
-fn subagent_parent_tool_call_id(tool_call: &ToolCall) -> Option<acp_v1::ToolCallId> {
+fn subagent_parent_tool_call_id(tool_call: &ToolCall) -> Option<acp_v2::ToolCallId> {
     let parent_id = tool_call
         .meta
         .as_ref()?
         .get("claudeCode")?
         .get("parentToolUseId")?
         .as_str()?;
-    Some(acp_v1::ToolCallId::new(parent_id))
+    Some(acp_v2::ToolCallId::new(parent_id))
 }
 
 /// Whether `tool_call` is Claude Code's Agent (formerly Task) tool, which
@@ -718,16 +718,16 @@ pub struct ThreadView {
     sticky_user_message_ix: Option<usize>,
     middle_click_autoscroll: Option<MiddleClickAutoscroll>,
     pub session_capabilities: SharedSessionCapabilities,
-    pub expanded_tool_call_raw_inputs: HashSet<acp_v1::ToolCallId>,
+    pub expanded_tool_call_raw_inputs: HashSet<acp_v2::ToolCallId>,
     /// Agent tool calls whose subagent's tool calls are all shown, rather than
     /// only the latest.
-    expanded_subagent_activity: HashSet<acp_v1::ToolCallId>,
+    expanded_subagent_activity: HashSet<acp_v2::ToolCallId>,
     /// The launching tool call of each subagent tool call seen so far. A tool
     /// call update replaces the whole `_meta`, so the tag that names the
     /// parent is remembered rather than read from the latest one only.
-    subagent_parent_ids: RefCell<HashMap<acp_v1::ToolCallId, acp_v1::ToolCallId>>,
-    collapsed_sandbox_authorization_details: HashSet<acp_v1::ToolCallId>,
-    collapsed_sandbox_network_details: HashSet<acp_v1::ToolCallId>,
+    subagent_parent_ids: RefCell<HashMap<acp_v2::ToolCallId, acp_v2::ToolCallId>>,
+    collapsed_sandbox_authorization_details: HashSet<acp_v2::ToolCallId>,
+    collapsed_sandbox_network_details: HashSet<acp_v2::ToolCallId>,
     /// Sandbox escalation prompts whose "surprising Unicode" warning the user
     /// has explicitly acknowledged. Until a prompt's tool call is in this set,
     /// its allow buttons stay disabled. See [`Self::sandbox_confusable_findings`].
@@ -3000,8 +3000,16 @@ impl ThreadView {
 
         let cancelled = self.thread.update(cx, |thread, cx| thread.cancel(cx));
 
-        let contents_task = cx.spawn_in(window, async move |_this, _cx| {
-            cancelled.await;
+        let contents_task = cx.spawn_in(window, async move |this, cx| {
+            if let Err(error) = cancelled.await {
+                this.update(cx, |this, cx| {
+                    this.message_queue.restore_after_failed_send(entry);
+                    this.sync_queue_flag_to_native_thread(cx);
+                    cx.notify();
+                })
+                .log_err();
+                return Err(error);
+            }
 
             Ok(Some((entry.content, entry.tracked_buffers)))
         });
@@ -3281,7 +3289,7 @@ impl ThreadView {
 
     pub fn authorize_pending_tool_call(
         &mut self,
-        kind: acp_v1::PermissionOptionKind,
+        kind: acp_v2::PermissionOptionKind,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<()> {
@@ -4748,7 +4756,7 @@ impl ThreadView {
     fn running_subagents(
         &self,
         cx: &App,
-    ) -> Vec<(usize, SharedString, usize, Option<acp_v1::ToolCallId>)> {
+    ) -> Vec<(usize, SharedString, usize, Option<acp_v2::ToolCallId>)> {
         let thread = self.thread.read(cx);
         let entries = thread.entries();
         entries
@@ -9317,7 +9325,7 @@ impl ThreadView {
     fn render_collapsible_command(
         &self,
         group: SharedString,
-        tool_call_id: &acp_v1::ToolCallId,
+        tool_call_id: &acp_v2::ToolCallId,
         is_preview: bool,
         command: Entity<Markdown>,
         window: &Window,
@@ -9601,7 +9609,10 @@ impl ThreadView {
                                     .child(div().flex_none().child(terminal_view))
                                     .into_any_element()
                             } else if is_scrollable {
-                                div().h_72().child(terminal_view).into_any_element()
+                                div()
+                                    .h(rems(18. + TERMINAL_CONTENT_TOP_PADDING))
+                                    .child(terminal_view)
+                                    .into_any_element()
                             } else {
                                 terminal_view.into_any_element()
                             };
@@ -9741,6 +9752,7 @@ impl ThreadView {
         div()
             .w_full()
             .id(container_id)
+            .debug_selector(|| format!("tool-call-{}-{}", tool_call.id.0, layout.id_str()))
             .map(|this| {
                 if tool_call.is_subagent() {
                     this.child(
@@ -9757,6 +9769,11 @@ impl ThreadView {
                             cx,
                         ),
                     )
+                    .children(self.render_generic_tool_permissions(
+                        active_session_id,
+                        tool_call,
+                        cx,
+                    ))
                 } else if has_terminals {
                     this.children(tool_call.terminals().map(|terminal| {
                         self.render_terminal_tool_call(
@@ -9793,7 +9810,7 @@ impl ThreadView {
             })
     }
 
-    fn subagent_parent_id(&self, tool_call: &ToolCall) -> Option<acp_v1::ToolCallId> {
+    fn subagent_parent_id(&self, tool_call: &ToolCall) -> Option<acp_v2::ToolCallId> {
         let mut parent_ids = self.subagent_parent_ids.borrow_mut();
         if let Some(parent_id) = subagent_parent_tool_call_id(tool_call) {
             parent_ids.insert(tool_call.id.clone(), parent_id.clone());
@@ -9808,7 +9825,7 @@ impl ThreadView {
     /// one (and any waiting for permission) shows, as the subagent's progress.
     fn render_subagent_activity(
         &self,
-        active_session_id: &acp_v1::SessionId,
+        active_session_id: &acp_v2::SessionId,
         entry_ix: usize,
         tool_call: &ToolCall,
         focus_handle: &FocusHandle,
@@ -12375,7 +12392,7 @@ impl ThreadView {
     /// with a button under it that switches between all of it and the preview.
     fn render_line_clamped_block(
         &self,
-        tool_call_id: &acp_v1::ToolCallId,
+        tool_call_id: &acp_v2::ToolCallId,
         block: ToolCallBlock,
         line_count: usize,
         line_height: Pixels,
@@ -12412,7 +12429,7 @@ impl ThreadView {
 
     fn render_block_toggle(
         &self,
-        tool_call_id: &acp_v1::ToolCallId,
+        tool_call_id: &acp_v2::ToolCallId,
         block: ToolCallBlock,
         is_fully_shown: bool,
         show_all_label: &'static str,

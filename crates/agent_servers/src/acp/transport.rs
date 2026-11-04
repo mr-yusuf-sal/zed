@@ -9,7 +9,7 @@ use futures::{
 };
 use gpui::{AsyncApp, Entity};
 use project::{Project, agent_server_store::AgentServerCommand};
-use remote::remote_client::Interactive;
+use remote::command::RemoteCommand;
 use std::{
     io,
     pin::Pin,
@@ -122,7 +122,7 @@ pub(super) async fn spawn_stdio(
         .inspect(record_incoming_line(debug_log.clone()))
         .boxed();
 
-    let outgoing = outgoing_sink(stdin, debug_log.clone());
+    let outgoing = outgoing_sink(stdin, debug_log.clone(), command_input);
 
     let stderr = {
         let debug_log = debug_log.clone();
@@ -159,7 +159,7 @@ fn hosted_process(connection: agent_host::HostConnection) -> StdioProcess {
         .inspect(record_incoming_line(debug_log.clone()))
         .boxed();
 
-    let outgoing = outgoing_sink(connection.writer, debug_log.clone());
+    let outgoing = outgoing_sink(connection.writer, debug_log.clone(), None);
 
     // The host sends the agent's stdout, stderr and exit over one socket, so
     // the task the connection runs for stderr routes all three.
@@ -217,15 +217,19 @@ fn record_incoming_line(debug_log: AcpDebugLog) -> impl FnMut(&io::Result<String
 fn outgoing_sink(
     writer: impl AsyncWrite + Send + 'static,
     debug_log: AcpDebugLog,
+    command_input: Option<Vec<u8>>,
 ) -> Pin<Box<dyn Sink<String, Error = io::Error> + Send>> {
     Box::pin(futures::sink::unfold(
-        (Box::pin(writer), debug_log),
-        async move |(mut writer, debug_log), line: String| {
+        (Box::pin(writer), debug_log, command_input),
+        async move |(mut writer, debug_log, mut command_input), line: String| {
+            if let Some(input) = command_input.take() {
+                writer.write_all(&input).await?;
+            }
             debug_log.record_line(AcpDebugMessageDirection::Outgoing, &line);
             let mut bytes = line.into_bytes();
             bytes.push(b'\n');
             writer.write_all(&bytes).await?;
-            Ok::<_, io::Error>((writer, debug_log))
+            Ok::<_, io::Error>((writer, debug_log, command_input))
         },
     ))
 }

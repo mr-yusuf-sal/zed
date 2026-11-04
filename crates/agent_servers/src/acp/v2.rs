@@ -224,15 +224,17 @@ impl AcpV2Connection {
     ) -> Result<Self> {
         let transport::StdioProcess {
             child,
+            status,
             incoming,
             outgoing,
             stderr,
             debug_log,
-        } = transport::spawn_stdio(&project, command, cx)?;
-        let mut child = transport::OwnedChild(child);
-        let status = child
-            .0
-            .status()
+        } = transport::spawn_stdio(&project, command, false, cx).await?;
+        // Without an agent host the agent always runs as Zed's own child.
+        let child = transport::OwnedChild(
+            child.context("ACP v2 agent was not spawned as a child process")?,
+        );
+        let status = status
             .map(|result| {
                 result.map_err(|error| anyhow!("failed to wait for agent server exit: {error}"))
             })
@@ -337,6 +339,7 @@ impl AcpV2Connection {
             session_list: Rc::new(RefCell::new(None)),
             request_elicitations: request_elicitations.clone(),
             active_request_scopes: Some(RefCell::new(Default::default())),
+            subagents: Rc::default(),
         };
         let (mut client_runtime, shutdown) = runtime::ClientRuntime::new(context, cx);
         let dispatch_tx = client_runtime.sender();
