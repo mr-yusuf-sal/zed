@@ -891,6 +891,17 @@ impl WorkingTreeChanges {
                 .child(editor)
         };
         let committing = self.pending_commit.is_some();
+        let unpushed_commits = repository
+            .as_ref()
+            .and_then(|repository| repository.read(cx).branch.as_ref())
+            .and_then(|branch| branch.upstream.as_ref())
+            .and_then(|upstream| upstream.tracking.status())
+            .map_or(0, |status| status.ahead);
+        let push_label: SharedString = if unpushed_commits > 0 {
+            format!("Push {unpushed_commits}").into()
+        } else {
+            "Push".into()
+        };
         v_flex()
             .p_2()
             .gap_1p5()
@@ -919,7 +930,7 @@ impl WorkingTreeChanges {
                     .gap_1()
                     .justify_end()
                     .child(
-                        Button::new("push", "Push")
+                        Button::new("push", push_label)
                             .start_icon(Icon::new(IconName::ArrowUp).size(IconSize::Small))
                             .disabled(repository.is_none())
                             .on_click({
@@ -1130,9 +1141,15 @@ impl Render for WorkingTreeChanges {
             cx,
         );
         v_flex()
+            .key_context("WorkingTreeChanges")
             .track_focus(&self.focus_handle)
             // Enter in the commit title commits, instead of reaching the view this list is in.
             .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                this.commit(window, cx);
+            }))
+            // Bound to ctrl-enter in both commit editors. Handled here so it commits this
+            // form's repository rather than reaching the git panel's handler.
+            .on_action(cx.listener(|this, _: &git::Commit, window, cx| {
                 this.commit(window, cx);
             }))
             .size_full()

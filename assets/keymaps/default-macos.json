@@ -1192,6 +1192,14 @@
     },
   },
   {
+    // The commit form of the Main tab and the git graph's uncommitted changes.
+    "context": "WorkingTreeChanges > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-enter": "git::Commit",
+    },
+  },
+  {
     "context": "GitPanel",
     "use_key_equivalents": true,
     "bindings": {
