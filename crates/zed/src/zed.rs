@@ -676,6 +676,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         let panels_task = initialize_panels(window, cx);
         workspace.set_panels_task(panels_task);
         register_actions(app_state.clone(), workspace, window, cx);
+        main_page::register_actions(workspace);
 
         if !workspace.has_active_modal(window, cx) {
             workspace.focus_handle(cx).focus(window, cx);
