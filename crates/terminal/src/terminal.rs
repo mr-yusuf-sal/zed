@@ -1331,7 +1331,11 @@ impl TerminalBuilder {
                             .map(|(key, value)| (key.clone(), value.clone()))
                             .collect(),
                         working_directory: working_directory.clone(),
+                        #[cfg(windows)]
                         escape_args: shell_kind.tty_escape_args(),
+                        // Only Windows' PTY reads this.
+                        #[cfg(not(windows))]
+                        escape_args: true,
                         scrolling_history,
                         size: ScreenSize::from_bounds(TerminalBounds::default()),
                     };
