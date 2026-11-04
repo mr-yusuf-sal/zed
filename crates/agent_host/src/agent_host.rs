@@ -70,6 +70,44 @@ pub const TURN_RUNNING_META_KEY: &str = "zedAgentHostTurnRunning";
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(windows)]
+static IS_ELEVATED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(is_elevated);
+
+#[cfg(windows)]
+fn is_elevated() -> bool {
+    use util::ResultExt as _;
+    use windows::Win32::{
+        Foundation::{CloseHandle, HANDLE},
+        Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation},
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    let mut token = HANDLE::default();
+    if let Err(error) = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } {
+        log::error!("Failed to open the process token: {error}");
+        return false;
+    }
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut length = 0u32;
+    let result = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            Some((&raw mut elevation).cast()),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut length,
+        )
+    };
+    unsafe { CloseHandle(token) }.log_err();
+    match result {
+        Ok(()) => elevation.TokenIsElevated != 0,
+        Err(error) => {
+            log::error!("Failed to query the token elevation: {error}");
+            false
+        }
+    }
+}
+
 /// Allows agents to be launched through a host process. Only the Zed binary
 /// handles `--agent-host`, so test binaries and other embedders of the agent
 /// crates must keep spawning agents directly.
@@ -123,6 +161,13 @@ impl HostedCommand {
         hasher.update([0]);
         if let Some(current_dir) = &self.current_dir {
             hasher.update(current_dir.to_string_lossy().as_bytes());
+        }
+        // An agent runs with the token of the host that spawned it, so an elevated Zed must not
+        // pick up a host an unelevated Zed started, or the other way round. Only the elevated key
+        // changes, so unelevated hosts from before this keep being found.
+        #[cfg(windows)]
+        if *IS_ELEVATED {
+            hasher.update(b"\0elevated");
         }
         let digest = hasher.finalize();
         let name: String = digest
