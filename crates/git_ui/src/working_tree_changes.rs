@@ -20,7 +20,7 @@ use ui::{
 use util::ResultExt as _;
 use workspace::Workspace;
 
-use crate::{git_status_icon, project_diff::ProjectDiff};
+use crate::{commit_view::FileHistoryView, git_status_icon, project_diff::ProjectDiff};
 
 /// The uncommitted and staged changes of a project's repositories, with buttons to stage,
 /// unstage and discard them, and a form to commit the staged ones and push.
@@ -348,10 +348,9 @@ impl WorkingTreeChanges {
         file: &ChangedFile,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let workspace = self.workspace.clone();
-        let project_path = file.project_path.clone();
         let repository_handle = repository.repository.clone();
-        let diff_repository = repository.repository.clone();
+        let history_repository = repository.repository.clone();
+        let history_repo_path = file.repo_path.clone();
         let repo_path = file.repo_path.clone();
         let menu_this = cx.weak_entity();
         let menu_repository = repository.repository.clone();
@@ -429,39 +428,9 @@ impl WorkingTreeChanges {
                             })),
                     ),
             )
-            .on_click(move |_, window, cx| {
-                let workspace = workspace.clone();
-                let project_path = project_path.clone();
-                let diff_repository = diff_repository.clone();
-                // Opening the diff deactivates the tab showing this list, which updates it, and
-                // the click is handled while that tab may still be updating.
-                window.defer(cx, move |window, cx| {
-                    workspace
-                        .update(cx, |workspace, cx| match project_path {
-                            Some(project_path) => ProjectDiff::deploy_at_project_path(
-                                workspace,
-                                project_path,
-                                window,
-                                cx,
-                            ),
-                            None => {
-                                ProjectDiff::deploy_at(workspace, None, window, cx);
-                                // `deploy_at` shows the active repository, which may not be the
-                                // one this file belongs to.
-                                let project_diff =
-                                    workspace.items_of_type::<ProjectDiff>(cx).next();
-                                if let Some(repository) = diff_repository.upgrade()
-                                    && let Some(project_diff) = project_diff
-                                {
-                                    project_diff.update(cx, |project_diff, cx| {
-                                        project_diff.set_repo(Some(repository), cx);
-                                    });
-                                }
-                            }
-                        })
-                        .log_err();
-                });
-            });
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open_file_changes(&history_repository, history_repo_path.clone(), window, cx);
+            }));
 
         right_click_menu((
             if staged {
@@ -502,6 +471,13 @@ impl WorkingTreeChanges {
                 let project_path = file.project_path.clone();
                 window.handler_for(&this, move |this, window, cx| {
                     this.open_file(project_path.clone(), window, cx);
+                })
+            })
+            .entry("Open Diff", None, {
+                let repository = repository.clone();
+                let project_path = file.project_path.clone();
+                window.handler_for(&this, move |this, window, cx| {
+                    this.open_project_diff(&repository, project_path.clone(), window, cx);
                 })
             })
             .item(
@@ -578,6 +554,64 @@ impl WorkingTreeChanges {
                     workspace
                         .open_path(project_path, None, true, window, cx)
                         .detach_and_log_err(cx);
+                })
+                .log_err();
+        });
+    }
+
+    /// Opens the file's uncommitted changes with what earlier commits changed in it below.
+    fn open_file_changes(
+        &self,
+        repository: &WeakEntity<Repository>,
+        repo_path: RepoPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = repository.upgrade() else {
+            return;
+        };
+        let workspace = self.workspace.clone();
+        // Opening the view deactivates the tab showing this list, which updates it, and
+        // the click is handled while that tab may still be updating.
+        window.defer(cx, move |window, cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    FileHistoryView::open(repo_path, repository, workspace, window, cx);
+                })
+                .log_err();
+        });
+    }
+
+    fn open_project_diff(
+        &self,
+        repository: &WeakEntity<Repository>,
+        project_path: Option<ProjectPath>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = self.workspace.clone();
+        let repository = repository.clone();
+        // Opening the diff deactivates the tab showing this list, which updates it, and
+        // the menu is handled while that tab may still be updating.
+        window.defer(cx, move |window, cx| {
+            workspace
+                .update(cx, |workspace, cx| match project_path {
+                    Some(project_path) => {
+                        ProjectDiff::deploy_at_project_path(workspace, project_path, window, cx)
+                    }
+                    None => {
+                        ProjectDiff::deploy_at(workspace, None, window, cx);
+                        // `deploy_at` shows the active repository, which may not be the
+                        // one this file belongs to.
+                        let project_diff = workspace.items_of_type::<ProjectDiff>(cx).next();
+                        if let Some(repository) = repository.upgrade()
+                            && let Some(project_diff) = project_diff
+                        {
+                            project_diff.update(cx, |project_diff, cx| {
+                                project_diff.set_repo(Some(repository), cx);
+                            });
+                        }
+                    }
                 })
                 .log_err();
         });
