@@ -6601,12 +6601,18 @@ impl ProjectPanel {
                 }),
             )
             .on_aux_click(
-                cx.listener(move |project_panel, event: &gpui::ClickEvent, _, cx| {
-                    if !event.is_middle_click() || show_editor || !kind.is_file() {
+                cx.listener(move |project_panel, event: &gpui::ClickEvent, window, cx| {
+                    if !event.is_middle_click() || show_editor {
                         return;
                     }
 
-                    project_panel.open_entry_in_background(entry_id, cx);
+                    if kind.is_dir() {
+                        project_panel.toggle_expanded(entry_id, window, cx);
+                    } else if kind.is_file() {
+                        project_panel.open_entry_in_background(entry_id, cx);
+                    } else {
+                        return;
+                    }
                     cx.stop_propagation();
                 }),
             )
