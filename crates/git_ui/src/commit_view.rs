@@ -1848,7 +1848,7 @@ impl FileHistoryView {
             Some(commit.author_email.clone()),
             self.remote.as_ref(),
         )
-        .size(rems_from_px(32.))
+        .size(rems_from_px(32_f32))
         .render(window, cx);
         let sha = commit.sha.clone();
         let repository = self.repository.downgrade();

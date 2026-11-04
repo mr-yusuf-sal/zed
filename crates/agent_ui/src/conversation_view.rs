@@ -2055,9 +2055,6 @@ impl ConversationView {
                         matches!(thread.read(cx).status(), ThreadStatus::Generating);
                     active.update(cx, |active, cx| {
                         if !is_generating {
-                            if thread.read(cx).uses_reported_activity() {
-                                active.sync_follow_agent_state(cx);
-                            }
                             active.thread_retry_status.take();
                             active.clear_auto_expand_tracking(cx);
                             if active.list_state.is_following_tail() {
@@ -6129,7 +6126,6 @@ pub(crate) mod tests {
         let thread_view = active_thread(&conversation_view, cx);
         let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
         thread_view.update_in(cx, |view, window, cx| {
-            view.should_be_following = true;
             view.add_to_queue(vec!["queued".into()], vec![], window, cx);
         });
         thread.update(cx, |thread, cx| {
@@ -6159,7 +6155,6 @@ pub(crate) mod tests {
         cx.run_until_parked();
         thread_view.read_with(cx, |view, _| {
             assert_eq!(view.message_queue.len(), 1);
-            assert!(view.should_be_following);
         });
         assert!(thread.read_with(cx, |thread, _| thread.activity_generation() > generation_a));
         thread.update(cx, |thread, cx| {
@@ -6191,7 +6186,6 @@ pub(crate) mod tests {
                 Some(ThreadError::MaxOutputTokens)
             ));
             assert_eq!(view.message_queue.len(), 1);
-            assert!(!view.should_be_following);
             assert!(view.turn_fields.turn_started_at.is_none());
             assert!(view.turn_fields._turn_timer_task.is_none());
             assert_eq!(

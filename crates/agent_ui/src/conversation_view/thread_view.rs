@@ -38,7 +38,7 @@ use gpui::Stateful;
 use gpui::TaskExt;
 use gpui::{
     DispatchPhase, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ScrollWheelEvent, anchored, canvas, deferred, point,
+    ScrollEvent, anchored, canvas, deferred, point,
 };
 use heapless::Vec as ArrayVec;
 use itertools::Itertools;
@@ -1745,15 +1745,6 @@ impl ThreadView {
             }
         }
         cx.notify();
-    }
-
-    pub(crate) fn sync_follow_agent_state(&mut self, cx: &mut Context<Self>) {
-        self.should_be_following = self
-            .workspace
-            .update(cx, |workspace, _| {
-                workspace.is_being_followed(CollaboratorId::Agent)
-            })
-            .unwrap_or_default();
     }
 
     pub(crate) fn report_activity_completion(
@@ -7488,7 +7479,7 @@ impl ThreadView {
 
                 window.on_mouse_event({
                     let view = view.clone();
-                    move |_: &ScrollWheelEvent, phase, _, cx| {
+                    move |_: &ScrollEvent, phase, _, cx| {
                         if phase == DispatchPhase::Capture {
                             view.update(cx, |this, cx| this.stop_middle_click_autoscroll(cx));
                         }
@@ -9790,6 +9781,7 @@ impl ThreadView {
                 } else {
                     this.child(self.render_tool_call(
                         active_session_id,
+                        entry_ix,
                         tool_call,
                         focus_handle,
                         layout,
