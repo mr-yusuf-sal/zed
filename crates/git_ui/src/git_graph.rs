@@ -9121,7 +9121,7 @@ impl Item for GitGraph {
         }))))
     }
 
-    fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
+    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
         if let LogSource::Path(path) = &self.log_source {
             return path
                 .as_ref()
@@ -9130,14 +9130,7 @@ impl Item for GitGraph {
                 .unwrap_or_else(|| SharedString::from(path.as_unix_str().to_string()));
         }
 
-        self.get_repository(cx)
-            .and_then(|repo| {
-                repo.read(cx)
-                    .work_directory_abs_path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().to_string())
-            })
-            .map_or_else(|| "Git Graph".into(), |name| SharedString::from(name))
+        "Git".into()
     }
 
     fn show_toolbar(&self) -> bool {
