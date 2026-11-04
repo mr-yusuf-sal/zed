@@ -37,7 +37,7 @@ use gpui::List;
 use gpui::Stateful;
 use gpui::TaskExt;
 use gpui::{
-    DispatchPhase, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Point,
+    DispatchPhase, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ScrollWheelEvent, anchored, canvas, deferred, point,
 };
 use heapless::Vec as ArrayVec;
@@ -7353,8 +7353,8 @@ fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
 /// button: the list scrolls toward the cursor, faster the farther the cursor
 /// is from where the button was pressed.
 struct MiddleClickAutoscroll {
-    origin: Point<Pixels>,
-    cursor: Point<Pixels>,
+    origin: gpui::Point<Pixels>,
+    cursor: gpui::Point<Pixels>,
     started_at: Instant,
     /// Whether the press that started the autoscroll is still down. Releasing
     /// it after dragging or holding ends the autoscroll; releasing it right
@@ -7371,7 +7371,11 @@ const AUTOSCROLL_SPEED: f32 = 0.125;
 const AUTOSCROLL_INDICATOR_SIZE: Pixels = px(26.);
 
 impl ThreadView {
-    fn start_middle_click_autoscroll(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+    fn start_middle_click_autoscroll(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
         let scroll_task = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(AUTOSCROLL_FRAME).await;
