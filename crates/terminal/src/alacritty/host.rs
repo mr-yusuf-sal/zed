@@ -31,6 +31,15 @@ use crate::terminal_host::ScreenSize;
 
 const READ_BUFFER_SIZE: usize = 0x10_0000;
 
+// The keys `tty::Pty::register` gives its PTY and child events on Unix. Alacritty
+// defines them as `pub(crate)`, so they are repeated here.
+#[cfg(unix)]
+const PTY_READ_WRITE_TOKEN: usize = 0;
+#[cfg(unix)]
+const PTY_CHILD_EVENT_TOKEN: usize = 1;
+#[cfg(windows)]
+use tty::{PTY_CHILD_EVENT_TOKEN, PTY_READ_WRITE_TOKEN};
+
 impl Dimensions for ScreenSize {
     fn total_lines(&self) -> usize {
         self.lines
@@ -366,7 +375,7 @@ fn run_pty(
 
         for event in events.iter() {
             match event.key {
-                tty::PTY_CHILD_EVENT_TOKEN => {
+                PTY_CHILD_EVENT_TOKEN => {
                     if let Some(tty::ChildEvent::Exited(status)) = pty.next_child_event() {
                         if let Err(error) =
                             read_available(&mut pty, &mut buffer, screen, &mut pending_writes)
@@ -376,7 +385,7 @@ fn run_pty(
                         break 'event_loop status.and_then(|status| status.code());
                     }
                 }
-                tty::PTY_READ_WRITE_TOKEN => {
+                PTY_READ_WRITE_TOKEN => {
                     if event.is_interrupt() {
                         continue;
                     }
