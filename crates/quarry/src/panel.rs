@@ -77,6 +77,82 @@ enum Script {
     Create,
 }
 
+/// Offering Quarry to agents, adding from Docker and adding a connection.
+fn render_header_buttons(panel: WeakEntity<QuarryPanel>, discovering: bool) -> impl IntoElement {
+    h_flex()
+        .gap_0p5()
+        .child(
+            IconButton::new("quarry-agents", IconName::ToolHammer)
+                .icon_size(IconSize::Small)
+                .tooltip(|_, cx| {
+                    Tooltip::with_meta(
+                        "Offer Quarry to AI Agents",
+                        None,
+                        "Adds Quarry's read-only MCP server to settings.json",
+                        cx,
+                    )
+                })
+                .on_click({
+                    let panel = panel.clone();
+                    move |_, _, cx| {
+                        panel
+                            .update(cx, |panel, cx| panel.offer_to_agents(cx))
+                            .log_err();
+                    }
+                }),
+        )
+        .child(
+            IconButton::new("quarry-docker", IconName::Box)
+                .icon_size(IconSize::Small)
+                .disabled(discovering)
+                .tooltip(|_, cx| Tooltip::simple("Add from Docker Containers", cx))
+                .on_click({
+                    let panel = panel.clone();
+                    move |event: &gpui::ClickEvent, window, cx| {
+                        panel
+                            .update(cx, |panel, cx| {
+                                panel.discover_docker(event.position(), window, cx)
+                            })
+                            .log_err();
+                    }
+                }),
+        )
+        .child(
+            IconButton::new("quarry-add", IconName::Plus)
+                .icon_size(IconSize::Small)
+                .tooltip(|_, cx| Tooltip::simple("Add Connection", cx))
+                .on_click(move |_, window, cx| {
+                    panel
+                        .update(cx, |panel, cx| panel.start_adding(window, cx))
+                        .log_err();
+                }),
+        )
+}
+
+/// Quarry's header buttons on their own, for the Workspaces panel to show in its Databases
+/// header. It redraws with the panel, which disables the Docker button while discovering.
+pub struct QuarryHeaderButtons {
+    panel: Entity<QuarryPanel>,
+    _observe_panel: Subscription,
+}
+
+impl QuarryHeaderButtons {
+    pub fn new(panel: Entity<QuarryPanel>, cx: &mut Context<Self>) -> Self {
+        let observe_panel = cx.observe(&panel, |_, _, cx| cx.notify());
+        Self {
+            panel,
+            _observe_panel: observe_panel,
+        }
+    }
+}
+
+impl Render for QuarryHeaderButtons {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let discovering = self.panel.read(cx).discovering.is_some();
+        render_header_buttons(self.panel.downgrade(), discovering)
+    }
+}
+
 /// Which project moves a connection's menu offers.
 #[derive(Clone, Copy, Default)]
 struct ProjectMoves {
@@ -279,6 +355,9 @@ pub struct QuarryPanel {
     /// folder that was never expanded is not searched, because that would mean asking the
     /// server for everything.
     filter: Entity<Editor>,
+    /// The filter is only shown once the user starts typing in the tree, and hidden, and
+    /// cleared, by Escape.
+    filter_visible: bool,
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     /// Set while `docker inspect` is running for "Add from Docker Containers".
     discovering: Option<Task<()>>,
@@ -299,6 +378,46 @@ impl QuarryPanel {
     /// tree per window, which follows the active workspace.
     pub fn set_workspace(&mut self, workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) {
         self.workspace = workspace;
+        cx.notify();
+    }
+
+    /// Typing a character while the tree has focus opens the filter with that character in it.
+    fn start_filtering_on_typing(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.focus_handle.is_focused(window) {
+            return;
+        }
+        let modifiers = event.keystroke.modifiers;
+        if modifiers.control || modifiers.alt || modifiers.platform || modifiers.function {
+            return;
+        }
+        let Some(text) = event
+            .keystroke
+            .key_char
+            .clone()
+            .filter(|text| text.chars().all(|character| !character.is_control()))
+        else {
+            return;
+        };
+        self.filter_visible = true;
+        self.filter.update(cx, |editor, cx| {
+            editor.clear(window, cx);
+            editor.insert(&text, window, cx);
+        });
+        window.focus(&self.filter.focus_handle(cx), cx);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn hide_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.filter_visible = false;
+        self.filter
+            .update(cx, |editor, cx| editor.clear(window, cx));
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
@@ -412,6 +531,7 @@ impl QuarryPanel {
             context_menu: None,
             collapsed_folders: HashSet::default(),
             scoped_to_project: false,
+            filter_visible: false,
             shared_collapsed: false,
             compare_source: None,
             discovering: None,
@@ -2061,7 +2181,8 @@ impl QuarryPanel {
                     .into_any_element(),
             );
             if !collapsed {
-                for element in self.render_connection_group("shared-", connections, shared, filter, cx)
+                for element in
+                    self.render_connection_group("shared-", connections, shared, filter, cx)
                 {
                     elements.push(div().w_full().pl_3().child(element).into_any_element());
                 }
@@ -2358,62 +2479,41 @@ impl Render for QuarryPanel {
         v_flex()
             .key_context("QuarryPanel")
             .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::start_filtering_on_typing))
+            // Clicking the tree gives it focus, so typing there filters it. A text field inside
+            // the panel, like the filter or the connection form, focuses itself first and keeps
+            // its focus.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    if !this.focus_handle.contains_focused(window, cx) {
+                        window.focus(&this.focus_handle, cx);
+                    }
+                }),
+            )
             .size_full()
             .bg(cx.theme().colors().panel_background)
-            .child(
-                h_flex()
-                    .w_full()
-                    .justify_between()
-                    .px_2()
-                    .py_1()
-                    .border_b_1()
-                    .border_color(cx.theme().colors().border)
-                    .child(
-                        Label::new("Quarry")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_0p5()
-                            .child(
-                                IconButton::new("quarry-agents", IconName::ToolHammer)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(|_, cx| {
-                                        Tooltip::with_meta(
-                                            "Offer Quarry to AI Agents",
-                                            None,
-                                            "Adds Quarry's read-only MCP server to settings.json",
-                                            cx,
-                                        )
-                                    })
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.offer_to_agents(cx);
-                                    })),
-                            )
-                            .child(
-                                IconButton::new("quarry-docker", IconName::Box)
-                                    .icon_size(IconSize::Small)
-                                    .disabled(self.discovering.is_some())
-                                    .tooltip(|_, cx| {
-                                        Tooltip::simple("Add from Docker Containers", cx)
-                                    })
-                                    .on_click(cx.listener(
-                                        |this, event: &gpui::ClickEvent, window, cx| {
-                                            this.discover_docker(event.position(), window, cx);
-                                        },
-                                    )),
-                            )
-                            .child(
-                                IconButton::new("quarry-add", IconName::Plus)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(|_, cx| Tooltip::simple("Add Connection", cx))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.start_adding(window, cx);
-                                    })),
-                            ),
-                    ),
-            )
+            // In the Workspaces panel the buttons sit in the Databases header instead.
+            .when(!self.scoped_to_project, |this| {
+                this.child(
+                    h_flex()
+                        .w_full()
+                        .justify_between()
+                        .px_2()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(cx.theme().colors().border)
+                        .child(
+                            Label::new("Quarry")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(render_header_buttons(
+                            cx.weak_entity(),
+                            self.discovering.is_some(),
+                        )),
+                )
+            })
             .children(self.notice.clone().map(|(notice, color)| {
                 h_flex()
                     .w_full()
@@ -2571,7 +2671,7 @@ impl Render for QuarryPanel {
                     }))
                     .into_any_element()
             }))
-            .when(!connections.is_empty(), |this| {
+            .when(self.filter_visible, |this| {
                 this.child(
                     div()
                         .w_full()
@@ -2579,6 +2679,14 @@ impl Render for QuarryPanel {
                         .py_1()
                         .border_b_1()
                         .border_color(cx.theme().colors().border)
+                        .capture_action(cx.listener(
+                            |this, _: &editor::actions::Cancel, window, cx| {
+                                this.hide_filter(window, cx);
+                            },
+                        ))
+                        .capture_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
+                            this.hide_filter(window, cx);
+                        }))
                         .child(self.filter.clone()),
                 )
             })

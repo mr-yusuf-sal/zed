@@ -1505,8 +1505,9 @@ fn add_databases_to_sidebar(
     })
     .detach();
     let focus_handle = quarry.focus_handle(cx);
+    let header_buttons = cx.new(|cx| quarry::panel::QuarryHeaderButtons::new(quarry.clone(), cx));
     sidebar.update(cx, |sidebar, cx| {
-        sidebar.set_databases_view(quarry.into(), focus_handle, cx);
+        sidebar.set_databases_view(quarry.into(), header_buttons.into(), focus_handle, cx);
     });
 }
 
