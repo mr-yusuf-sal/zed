@@ -92,7 +92,7 @@ impl GitPage {
 }
 
 /// Registered in place of the git graph's and Quarry's own handlers, which open them in tabs of
-/// their own. Those are still used for a workspace without the Git tab.
+/// their own. Those are still used for a workspace without the Git tab or the Workspaces panel.
 pub fn register_actions(workspace: &mut Workspace) {
     workspace
         .register_action(|workspace, _: &git_graph::Open, window, cx| {
@@ -102,7 +102,7 @@ pub fn register_actions(workspace: &mut Workspace) {
             show_git_graph(workspace, Some(action.sha.clone()), window, cx);
         })
         .register_action(|workspace, _: &quarry::panel::ToggleFocus, window, cx| {
-            show_quarry(workspace, window, cx);
+            toggle_search(workspace, window, cx);
         });
 }
 
@@ -136,9 +136,10 @@ fn show_git_graph(
     }
 }
 
-/// Quarry's tree is in the Workspaces panel; a window without one opens Quarry as a tab.
-fn show_quarry(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
-    if !MultiWorkspace::focus_databases_in_sidebar(window, cx) {
+/// Quarry's shortcut opens and closes the Workspaces panel's search, which also filters Quarry's
+/// tree there. A window without that panel opens Quarry as a tab.
+fn toggle_search(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    if !MultiWorkspace::toggle_search_in_sidebar(window, cx) {
         quarry::panel::open(workspace, window, cx);
     }
 }

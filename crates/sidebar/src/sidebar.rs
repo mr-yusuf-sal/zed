@@ -3680,6 +3680,26 @@ impl Sidebar {
         }
     }
 
+    /// Focuses the search, which shows it, or, when it already has focus, clears and hides it
+    /// and gives focus back to the active workspace's editor.
+    fn toggle_search_impl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.view, SidebarView::Archive(_)) {
+            self.show_thread_list(window, cx);
+        }
+        if self.filter_editor.focus_handle(cx).is_focused(window) {
+            self.reset_filter_editor_text(window, cx);
+            self.selection = None;
+            self.update_entries(cx);
+            if let Some(workspace) = self.active_workspace(cx) {
+                let pane = workspace.read(cx).active_pane().clone();
+                window.focus(&pane.read(cx).focus_handle(cx), cx);
+            }
+        } else {
+            self.filter_editor.focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
     fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.reset_filter_editor_text(window, cx);
         self.selection = None;
@@ -8839,6 +8859,10 @@ impl WorkspaceSidebar for Sidebar {
 
     fn focus_databases(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_databases_impl(window, cx);
+    }
+
+    fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_search_impl(window, cx);
     }
 
     fn serialized_state(&self, _cx: &App) -> Option<String> {

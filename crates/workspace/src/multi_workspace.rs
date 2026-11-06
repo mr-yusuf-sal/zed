@@ -171,6 +171,9 @@ pub trait Sidebar: Focusable + Render + EventEmitter<SidebarEvent> + Sized {
 
     /// Shows the databases tree and moves focus into it.
     fn focus_databases(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
+    /// Opens the search and focuses it, or, when it already has focus, clears and closes it.
+    fn toggle_search(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
 }
 
 pub trait SidebarHandle: 'static + Send + Sync {
@@ -193,6 +196,7 @@ pub trait SidebarHandle: 'static + Send + Sync {
     fn restore_serialized_state(&self, state: &str, window: &mut Window, cx: &mut App);
     fn reveal_files(&self, workspace: Entity<Workspace>, window: &mut Window, cx: &mut App);
     fn focus_databases(&self, window: &mut Window, cx: &mut App);
+    fn toggle_search(&self, window: &mut Window, cx: &mut App);
 }
 
 #[derive(Clone)]
@@ -261,6 +265,15 @@ impl<T: Sidebar> SidebarHandle for Entity<T> {
         window.defer(cx, move |window, cx| {
             entity.update(cx, |this, cx| {
                 this.focus_databases(window, cx);
+            });
+        });
+    }
+
+    fn toggle_search(&self, window: &mut Window, cx: &mut App) {
+        let entity = self.clone();
+        window.defer(cx, move |window, cx| {
+            entity.update(cx, |this, cx| {
+                this.toggle_search(window, cx);
             });
         });
     }
@@ -485,6 +498,25 @@ impl MultiWorkspace {
                 }
                 if let Some(sidebar) = &multi_workspace.sidebar {
                     sidebar.focus_databases(window, cx);
+                }
+            });
+        });
+        true
+    }
+
+    /// Opens the sidebar's search and focuses it, or closes it when it has focus. Returns false
+    /// when this window has no sidebar.
+    pub fn toggle_search_in_sidebar(window: &mut Window, cx: &mut App) -> bool {
+        let Some(multi_workspace) = Self::with_usable_sidebar(window, cx) else {
+            return false;
+        };
+        window.defer(cx, move |window, cx| {
+            multi_workspace.update(cx, |multi_workspace, cx| {
+                if !multi_workspace.sidebar_open() {
+                    multi_workspace.open_sidebar(cx);
+                }
+                if let Some(sidebar) = &multi_workspace.sidebar {
+                    sidebar.toggle_search(window, cx);
                 }
             });
         });
