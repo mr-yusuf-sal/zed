@@ -1687,6 +1687,14 @@ impl Render for Dock {
         let dispatch_context = Self::dispatch_context();
         if let Some(entry) = self.visible_entry() {
             let position = self.position;
+            // Rendered before `create_resize_handle` exists, since that closure
+            // holds a borrow of `cx` until the element tree is built. Converted
+            // to `AnyElement` because the `impl IntoElement` return type would
+            // otherwise keep `cx` borrowed.
+            let pin_bar = self.supports_auto_hide().then(|| {
+                self.render_pin_bar(entry.panel.as_ref(), window, cx)
+                    .into_any_element()
+            });
             let create_resize_handle = || {
                 let handle = div()
                     .id("resize-handle")
@@ -1771,11 +1779,11 @@ impl Render for Dock {
                         .panel
                         .to_any()
                         .cached(StyleRefinement::default().v_flex().size_full());
-                    if self.supports_auto_hide() {
+                    if let Some(pin_bar) = pin_bar {
                         this.child(
                             v_flex()
                                 .size_full()
-                                .child(self.render_pin_bar(entry.panel.as_ref(), window, cx))
+                                .child(pin_bar)
                                 .child(div().flex_1().min_h_0().w_full().child(panel)),
                         )
                     } else {
