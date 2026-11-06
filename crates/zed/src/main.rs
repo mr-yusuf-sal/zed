@@ -1229,7 +1229,7 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                             window,
                             cx,
                             Arc::new(|workspace: &mut workspace::Workspace, window, cx| {
-                                workspace.focus_panel::<ProjectPanel>(window, cx);
+                                ProjectPanel::activate_tab(workspace, window, cx);
                             }),
                         );
                         return;
@@ -1247,7 +1247,7 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                                     window,
                                     cx,
                                     Arc::new(|workspace: &mut workspace::Workspace, window, cx| {
-                                        workspace.focus_panel::<ProjectPanel>(window, cx);
+                                        ProjectPanel::activate_tab(workspace, window, cx);
                                     }),
                                 );
                             }
