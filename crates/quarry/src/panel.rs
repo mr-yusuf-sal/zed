@@ -9,7 +9,7 @@ use anyhow::Result;
 use collections::{BTreeMap, HashMap, HashSet};
 use editor::Editor;
 use gpui::{
-    Anchor, AnyElement, App, AppContext as _, ClipboardItem, Context, DismissEvent, Entity,
+    Action, Anchor, AnyElement, App, AppContext as _, ClipboardItem, Context, DismissEvent, Entity,
     EventEmitter, FocusHandle, Focusable, MouseButton, MouseDownEvent, Pixels, Point, PromptLevel,
     Render, Subscription, Task, WeakEntity, Window, actions, anchored, deferred, px,
 };
@@ -19,7 +19,8 @@ use ui::{
 };
 use util::ResultExt as _;
 use workspace::{
-    ItemId, Workspace, WorkspaceId,
+    ItemId, Panel, Workspace, WorkspaceId,
+    dock::{DockPosition, PanelEvent},
     item::{Item, ItemEvent, SerializableItem, TabContentParams},
 };
 
@@ -2155,6 +2156,80 @@ impl SerializableItem for QuarryPanel {
 
     fn should_serialize(&self, _event: &Self::Event) -> bool {
         false
+    }
+}
+
+/// Quarry's connection tree in the right dock, which reveals it at the editor's left edge while a
+/// query tab is active. It is the tree the Main tab shows, and the right dock closes whenever the
+/// Main tab is on screen, so the two are never drawn at once.
+pub struct QuarryDockPanel {
+    quarry: Entity<QuarryPanel>,
+}
+
+impl QuarryDockPanel {
+    pub fn new(quarry: Entity<QuarryPanel>) -> Self {
+        Self { quarry }
+    }
+}
+
+impl EventEmitter<PanelEvent> for QuarryDockPanel {}
+
+impl Focusable for QuarryDockPanel {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.quarry.focus_handle(cx)
+    }
+}
+
+impl Render for QuarryDockPanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        self.quarry.clone()
+    }
+}
+
+impl Panel for QuarryDockPanel {
+    fn persistent_name() -> &'static str {
+        "QuarryDockPanel"
+    }
+
+    fn panel_key() -> &'static str {
+        "QuarryDockPanel"
+    }
+
+    fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
+        DockPosition::Right
+    }
+
+    fn position_is_valid(&self, position: DockPosition) -> bool {
+        position == DockPosition::Right
+    }
+
+    fn set_position(
+        &mut self,
+        _position: DockPosition,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
+        px(320.)
+    }
+
+    fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
+        Some(IconName::Server)
+    }
+
+    fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
+        Some("Quarry")
+    }
+
+    fn toggle_action(&self) -> Box<dyn Action> {
+        Box::new(ToggleFocus)
+    }
+
+    /// Last, after the project panel, which the right dock shows unless a query tab asks for this.
+    fn activation_priority(&self) -> u32 {
+        8
     }
 }
 

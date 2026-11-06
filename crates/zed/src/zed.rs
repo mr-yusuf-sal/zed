@@ -838,6 +838,12 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
                             cx.new(|cx| {
                             main_page::MainPage::new(weak_workspace, panel, git_store, window, cx)
                         });
+                        // Query tabs reveal the Main tab's Quarry tree at the editor's left edge.
+                        if let Some(quarry) = main_page.read(cx).quarry().cloned() {
+                            let quarry_dock_panel =
+                                cx.new(|_| quarry::panel::QuarryDockPanel::new(quarry));
+                            workspace.add_panel(quarry_dock_panel, window, cx);
+                        }
                         workspace.add_permanent_item(Box::new(main_page), window, cx);
                     })
                     .log_err();
