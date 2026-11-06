@@ -75,8 +75,9 @@ use util::{
     rel_path::{RelPath, RelPathBuf},
 };
 use workspace::{
-    DraggedSelection, OpenInTerminal, OpenMode, OpenOptions, OpenVisible, PreviewTabsSettings,
-    SelectedEntry, SplitDirection, Workspace, WorkspaceSettings, copy_file_permalink,
+    DraggedSelection, MultiWorkspace, OpenInTerminal, OpenMode, OpenOptions, OpenVisible,
+    PreviewTabsSettings, SelectedEntry, SplitDirection, Workspace, WorkspaceSettings,
+    copy_file_permalink,
     dock::{DockPosition, Panel, PanelEvent},
     focus_follows_mouse::FocusFollowsMouse as _,
     notifications::{DetachAndPromptErr, NotifyResultExt, NotifyTaskExt},
@@ -628,8 +629,7 @@ pub enum Event {
         entry_id: ProjectEntryId,
         focus_opened_item: bool,
         allow_preview: bool,
-        /// Opens the entry in a tab that is neither activated nor focused, leaving the Main tab
-        /// holding the panel on screen.
+        /// Opens the entry in a tab that is neither activated nor focused.
         in_background: bool,
     },
     SplitEntry {
@@ -966,7 +966,7 @@ impl ProjectPanel {
             move |workspace, _, event, window, cx| match event {
                 &Event::OpenedEntry {
                     entry_id,
-                    focus_opened_item: _,
+                    focus_opened_item,
                     allow_preview,
                     in_background,
                 } => {
@@ -984,10 +984,7 @@ impl ProjectPanel {
                                         path: file_path.clone(),
                                     },
                                     None,
-                                    // An opened item takes the place of the Main tab holding the
-                                    // panel, so focus has to follow it rather than stay on a
-                                    // hidden panel.
-                                    !in_background,
+                                    focus_opened_item && !in_background,
                                     allow_preview,
                                     !in_background,
                                     window, cx,
@@ -1064,15 +1061,19 @@ impl ProjectPanel {
 
     /// Shows the permanent tab in the center that holds the panel, instead of a dock, and focuses
     /// the panel.
+    /// Brings the panel on screen and focuses it. It is drawn in the Workspaces panel, under
+    /// this workspace's Files node; a window without that panel shows it in the permanent tab.
     pub fn activate_tab(
         workspace: &mut Workspace,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Option<Entity<Self>> {
         let project_panel = workspace.panel::<ProjectPanel>(cx)?;
-        workspace.activate_permanent_item(window, cx);
-        let focus_handle = project_panel.read(cx).focus_handle.clone();
-        window.focus(&focus_handle, cx);
+        if !MultiWorkspace::reveal_files_in_sidebar(cx.entity(), window, cx) {
+            workspace.activate_permanent_item(window, cx);
+            let focus_handle = project_panel.read(cx).focus_handle.clone();
+            window.focus(&focus_handle, cx);
+        }
         Some(project_panel)
     }
 
@@ -6773,18 +6774,13 @@ impl ProjectPanel {
                         } else {
                             project_panel.toggle_expanded(entry_id, window, cx);
                         }
-                    } else if event.click_count() > 1 || project_panel.selection == Some(selection)
-                    {
-                        // Opening a file covers the Main tab holding the panel, so a first click
-                        // only selects it and a click on the selected file (a double click is
-                        // one too) opens it.
+                    } else {
                         let preview_tabs_enabled =
                             PreviewTabsSettings::get_global(cx).enable_preview_from_project_panel;
-                        project_panel.open_entry(entry_id, true, preview_tabs_enabled, cx);
-                    } else {
-                        project_panel.marked_entries.clear();
-                        project_panel.selection = Some(selection);
-                        cx.notify();
+                        let click_count = event.click_count();
+                        let focus_opened_item = click_count > 1;
+                        let allow_preview = preview_tabs_enabled && click_count == 1;
+                        project_panel.open_entry(entry_id, focus_opened_item, allow_preview, cx);
                     }
                 }),
             )
@@ -8514,8 +8510,8 @@ impl EventEmitter<Event> for ProjectPanel {}
 impl EventEmitter<PanelEvent> for ProjectPanel {}
 
 // The panel stays registered with the workspace so that `Workspace::panel` keeps finding it, but
-// it is shown inside the permanent Main tab in the center; the right dock it is kept in never
-// opens.
+// it is drawn in the Workspaces panel under its workspace's Files node; the right dock it is kept
+// in never opens.
 impl Panel for ProjectPanel {
     fn position(&self, _: &Window, _: &App) -> DockPosition {
         DockPosition::Right
