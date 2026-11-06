@@ -170,7 +170,12 @@ impl Render for DraggedRegionResize {
 enum HeaderPresentation {
     /// In the single list a search shows.
     List,
-    OtherWorkspace,
+    /// An inactive workspace kept in sight above Other Workspaces. Dropping a workspace on it
+    /// keeps that one in sight too.
+    InSight,
+    /// An inactive workspace under Other Workspaces. Dropping a workspace on it gathers that
+    /// one there too.
+    Gathered,
     ActiveWorkspace,
 }
 
@@ -1097,6 +1102,13 @@ pub struct Sidebar {
     /// Whether the Other Workspaces heading, which gathers the inactive workspaces that need
     /// no attention, is unfolded.
     other_workspaces_expanded: bool,
+    /// Groups the user dragged out of Other Workspaces. Forgotten once a group has no open
+    /// workspace, so a workspace closed and opened again goes back under the heading.
+    kept_in_sight: HashSet<ProjectGroupKey>,
+    /// Set when a project header starts being dragged, and cleared on the first render after the
+    /// drag ends. gpui doesn't say what is being dragged, and the keep-in-sight strip must not
+    /// appear while a region is being resized.
+    dragging_project_group: bool,
 }
 
 impl Sidebar {
@@ -1253,6 +1265,8 @@ impl Sidebar {
             databases_hidden: false,
             files_hidden: false,
             other_workspaces_expanded: false,
+            kept_in_sight: HashSet::new(),
+            dragging_project_group: false,
         }
     }
 
@@ -2400,6 +2414,12 @@ impl Sidebar {
         }
 
         let had_notifications = self.has_notifications(cx);
+        self.kept_in_sight.retain(|key| {
+            !multi_workspace
+                .read(cx)
+                .workspaces_for_project_group(key, cx)
+                .is_empty()
+        });
         let previous_shapes: Vec<EntryShape> =
             self.entry_shapes(multi_workspace.read(cx)).collect();
         let previous_active_group = self.contents.active_group.clone();
@@ -2702,7 +2722,7 @@ impl Sidebar {
         // switches to the workspace rather than folding it.
         let is_collapsed = match presentation {
             HeaderPresentation::List => self.is_group_collapsed(key, cx),
-            HeaderPresentation::OtherWorkspace => true,
+            HeaderPresentation::InSight | HeaderPresentation::Gathered => true,
             HeaderPresentation::ActiveWorkspace => false,
         };
         let is_foldable = presentation == HeaderPresentation::List;
@@ -2786,8 +2806,17 @@ impl Sidebar {
             .when(!has_filter, |this| {
                 this.hover(|s| s.bg(color.ghost_element_hover))
                     .group_active(&group_name, |s| s.bg(color.ghost_element_active))
-                    .on_drag(dragged_group, |dragged, _, _, cx| {
-                        cx.new(|_| dragged.clone())
+                    .on_drag(dragged_group, {
+                        let sidebar = cx.weak_entity();
+                        move |dragged, _, _, cx| {
+                            sidebar
+                                .update(cx, |sidebar, cx| {
+                                    sidebar.dragging_project_group = true;
+                                    cx.notify();
+                                })
+                                .ok();
+                            cx.new(|_| dragged.clone())
+                        }
                     })
                     .drag_over::<DraggedProjectGroup>(move |style, dragged, _, cx| {
                         let style = style
@@ -2803,6 +2832,15 @@ impl Sidebar {
                     })
                     .on_drop(cx.listener(
                         move |this, dragged: &DraggedProjectGroup, _window, cx| {
+                            match presentation {
+                                HeaderPresentation::InSight => {
+                                    this.keep_in_sight(&dragged.key, true, cx)
+                                }
+                                HeaderPresentation::Gathered => {
+                                    this.keep_in_sight(&dragged.key, false, cx)
+                                }
+                                HeaderPresentation::List | HeaderPresentation::ActiveWorkspace => {}
+                            }
                             if let Some(multi_workspace) = this.multi_workspace.upgrade() {
                                 multi_workspace.update(cx, |multi_workspace, cx| {
                                     multi_workspace.move_project_group_to(
@@ -3031,9 +3069,14 @@ impl Sidebar {
         let active_group = self.contents.active_group.clone();
         let (needing_attention, quiet) = self.inactive_workspace_headers();
         let mut other_headers = Vec::with_capacity(needing_attention.len() + quiet.len() + 1);
+        // While a workspace is dragged, a strip on top keeps it in sight when dropped there, which
+        // is the only way in when no inactive workspace is in sight yet.
+        if self.dragging_project_group && cx.has_active_drag() {
+            other_headers.push(self.render_keep_in_sight_drop_zone(cx));
+        }
         for ix in needing_attention {
             if let Some(header) =
-                self.render_header_at(ix, HeaderPresentation::OtherWorkspace, is_focused, cx)
+                self.render_header_at(ix, HeaderPresentation::InSight, is_focused, cx)
             {
                 other_headers.push(header);
             }
@@ -3042,12 +3085,9 @@ impl Sidebar {
             other_headers.push(self.render_other_workspaces_heading(quiet.len(), cx));
             if self.other_workspaces_expanded {
                 for ix in quiet {
-                    if let Some(header) = self.render_header_at(
-                        ix,
-                        HeaderPresentation::OtherWorkspace,
-                        is_focused,
-                        cx,
-                    ) {
+                    if let Some(header) =
+                        self.render_header_at(ix, HeaderPresentation::Gathered, is_focused, cx)
+                    {
                         other_headers.push(div().w_full().pl_2().child(header).into_any_element());
                     }
                 }
@@ -3078,8 +3118,9 @@ impl Sidebar {
             .into_any_element()
     }
 
-    /// The inactive workspaces' headers: those with a thread running, waiting for confirmation
-    /// or finished unread, which stay in sight, and the rest, gathered under Other Workspaces.
+    /// The inactive workspaces' headers: those the user dragged out of Other Workspaces or with a
+    /// thread running, waiting for confirmation or finished unread, which stay in sight, and the
+    /// rest, gathered under Other Workspaces.
     fn inactive_workspace_headers(&self) -> (Vec<usize>, Vec<usize>) {
         let active_header_ix = self
             .contents
@@ -3095,13 +3136,52 @@ impl Sidebar {
                 matches!(
                     self.contents.entries.get(ix),
                     Some(ListEntry::ProjectHeader {
+                        key,
                         has_running_threads,
                         waiting_thread_count,
                         has_notifications,
                         ..
-                    }) if *has_running_threads || *waiting_thread_count > 0 || *has_notifications
+                    }) if self.kept_in_sight.contains(key)
+                        || *has_running_threads
+                        || *waiting_thread_count > 0
+                        || *has_notifications
                 )
             })
+    }
+
+    fn keep_in_sight(&mut self, key: &ProjectGroupKey, keep: bool, cx: &mut Context<Self>) {
+        let changed = if keep {
+            self.kept_in_sight.insert(key.clone())
+        } else {
+            self.kept_in_sight.remove(key)
+        };
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn render_keep_in_sight_drop_zone(&self, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .id("keep-in-sight-drop-zone")
+            .h(Tab::content_height(cx))
+            .w_full()
+            .px_2()
+            .child(
+                Label::new("Drop here to keep in sight")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .drag_over::<DraggedProjectGroup>(|style, _, _, cx| {
+                style
+                    .bg(cx.theme().colors().drop_target_background)
+                    .border_color(cx.theme().colors().drop_target_border)
+            })
+            .on_drop(
+                cx.listener(|this, dragged: &DraggedProjectGroup, _window, cx| {
+                    this.keep_in_sight(&dragged.key, true, cx);
+                }),
+            )
+            .into_any_element()
     }
 
     fn render_other_workspaces_heading(&self, count: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -3135,6 +3215,16 @@ impl Sidebar {
                 this.serialize(cx);
                 cx.notify();
             }))
+            .drag_over::<DraggedProjectGroup>(|style, _, _, cx| {
+                style
+                    .bg(cx.theme().colors().drop_target_background)
+                    .border_color(cx.theme().colors().drop_target_border)
+            })
+            .on_drop(
+                cx.listener(|this, dragged: &DraggedProjectGroup, _window, cx| {
+                    this.keep_in_sight(&dragged.key, false, cx);
+                }),
+            )
             .into_any_element()
     }
 
@@ -8812,6 +8902,9 @@ impl Focusable for Sidebar {
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _titlebar_height = ui::utils::platform_title_bar_height(window);
+        if !cx.has_active_drag() {
+            self.dragging_project_group = false;
+        }
         // Headers drawn outside the list keep their menus' handles here too.
         for header_ix in self.contents.project_header_indices.clone() {
             self.project_header_menu_handles
