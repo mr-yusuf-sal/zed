@@ -1225,6 +1225,7 @@ async fn test_restore_serialized_archive_view_does_not_panic(cx: &mut TestAppCon
         databases_hidden: false,
         files_hidden: false,
         other_workspaces_expanded: false,
+        pinned_workspaces: Vec::new(),
     })
     .expect("serialization should succeed");
 
@@ -1857,7 +1858,7 @@ async fn test_keyboard_select_first_and_last(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn test_refocus_sidebar_with_no_selection_focuses_search(cx: &mut TestAppContext) {
+async fn test_refocus_sidebar_with_no_selection_keeps_search_hidden(cx: &mut TestAppContext) {
     let project = init_test_project("/my-project", cx).await;
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
@@ -1876,10 +1877,13 @@ async fn test_refocus_sidebar_with_no_selection_focuses_search(cx: &mut TestAppC
         assert_eq!(sidebar.selection, None);
     });
 
-    // Refocusing with no selection sends focus to search without selecting a row.
+    // Refocusing with no selection, as clicking the panel does, keeps focus on the list, so the
+    // search stays hidden.
     focus_sidebar(&sidebar, cx);
     sidebar.update_in(cx, |sidebar, window, cx| {
-        assert!(sidebar.filter_editor.read(cx).is_focused(window));
+        assert!(sidebar.focus_handle.is_focused(window));
+        assert!(!sidebar.filter_editor.read(cx).is_focused(window));
+        assert!(!sidebar.is_search_shown(window, cx));
         assert_eq!(sidebar.selection, None);
     });
 }
@@ -1909,6 +1913,63 @@ async fn test_refocus_sidebar_with_selection_preserves_it(cx: &mut TestAppContex
         assert!(sidebar.focus_handle.is_focused(window));
         assert_eq!(sidebar.selection, Some(0));
     });
+}
+
+#[gpui::test]
+async fn test_pinned_workspace_stays_in_sight_and_is_restored(cx: &mut TestAppContext) {
+    let project_a = init_test_project("/project-a", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    let key_a = multi_workspace.read_with(cx, |multi_workspace, cx| {
+        multi_workspace.workspace().read(cx).project_group_key(cx)
+    });
+
+    // Another workspace becomes active, which leaves project-a inactive with nothing running.
+    let fs = cx.update(|_, cx| <dyn Fs>::global(cx));
+    let project_b = project::Project::test(fs, [], cx).await;
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+    });
+    cx.run_until_parked();
+
+    let is_in_sight = |cx: &mut VisualTestContext| {
+        sidebar.read_with(cx, |sidebar, _| {
+            let (in_sight, _) = sidebar.inactive_workspace_headers();
+            in_sight.iter().any(|&ix| {
+                matches!(
+                    sidebar.contents.entries.get(ix),
+                    Some(ListEntry::ProjectHeader { key, .. }) if *key == key_a
+                )
+            })
+        })
+    };
+    assert!(!is_in_sight(cx));
+
+    sidebar.update(cx, |sidebar, cx| sidebar.set_pinned(&key_a, true, cx));
+    cx.run_until_parked();
+    assert!(is_in_sight(cx));
+
+    let serialized = multi_workspace
+        .read_with(cx, |multi_workspace, cx| {
+            multi_workspace
+                .sidebar()
+                .and_then(|sidebar| sidebar.serialized_state(cx))
+        })
+        .expect("the sidebar should serialize its state");
+
+    sidebar.update(cx, |sidebar, cx| sidebar.set_pinned(&key_a, false, cx));
+    cx.run_until_parked();
+    assert!(!is_in_sight(cx));
+
+    // The pin is saved with the panel's state, so restoring it pins the workspace again.
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        if let Some(sidebar) = multi_workspace.sidebar() {
+            sidebar.restore_serialized_state(&serialized, window, cx);
+        }
+    });
+    cx.run_until_parked();
+    assert!(is_in_sight(cx));
 }
 
 #[gpui::test]
@@ -2083,7 +2144,8 @@ async fn test_keyboard_navigation_on_empty_list(cx: &mut TestAppContext) {
     cx.dispatch_action(SelectNext);
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(0));
 
-    // SelectPrevious from first entry clears selection (returns to editor)
+    // SelectPrevious from first entry clears selection, and leaves the search closed since it has
+    // no query
     cx.dispatch_action(SelectPrevious);
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), None);
 
