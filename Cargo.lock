@@ -17352,6 +17352,7 @@ dependencies = [
  "platform_title_bar",
  "pretty_assertions",
  "project",
+ "project_panel",
  "prompt_store",
  "recent_projects",
  "release_channel",

@@ -831,12 +831,11 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             {
                 workspace_handle
                     .update_in(&mut cx, |workspace, window, cx| {
-                        workspace.add_panel(panel.clone(), window, cx);
+                        workspace.add_panel(panel, window, cx);
                         let weak_workspace = workspace.weak_handle();
                         let git_store = workspace.project().read(cx).git_store().clone();
-                        let main_page =
-                            cx.new(|cx| {
-                            main_page::MainPage::new(weak_workspace, panel, git_store, window, cx)
+                        let main_page = cx.new(|cx| {
+                            main_page::MainPage::new(weak_workspace, git_store, window, cx)
                         });
                         // Query tabs reveal the Main tab's Quarry tree at the editor's left edge.
                         if let Some(quarry) = main_page.read(cx).quarry().cloned() {

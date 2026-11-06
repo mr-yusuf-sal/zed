@@ -775,12 +775,9 @@ impl Dock {
         preferred_panel: Option<&'static str>,
         cx: &mut Context<Self>,
     ) -> Option<usize> {
-        preferred_panel
-            .and_then(|name| self.panel_index_for_persistent_name(name, cx))
-            .or_else(|| {
-                self.first_enabled_panel_idx(cx)
-                    .log_with_level(log::Level::Info)
-            })
+        // The project panel is shown in the Workspaces panel now, so the dock only reveals a
+        // panel the active item asks for.
+        preferred_panel.and_then(|name| self.panel_index_for_persistent_name(name, cx))
     }
 
     fn auto_hide_mode_key(position: DockPosition) -> String {

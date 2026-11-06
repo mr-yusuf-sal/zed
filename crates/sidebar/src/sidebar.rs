@@ -28,10 +28,10 @@ use feature_flags::{
     AgentThreadWorktreeLabel, AgentThreadWorktreeLabelFlag, FeatureFlag, FeatureFlagAppExt as _,
 };
 use gpui::{
-    Action as _, AnyElement, App, ClickEvent, Context, Decorations, DismissEvent, Entity, EntityId,
-    FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Task,
-    TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle, linear_color_stop,
-    linear_gradient, list, prelude::*, px,
+    Action as _, AnyElement, App, ClickEvent, Context, Decorations, DismissEvent, DragMoveEvent,
+    Entity, EntityId, FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, Render,
+    SharedString, Task, TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle,
+    linear_color_stop, linear_gradient, list, prelude::*, px,
 };
 use itertools::Itertools;
 use language_model::LanguageModelRegistry;
@@ -42,6 +42,7 @@ use notifications::status_toast::StatusToast;
 use project::{
     AgentId, AgentRegistryStore, Event as ProjectEvent, WorktreeId, repo_identity_path_if_local,
 };
+use project_panel::ProjectPanel;
 use recent_projects::sidebar_recent_projects::SidebarRecentProjects;
 use remote::{RemoteConnectionOptions, same_remote_connection_identity};
 use ui::utils::platform_title_bar_height;
@@ -129,7 +130,15 @@ struct SerializedSidebar {
     width_set_by_user: bool,
     #[serde(default)]
     active_view: SerializedSidebarView,
+    /// Height of the file tree shown under a workspace's Files node, once the user resized it.
+    #[serde(default)]
+    files_height: Option<f32>,
 }
+
+/// Height of the file tree under a workspace's Files node until the user drags its bottom edge.
+const DEFAULT_FILES_HEIGHT: Pixels = px(320.);
+const MIN_FILES_HEIGHT: Pixels = px(80.);
+const GROUP_SECTION_ROW_HEIGHT: Pixels = px(22.);
 
 #[derive(Debug, Default)]
 enum SidebarView {
@@ -519,6 +528,11 @@ enum EntryShape {
         // Determines whether the "No threads yet" row is rendered (only shown when
         // `!is_collapsed && !has_threads`).
         is_collapsed: bool,
+        // The Files and Threads rows are only drawn outside a search, and the tree under Files
+        // and the "No threads yet" row only when their node is expanded.
+        shows_sections: bool,
+        files_expanded: bool,
+        threads_collapsed: bool,
     },
     Thread(ThreadId),
     Terminal(TerminalId),
@@ -965,6 +979,28 @@ impl Render for DraggedProjectGroup {
     }
 }
 
+/// Dragged from the bottom edge of a workspace's file tree to resize it.
+#[derive(Clone)]
+struct DraggedFilesResize {
+    key: ProjectGroupKey,
+}
+
+impl Render for DraggedFilesResize {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+/// What a workspace's Files node shows when it is expanded.
+enum FilesContent {
+    Tree(Entity<ProjectPanel>),
+    /// The workspace is open but its project panel hasn't been added yet, or a closed local
+    /// workspace is being opened in the background for its files.
+    Loading,
+    /// A closed remote workspace: opening it connects to the host, so that waits for a click.
+    NeedsConnection,
+}
+
 /// The sidebar re-derives its entire entry list from scratch on every
 /// change via `update_entries` → `rebuild_contents`. Avoid adding
 /// incremental or inter-event coordination state — if something can
@@ -1031,6 +1067,19 @@ pub struct Sidebar {
     /// Display names of other release channels that have threads available to
     /// import.
     cross_channel_import_channels: Vec<SharedString>,
+    /// Files nodes the user expanded or collapsed. A group without an entry has its Files node
+    /// expanded only while it holds the active workspace.
+    files_expanded: HashMap<ProjectGroupKey, bool>,
+    threads_collapsed: HashSet<ProjectGroupKey>,
+    files_height: Pixels,
+    /// Workspaces opened without being activated because their Files node was expanded. Only
+    /// these are closed again when that node is collapsed, and only while nothing in them is
+    /// in use; activating one takes it off this list.
+    files_opened_in_background: HashSet<EntityId>,
+    files_opening: HashMap<ProjectGroupKey, Task<()>>,
+    /// Whether a search was active when the entries were last built, which decides whether
+    /// project headers carried their Files and Threads rows then.
+    previous_shapes_had_filter: bool,
 }
 
 impl Sidebar {
@@ -1069,6 +1118,12 @@ impl Sidebar {
             window,
             |this, _multi_workspace, event: &MultiWorkspaceEvent, window, cx| match event {
                 MultiWorkspaceEvent::ActiveWorkspaceChanged { .. } => {
+                    // A workspace the user switched to is in use, so collapsing its Files node
+                    // must no longer close it.
+                    if let Some(active_workspace) = this.active_workspace(cx) {
+                        this.files_opened_in_background
+                            .remove(&active_workspace.entity_id());
+                    }
                     this.sync_active_entry_from_active_workspace(cx);
                     this.replace_archived_panel_thread(window, cx);
                     this.schedule_update_entries(false, cx);
@@ -1174,6 +1229,12 @@ impl Sidebar {
             update_task: None,
             import_banners_use_verbose_labels: None,
             cross_channel_import_channels: Vec::new(),
+            files_expanded: HashMap::new(),
+            threads_collapsed: HashSet::new(),
+            files_height: DEFAULT_FILES_HEIGHT,
+            files_opened_in_background: HashSet::new(),
+            files_opening: HashMap::new(),
+            previous_shapes_had_filter: false,
         }
     }
 
@@ -1266,6 +1327,9 @@ impl Sidebar {
                     if let Ok(agent_panel) = view.clone().downcast::<AgentPanel>() {
                         this.subscribe_to_agent_panel(workspace, &agent_panel, window, cx);
                         this.schedule_update_entries(false, cx);
+                    } else if let Ok(project_panel) = view.clone().downcast::<ProjectPanel>() {
+                        this.subscribe_to_project_panel(workspace, &project_panel, window, cx);
+                        cx.notify();
                     }
                 }
             },
@@ -1277,6 +1341,42 @@ impl Sidebar {
         if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
             self.subscribe_to_agent_panel(workspace, &agent_panel, window, cx);
         }
+        if let Some(project_panel) = workspace.read(cx).panel::<ProjectPanel>(cx) {
+            self.subscribe_to_project_panel(workspace, &project_panel, window, cx);
+        }
+    }
+
+    /// A file opened from the tree of a workspace that isn't active opens in that workspace,
+    /// which is then brought up so the file is seen.
+    fn subscribe_to_project_panel(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        project_panel: &Entity<ProjectPanel>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = workspace.downgrade();
+        cx.subscribe_in(
+            project_panel,
+            window,
+            move |this, _project_panel, event: &project_panel::Event, window, cx| {
+                let opens_item = match event {
+                    project_panel::Event::OpenedEntry { in_background, .. } => !*in_background,
+                    project_panel::Event::SplitEntry { .. } => true,
+                    _ => false,
+                };
+                if !opens_item {
+                    return;
+                }
+                let Some(workspace) = workspace.upgrade() else {
+                    return;
+                };
+                if !this.is_active_workspace(&workspace, cx) {
+                    this.activate_workspace(&workspace, window, cx);
+                }
+            },
+        )
+        .detach();
     }
 
     fn move_entry_paths(
@@ -2237,6 +2337,17 @@ impl Sidebar {
                 if is_collapsed {
                     continue;
                 }
+                if self.threads_collapsed.contains(group_key) {
+                    // The rows are hidden, but the threads are still there: their notifications
+                    // and access times are only kept for threads seen in this rebuild.
+                    for thread in &threads {
+                        if let Some(session_id) = &thread.metadata.session_id {
+                            current_session_ids.insert(session_id.clone());
+                        }
+                        current_thread_ids.insert(thread.metadata.thread_id);
+                    }
+                    continue;
+                }
 
                 Self::push_entries_by_display_time(
                     &mut entries,
@@ -2294,15 +2405,18 @@ impl Sidebar {
         }
 
         let had_notifications = self.has_notifications(cx);
-        let previous_shapes: Vec<EntryShape> =
-            self.entry_shapes(multi_workspace.read(cx)).collect();
+        let has_filter_query = self.has_filter_query(cx);
+        let previous_shapes: Vec<EntryShape> = self
+            .entry_shapes(multi_workspace.read(cx), self.previous_shapes_had_filter)
+            .collect();
+        self.previous_shapes_had_filter = has_filter_query;
 
         self.rebuild_contents(cx);
         self.refresh_refilled_draft_times(cx);
         self.refresh_draft_editor_observations(cx);
 
         // Preserve measurements for unchanged entries so sticky headers do not flicker.
-        self.apply_list_state_diff(&previous_shapes, multi_workspace.read(cx));
+        self.apply_list_state_diff(&previous_shapes, multi_workspace.read(cx), has_filter_query);
 
         self.prefetch_worktree_default_branches(cx);
 
@@ -2320,8 +2434,9 @@ impl Sidebar {
         &self,
         previous_shapes: &[EntryShape],
         multi_workspace: &MultiWorkspace,
+        has_filter_query: bool,
     ) {
-        let mut new_iter = self.entry_shapes(multi_workspace);
+        let mut new_iter = self.entry_shapes(multi_workspace, has_filter_query);
         let mut prefix_len = 0;
         let leading_new = loop {
             match (previous_shapes.get(prefix_len), new_iter.next()) {
@@ -2348,10 +2463,14 @@ impl Sidebar {
     fn entry_shapes<'a>(
         &'a self,
         multi_workspace: &'a MultiWorkspace,
+        has_filter_query: bool,
     ) -> impl Iterator<Item = EntryShape> + 'a {
         self.contents.entries.iter().map(move |entry| match entry {
             ListEntry::ProjectHeader {
-                key, has_threads, ..
+                key,
+                has_threads,
+                is_active,
+                ..
             } => EntryShape::ProjectHeader {
                 key: key.clone(),
                 has_threads: *has_threads,
@@ -2359,6 +2478,9 @@ impl Sidebar {
                     .group_state_by_key(key)
                     .map(|state| !state.expanded)
                     .unwrap_or(false),
+                shows_sections: !has_filter_query,
+                files_expanded: self.is_files_expanded(key, *is_active),
+                threads_collapsed: self.threads_collapsed.contains(key),
             },
             ListEntry::Thread(thread) => EntryShape::Thread(thread.metadata.thread_id),
             ListEntry::Terminal(terminal) => EntryShape::Terminal(terminal.metadata.terminal_id),
@@ -2490,7 +2612,7 @@ impl Sidebar {
             } => {
                 self.project_header_menu_handles.entry(ix).or_default();
 
-                self.render_project_header(
+                let header = self.render_project_header(
                     ix,
                     false,
                     key,
@@ -2504,7 +2626,8 @@ impl Sidebar {
                     *has_threads,
                     // has_active_draft,
                     cx,
-                )
+                );
+                self.render_group_sections(ix, key, *is_active_group, *has_threads, header, cx)
             }
             ListEntry::Thread(thread) => self.render_thread(ix, thread, is_active, is_selected, cx),
             ListEntry::Terminal(terminal) => {
@@ -2825,13 +2948,64 @@ impl Sidebar {
             }))
             .block_mouse_except_scroll();
 
-        if !is_collapsed && !has_threads {
-            v_flex()
-                .w_full()
-                .child(header)
-                .child(
+        header.into_any_element()
+    }
+
+    /// The Files and Threads nodes under a project header. A search lists matching threads
+    /// right under their header instead.
+    fn render_group_sections(
+        &self,
+        ix: usize,
+        key: &ProjectGroupKey,
+        is_active_group: bool,
+        has_threads: bool,
+        header: AnyElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if self.has_filter_query(cx) || self.is_group_collapsed(key, cx) {
+            return header;
+        }
+        let files_expanded = self.is_files_expanded(key, is_active_group);
+        let threads_collapsed = self.threads_collapsed.contains(key);
+
+        let files_key = key.clone();
+        let files_row = self.render_group_section_row(
+            SharedString::from(format!("group-files-{ix}")),
+            IconName::FileTree,
+            "Files",
+            files_expanded,
+            cx.listener(move |this, _: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                this.toggle_files(&files_key, is_active_group, window, cx);
+            }),
+            cx,
+        );
+        let threads_key = key.clone();
+        let threads_row = self.render_group_section_row(
+            SharedString::from(format!("group-threads-{ix}")),
+            IconName::Thread,
+            "Threads",
+            !threads_collapsed,
+            cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                cx.stop_propagation();
+                this.toggle_threads(&threads_key, cx);
+            }),
+            cx,
+        );
+
+        v_flex()
+            .w_full()
+            .child(header)
+            .child(files_row)
+            .when(files_expanded, |this| {
+                this.child(self.render_files_tree(ix, key, cx))
+            })
+            .child(threads_row)
+            .when(!threads_collapsed && !has_threads, |this| {
+                this.child(
                     h_flex()
-                        .px_2()
+                        .pl_6()
+                        .pr_2()
                         .pt_1()
                         .pb_2()
                         .gap(px(7.))
@@ -2844,10 +3018,302 @@ impl Sidebar {
                                 .color(Color::Placeholder),
                         ),
                 )
-                .into_any_element()
+            })
+            .into_any_element()
+    }
+
+    fn render_group_section_row(
+        &self,
+        id: SharedString,
+        icon: IconName,
+        label: &'static str,
+        is_expanded: bool,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let disclosure_icon = if is_expanded {
+            IconName::ChevronDown
         } else {
-            header.into_any_element()
+            IconName::ChevronRight
+        };
+        h_flex()
+            .id(id)
+            .h(GROUP_SECTION_ROW_HEIGHT)
+            .w_full()
+            .pl_2()
+            .pr_2()
+            .gap_1()
+            .cursor_pointer()
+            .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+            .child(
+                Icon::new(disclosure_icon)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+            .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+            .on_click(on_click)
+            .into_any_element()
+    }
+
+    fn render_files_tree(
+        &self,
+        ix: usize,
+        key: &ProjectGroupKey,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let content = match self.files_content(key, cx) {
+            FilesContent::Tree(project_panel) => project_panel.into_any_element(),
+            FilesContent::Loading => h_flex()
+                .size_full()
+                .justify_center()
+                .child(
+                    Label::new("Loading…")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
+            FilesContent::NeedsConnection => {
+                let key = key.clone();
+                h_flex()
+                    .size_full()
+                    .justify_center()
+                    .child(
+                        Button::new(SharedString::from(format!("files-connect-{ix}")), "Connect")
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.open_files_workspace(&key, window, cx);
+                            })),
+                    )
+                    .into_any_element()
+            }
+        };
+
+        let resize_key = key.clone();
+        let drag_key = key.clone();
+        v_flex()
+            .id(SharedString::from(format!("group-files-tree-{ix}")))
+            .relative()
+            .w_full()
+            .h(self.files_height)
+            .overflow_hidden()
+            .border_t_1()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
+            .on_drag_move(cx.listener(
+                move |this, event: &DragMoveEvent<DraggedFilesResize>, _window, cx| {
+                    if event.drag(cx).key != resize_key {
+                        return;
+                    }
+                    let height =
+                        (event.event.position.y - event.bounds.top()).max(MIN_FILES_HEIGHT);
+                    if height != this.files_height {
+                        this.files_height = height;
+                        // Every expanded tree shares this height.
+                        this.list_state.remeasure();
+                        this.serialize(cx);
+                        cx.notify();
+                    }
+                },
+            ))
+            .child(div().size_full().child(content))
+            .child(
+                div()
+                    .id(SharedString::from(format!("group-files-resize-{ix}")))
+                    .absolute()
+                    .left_0()
+                    .bottom_0()
+                    .w_full()
+                    .h(px(4.))
+                    .cursor_row_resize()
+                    .on_drag(DraggedFilesResize { key: drag_key }, |dragged, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.new(|_| dragged.clone())
+                    })
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn is_files_expanded(&self, key: &ProjectGroupKey, is_active_group: bool) -> bool {
+        self.files_expanded
+            .get(key)
+            .copied()
+            .unwrap_or(is_active_group)
+    }
+
+    /// The workspace whose tree a group's Files node shows: the one the user was last in, or
+    /// any open one.
+    fn files_workspace_for_group(
+        &self,
+        key: &ProjectGroupKey,
+        cx: &App,
+    ) -> Option<Entity<Workspace>> {
+        let multi_workspace = self.multi_workspace.upgrade()?;
+        let multi_workspace = multi_workspace.read(cx);
+        multi_workspace
+            .last_active_workspace_for_group(key, cx)
+            .or_else(|| self.workspace_for_group(key, cx))
+            .or_else(|| {
+                multi_workspace
+                    .workspaces_for_project_group(key, cx)
+                    .into_iter()
+                    .next()
+            })
+    }
+
+    fn files_content(&self, key: &ProjectGroupKey, cx: &App) -> FilesContent {
+        match self.files_workspace_for_group(key, cx) {
+            Some(workspace) => match workspace.read(cx).panel::<ProjectPanel>(cx) {
+                Some(project_panel) => FilesContent::Tree(project_panel),
+                None => FilesContent::Loading,
+            },
+            None if self.files_opening.contains_key(key) || key.host().is_none() => {
+                FilesContent::Loading
+            }
+            None => FilesContent::NeedsConnection,
         }
+    }
+
+    fn toggle_files(
+        &mut self,
+        key: &ProjectGroupKey,
+        is_active_group: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let expanded = !self.is_files_expanded(key, is_active_group);
+        self.files_expanded.insert(key.clone(), expanded);
+        if expanded {
+            // Connecting to a remote host can prompt for a password, so it waits for a click.
+            if key.host().is_none() {
+                self.open_files_workspace(key, window, cx);
+            }
+        } else {
+            self.files_opening.remove(key);
+            self.close_files_workspaces(key, window, cx);
+        }
+        self.update_entries(cx);
+        self.remeasure_project_header(key);
+    }
+
+    fn toggle_threads(&mut self, key: &ProjectGroupKey, cx: &mut Context<Self>) {
+        if !self.threads_collapsed.remove(key) {
+            self.threads_collapsed.insert(key.clone());
+        }
+        self.update_entries(cx);
+        self.remeasure_project_header(key);
+    }
+
+    /// A project header's height follows its Files and Threads nodes, which the shape diff in
+    /// `update_entries` doesn't see change, since it compares against the already toggled state.
+    fn remeasure_project_header(&self, key: &ProjectGroupKey) {
+        let header_ix = self.contents.entries.iter().position(
+            |entry| matches!(entry, ListEntry::ProjectHeader { key: entry_key, .. } if entry_key == key),
+        );
+        if let Some(header_ix) = header_ix {
+            self.list_state.remeasure_items(header_ix..header_ix + 1);
+        }
+    }
+
+    /// Opens a closed group's workspace without switching to it, so its Files node can show
+    /// the tree.
+    fn open_files_workspace(
+        &mut self,
+        key: &ProjectGroupKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.files_workspace_for_group(key, cx).is_some() || self.files_opening.contains_key(key)
+        {
+            return;
+        }
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+        let active_workspace = multi_workspace.read(cx).workspace().clone();
+        let modal_workspace = active_workspace.clone();
+        let task = multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace.find_or_create_workspace(
+                key.path_list().clone(),
+                key.host(),
+                Some(key.clone()),
+                |options, window, cx| connect_remote(active_workspace, options, window, cx),
+                None,
+                OpenMode::Add,
+                None,
+                window,
+                cx,
+            )
+        });
+
+        let opening_key = key.clone();
+        let opening = cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            remote_connection::dismiss_connection_modal(&modal_workspace, cx);
+            this.update(cx, |this, cx| {
+                this.files_opening.remove(&opening_key);
+                match result {
+                    Ok(workspace) => {
+                        this.files_opened_in_background
+                            .insert(workspace.entity_id());
+                    }
+                    Err(error) => {
+                        log::error!("failed to open a workspace for its files: {error:#}");
+                        // Collapsed again, so expanding it retries.
+                        this.files_expanded.insert(opening_key.clone(), false);
+                    }
+                }
+                this.update_entries(cx);
+                this.remeasure_project_header(&opening_key);
+            })
+            .log_err();
+        });
+        self.files_opening.insert(key.clone(), opening);
+    }
+
+    /// Closes the workspaces of a group that were only opened for their Files node, unless the
+    /// user switched to one, has unsaved changes in it or has a thread running there.
+    fn close_files_workspaces(
+        &mut self,
+        key: &ProjectGroupKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+        let workspaces_to_close: Vec<Entity<Workspace>> = multi_workspace
+            .read(cx)
+            .workspaces_for_project_group(key, cx)
+            .into_iter()
+            .filter(|workspace| {
+                self.files_opened_in_background
+                    .contains(&workspace.entity_id())
+                    && !self.is_active_workspace(workspace, cx)
+                    && !workspace.read(cx).items(cx).any(|item| item.is_dirty(cx))
+                    && !all_thread_infos_for_workspace(workspace, cx).any(|info| {
+                        matches!(
+                            info.status,
+                            AgentThreadStatus::Running | AgentThreadStatus::WaitingForConfirmation
+                        )
+                    })
+            })
+            .collect();
+        if workspaces_to_close.is_empty() {
+            return;
+        }
+        for workspace in &workspaces_to_close {
+            self.files_opened_in_background
+                .remove(&workspace.entity_id());
+        }
+        multi_workspace
+            .update(cx, |multi_workspace, cx| {
+                multi_workspace.remove(workspaces_to_close, RemovalIntent::KeepProject, window, cx)
+            })
+            .detach_and_log_err(cx);
     }
 
     fn render_new_thread_button(
@@ -3485,7 +3951,9 @@ impl Sidebar {
                 let bounds = self.list_state.bounds_for_item(next_idx)?;
                 let viewport = self.list_state.viewport_bounds();
                 let y_in_viewport = bounds.origin.y - viewport.origin.y;
-                let header_height = bounds.size.height;
+                // The next header's item also holds its Files and Threads rows, so only the
+                // height of a header row itself pushes this one off.
+                let header_height = Tab::content_height(cx);
                 (y_in_viewport < header_height).then_some(y_in_viewport - header_height)
             })
             .unwrap_or(px(0.));
@@ -8088,6 +8556,8 @@ impl WorkspaceSidebar for Sidebar {
                 SidebarView::ThreadList => SerializedSidebarView::ThreadList,
                 SidebarView::Archive(_) => SerializedSidebarView::History,
             },
+            files_height: (self.files_height != DEFAULT_FILES_HEIGHT)
+                .then(|| f32::from(self.files_height)),
         };
         serde_json::to_string(&serialized).ok()
     }
@@ -8106,6 +8576,9 @@ impl WorkspaceSidebar for Sidebar {
             {
                 self.width = px(width).clamp(THREADS_LIST_MIN_WIDTH, THREADS_LIST_MAX_WIDTH);
                 self.width_set_by_user = true;
+            }
+            if let Some(files_height) = serialized.files_height {
+                self.files_height = px(files_height).max(MIN_FILES_HEIGHT);
             }
             if serialized.active_view == SerializedSidebarView::History {
                 cx.defer_in(window, |this, window, cx| {
