@@ -162,40 +162,45 @@ fn show_git_graph(
     {
         return;
     }
-    let Some((repo_id, git_store)) = git_graph::active_repository_target(workspace, cx) else {
+    let Some((active_repo_id, git_store)) = git_graph::active_repository_target(workspace, cx)
+    else {
         return;
     };
+    // A commit to show belongs to the active repository; otherwise the graph comes back to the
+    // repository and branch it was last left on, across restarts too.
+    let (repo_id, log_source) = match sha {
+        Some(_) => (active_repo_id, LogSource::All),
+        None => git_graph::remembered_project_graph_target(&git_store, cx)
+            .unwrap_or((active_repo_id, LogSource::All)),
+    };
     let Some(main_page) = main_page else {
-        git_graph::open_or_reuse_graph(
-            workspace,
-            repo_id,
-            git_store,
-            LogSource::All,
-            sha,
-            window,
-            cx,
-        );
+        git_graph::open_or_reuse_graph(workspace, repo_id, git_store, log_source, sha, window, cx);
         return;
     };
     let workspace_handle = workspace.weak_handle();
-    let graph = main_page.update(cx, |main_page, cx| {
-        main_page
-            .git_graph
-            .get_or_insert_with(|| {
-                cx.new(|cx| {
-                    GitGraph::new(
-                        repo_id,
-                        git_store,
-                        workspace_handle,
-                        Some(LogSource::All),
-                        window,
-                        cx,
-                    )
-                })
-            })
-            .clone()
-    });
-    git_graph::retarget_project_graph(&graph, repo_id, sha, cx);
+    // A graph kept since it was last shown is already as it was left.
+    let graph = match main_page.read(cx).git_graph.clone() {
+        Some(graph) => graph,
+        None => {
+            let graph = cx.new(|cx| {
+                GitGraph::new(
+                    repo_id,
+                    git_store,
+                    workspace_handle,
+                    Some(log_source),
+                    window,
+                    cx,
+                )
+            });
+            main_page.update(cx, |main_page, _| {
+                main_page.git_graph = Some(graph.clone());
+            });
+            graph
+        }
+    };
+    if sha.is_some() {
+        git_graph::retarget_project_graph(&graph, repo_id, sha, cx);
+    }
     show(workspace, &main_page, MainView::GitGraph, window, cx);
 }
 
