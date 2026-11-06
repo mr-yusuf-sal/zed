@@ -9,10 +9,10 @@ use collections::HashMap;
 use db::kvp::KeyValueStore;
 
 use gpui::{
-    Action, Anchor, AnyView, App, Axis, Bounds, Context, Entity, EntityId, EventEmitter,
-    FocusHandle, Focusable, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseUpEvent,
-    ParentElement, Point, Render, SharedString, StyleRefinement, Styled, Subscription, Task,
-    WeakEntity, Window, canvas, deferred, div, px,
+    Action, Anchor, AnyView, App, Axis, Context, Entity, EntityId, EventEmitter, FocusHandle,
+    Focusable, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement,
+    Render, SharedString, StyleRefinement, Styled, Subscription, WeakEntity, Window, deferred, div,
+    px,
 };
 use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore, TerminalDockPosition};
@@ -29,12 +29,7 @@ pub(crate) const RESIZE_HANDLE_SIZE: Pixels = px(6.);
 pub(crate) const AUTO_HIDE_REVEAL_EDGE: Pixels = px(4.);
 /// Grace period before an auto-hidden panel closes, so brushing past its edge doesn't close it.
 pub(crate) const AUTO_HIDE_DELAY: Duration = Duration::from_millis(300);
-/// How long the mouse has to stay at the editor's left edge to reveal the project panel. The mouse
-/// crosses that edge whenever it goes from the left dock to the editor, which shouldn't reveal it.
-const PROJECT_PANEL_REVEAL_DELAY: Duration = Duration::from_millis(150);
-const DOCK_PINNED_KEY_PREFIX: &str = "dock_pinned";
-
-/// How an edge panel (the left dock or the thread sidebar) shows itself.
+/// How the Workspaces panel shows itself.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum AutoHideMode {
     /// Closed until opened explicitly; reaching the window edge doesn't reveal it.
@@ -69,40 +64,6 @@ impl AutoHideMode {
             Self::Hover => "Show on Hover",
             Self::Pinned => "Pinned",
         }
-    }
-
-    fn to_stored(self) -> &'static str {
-        match self {
-            Self::Hidden => "hidden",
-            Self::Hover => "hover",
-            Self::Pinned => "pinned",
-        }
-    }
-
-    fn from_stored(value: &str) -> Option<Self> {
-        // "true" and "false" are what the earlier two-state pin wrote under the same keys.
-        match value {
-            "hidden" => Some(Self::Hidden),
-            "hover" | "false" => Some(Self::Hover),
-            "pinned" | "true" => Some(Self::Pinned),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn load(key: &str, cx: &App) -> Self {
-        KeyValueStore::global(cx)
-            .read_kvp(key)
-            .log_err()
-            .flatten()
-            .and_then(|value| Self::from_stored(&value))
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn store(self, key: String, cx: &App) {
-        let kvp = KeyValueStore::global(cx);
-        db::write_and_log(cx, move || async move {
-            kvp.write_kvp(key, self.to_stored().to_string()).await
-        });
     }
 }
 
@@ -373,16 +334,6 @@ pub struct Dock {
     restoration: DockRestoreState,
     zoom_layer_open: bool,
     modal_layer: Entity<ModalLayer>,
-    auto_hide_mode: AutoHideMode,
-    bounds: Option<Bounds<Pixels>>,
-    // A dock opened by keyboard or button may never have had the mouse over it; it only starts
-    // auto-hiding once the mouse has been inside, so it doesn't vanish on the next mouse move.
-    hovered_since_open: bool,
-    auto_hide_task: Option<Task<()>>,
-    /// Where the right dock is drawn, over the left of the center, kept up to date even while the
-    /// dock is closed so that hovering its left edge can reveal it.
-    reveal_area: Option<Bounds<Pixels>>,
-    reveal_task: Option<Task<()>>,
     _subscriptions: [Subscription; 2],
 }
 
@@ -551,12 +502,6 @@ impl Dock {
                 restoration: DockRestoreState::Restoring { pending: None },
                 zoom_layer_open: false,
                 modal_layer,
-                auto_hide_mode: AutoHideMode::load(&Self::auto_hide_mode_key(position), cx),
-                bounds: None,
-                hovered_since_open: false,
-                auto_hide_task: None,
-                reveal_area: None,
-                reveal_task: None,
             }
         });
 
@@ -682,18 +627,8 @@ impl Dock {
 
     fn set_open_internal(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
         let open = self.can_open() && (open || self.stays_open());
-        self.apply_open(open, window, cx);
-    }
-
-    fn apply_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
         if open != self.is_open {
             self.is_open = open;
-            self.hovered_since_open = false;
-            self.auto_hide_task = None;
-            self.reveal_task = None;
-            if !open {
-                self.bounds = None;
-            }
             if let Some(active_panel) = self.active_panel_entry() {
                 active_panel.panel.set_active(open, window, cx);
             }
@@ -702,10 +637,9 @@ impl Dock {
         }
     }
 
-    /// The right dock is only revealed by hovering the left edge of the center, and then shows the
-    /// project panel over the left of the center, which otherwise lives in the Main tab. It also
-    /// keeps the git panel, which is never shown, only for the actions it backs, such as push, pull
-    /// and commit. Nothing else opens it.
+    /// The right dock keeps the project panel, shown in the Workspaces panel instead, and the git
+    /// panel, which is never shown, only for the actions they back, such as Reveal in Project
+    /// Panel, push, pull and commit. Nothing opens it.
     pub fn can_open(&self) -> bool {
         self.position != DockPosition::Right
     }
@@ -713,218 +647,6 @@ impl Dock {
     /// The left dock holds the agent panel, which this fork keeps on screen at all times.
     pub fn stays_open(&self) -> bool {
         self.position == DockPosition::Left
-    }
-
-    pub fn supports_auto_hide(&self) -> bool {
-        self.position == DockPosition::Right
-    }
-
-    pub fn auto_hide_mode(&self) -> AutoHideMode {
-        self.auto_hide_mode
-    }
-
-    pub fn is_pinned(&self) -> bool {
-        self.supports_auto_hide() && self.auto_hide_mode == AutoHideMode::Pinned
-    }
-
-    fn auto_hides(&self) -> bool {
-        self.supports_auto_hide() && !self.is_pinned()
-    }
-
-    /// Switches the right dock between showing on hover and pinned. It skips hidden: nothing but
-    /// hovering opens the right dock, so a hidden one could never be brought back.
-    pub fn cycle_auto_hide_mode(&mut self, cx: &mut Context<Self>) {
-        if !self.supports_auto_hide() {
-            return;
-        }
-        self.auto_hide_mode = match self.auto_hide_mode {
-            AutoHideMode::Pinned => AutoHideMode::Hover,
-            AutoHideMode::Hidden | AutoHideMode::Hover => AutoHideMode::Pinned,
-        };
-        self.auto_hide_task = None;
-        self.auto_hide_mode
-            .store(Self::auto_hide_mode_key(self.position), cx);
-        // The pin button is inside the dock, so the mouse is too; an unpinned dock then hides once
-        // the mouse leaves, as one revealed by hovering would.
-        self.hovered_since_open = self.is_open;
-        cx.notify();
-    }
-
-    /// Keeps a pinned dock open on `preferred_panel`, or on the first enabled panel when no panel
-    /// is asked for, as hovering would reveal it.
-    pub(crate) fn show_pinned(
-        &mut self,
-        preferred_panel: Option<&'static str>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.is_pinned() {
-            return;
-        }
-        let Some(panel_ix) = self.panel_index_to_reveal(preferred_panel, cx) else {
-            return;
-        };
-        if !self.is_open || self.active_panel_index != Some(panel_ix) {
-            self.activate_panel_internal(panel_ix, window, cx);
-            self.apply_open(true, window, cx);
-        }
-    }
-
-    fn panel_index_to_reveal(
-        &mut self,
-        preferred_panel: Option<&'static str>,
-        cx: &mut Context<Self>,
-    ) -> Option<usize> {
-        // The project panel is shown in the Workspaces panel now, so the dock only reveals a
-        // panel the active item asks for.
-        preferred_panel.and_then(|name| self.panel_index_for_persistent_name(name, cx))
-    }
-
-    fn auto_hide_mode_key(position: DockPosition) -> String {
-        format!("{DOCK_PINNED_KEY_PREFIX}:{}", position.label())
-    }
-
-    /// `preferred_panel` is revealed instead of the first enabled panel; the active item can ask
-    /// for one.
-    pub(crate) fn auto_hide_on_mouse_move(
-        &mut self,
-        mouse_position: Point<Pixels>,
-        workspace_bounds: Bounds<Pixels>,
-        preferred_panel: Option<&'static str>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.auto_hides() || cx.has_active_drag() {
-            return;
-        }
-
-        if !self.is_open {
-            if self.position == DockPosition::Right {
-                self.reveal_panel_on_mouse_move(mouse_position, preferred_panel, window, cx);
-                return;
-            }
-            let within_height = mouse_position.y >= workspace_bounds.top()
-                && mouse_position.y <= workspace_bounds.bottom();
-            let at_edge = match self.position {
-                DockPosition::Left => {
-                    mouse_position.x <= workspace_bounds.left() + AUTO_HIDE_REVEAL_EDGE
-                }
-                DockPosition::Right | DockPosition::Bottom => false,
-            };
-            if within_height && at_edge {
-                self.reveal_on_hover(preferred_panel, window, cx);
-            }
-            return;
-        }
-
-        let is_inside = self
-            .bounds
-            .is_some_and(|bounds| bounds.dilate(RESIZE_HANDLE_SIZE).contains(&mouse_position));
-        if is_inside {
-            self.hovered_since_open = true;
-            self.auto_hide_task = None;
-        } else if self.hovered_since_open && self.auto_hide_task.is_none() {
-            self.auto_hide_task = Some(cx.spawn_in(window, async move |dock, cx| {
-                cx.background_executor().timer(AUTO_HIDE_DELAY).await;
-                dock.update_in(cx, |dock, window, cx| {
-                    dock.auto_hide_task = None;
-                    dock.hide_after_mouse_left(window, cx);
-                })
-                .log_err();
-            }));
-        }
-    }
-
-    pub(crate) fn reveal_area(&self) -> Option<Bounds<Pixels>> {
-        self.reveal_area
-    }
-
-    pub(crate) fn set_reveal_area(&mut self, reveal_area: Bounds<Pixels>) {
-        self.reveal_area = Some(reveal_area);
-    }
-
-    fn is_at_reveal_edge(&self, mouse_position: Point<Pixels>) -> bool {
-        let Some(area) = self.reveal_area else {
-            return false;
-        };
-        // The resize handle of the threads sidebar, left of the center, straddles its left edge.
-        let edge_start = area.left() + RESIZE_HANDLE_SIZE / 2.;
-        mouse_position.y >= area.top()
-            && mouse_position.y <= area.bottom()
-            && mouse_position.x >= edge_start
-            && mouse_position.x <= edge_start + AUTO_HIDE_REVEAL_EDGE
-    }
-
-    fn reveal_panel_on_mouse_move(
-        &mut self,
-        mouse_position: Point<Pixels>,
-        preferred_panel: Option<&'static str>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.is_at_reveal_edge(mouse_position) {
-            self.reveal_task = None;
-            return;
-        }
-        if self.reveal_task.is_some() {
-            return;
-        }
-        self.reveal_task = Some(cx.spawn_in(window, async move |dock, cx| {
-            cx.background_executor()
-                .timer(PROJECT_PANEL_REVEAL_DELAY)
-                .await;
-            dock.update_in(cx, |dock, window, cx| {
-                dock.reveal_task = None;
-                if !dock.is_open && dock.is_at_reveal_edge(window.mouse_position()) {
-                    dock.reveal_on_hover(preferred_panel, window, cx);
-                }
-            })
-            .log_err();
-        }));
-    }
-
-    /// Shows `preferred_panel`, or else the first enabled panel, whichever panel was activated in
-    /// the dock before, since the dock's other panels are not meant to be seen.
-    fn reveal_on_hover(
-        &mut self,
-        preferred_panel: Option<&'static str>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(panel_ix) = self.panel_index_to_reveal(preferred_panel, cx) else {
-            return;
-        };
-        self.activate_panel_internal(panel_ix, window, cx);
-        self.apply_open(true, window, cx);
-    }
-
-    fn hide_after_mouse_left(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // A drag out of the dock (e.g. a file onto a pane) or an open modal still needs the
-        // dock; the next mouse move after it ends re-arms the timer.
-        if !self.auto_hides()
-            || !self.is_open
-            || cx.has_active_drag()
-            || self.modal_layer.read(cx).has_active_modal()
-        {
-            return;
-        }
-        self.close_and_return_focus(window, cx);
-    }
-
-    fn close_and_return_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.is_open {
-            return;
-        }
-        let dock_had_focus = self.focus_handle.contains_focused(window, cx);
-        self.set_open(false, window, cx);
-        if dock_had_focus {
-            self.workspace
-                .update(cx, |workspace, cx| {
-                    let pane = workspace.active_pane().clone();
-                    window.focus(&pane.read(cx).focus_handle(cx), cx);
-                })
-                .log_err();
-        }
     }
 
     pub fn set_panel_zoomed(
@@ -1577,58 +1299,6 @@ impl Dock {
         }
     }
 
-    /// The right dock is only ever revealed, so it has no status bar button to pin it from.
-    fn render_pin_bar(
-        &self,
-        panel: &dyn PanelHandle,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let pinned = self.is_pinned();
-        let (icon, tooltip) = if pinned {
-            (IconName::Pin, "Unpin: show only while hovered")
-        } else {
-            (IconName::Unpin, "Pin: keep open beside the editor")
-        };
-        h_flex()
-            .w_full()
-            .flex_none()
-            .justify_between()
-            .pl_2()
-            .pr_1()
-            .py_0p5()
-            .border_b_1()
-            .border_color(cx.theme().colors().border)
-            .children(panel.icon_tooltip(window, cx).map(|title| {
-                Label::new(title)
-                    .size(LabelSize::Small)
-                    .color(Color::Muted)
-                    .truncate()
-            }))
-            .child(
-                IconButton::new("right-dock-pin", icon)
-                    .icon_size(IconSize::Small)
-                    .toggle_state(pinned)
-                    .aria_label(tooltip)
-                    .tooltip(Tooltip::text(tooltip))
-                    .on_click({
-                        let dock = cx.entity();
-                        let workspace = self.workspace.clone();
-                        move |_, window, cx| {
-                            dock.update(cx, |dock, cx| dock.cycle_auto_hide_mode(cx));
-                            // The center makes room for a pinned dock and is drawn under one
-                            // that isn't.
-                            workspace
-                                .update(cx, |workspace, cx| {
-                                    workspace.sync_pinned_right_dock(window, cx);
-                                    cx.notify();
-                                })
-                                .log_err();
-                        }
-                    }),
-            )
-    }
-
     fn dispatch_context() -> KeyContext {
         let mut dispatch_context = KeyContext::new_with_defaults();
         dispatch_context.add("Dock");
@@ -1680,18 +1350,10 @@ impl Dock {
 }
 
 impl Render for Dock {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dispatch_context = Self::dispatch_context();
         if let Some(entry) = self.visible_entry() {
             let position = self.position;
-            // Rendered before `create_resize_handle` exists, since that closure
-            // holds a borrow of `cx` until the element tree is built. Converted
-            // to `AnyElement` because the `impl IntoElement` return type would
-            // otherwise keep `cx` borrowed.
-            let pin_bar = self.supports_auto_hide().then(|| {
-                self.render_pin_bar(entry.panel.as_ref(), window, cx)
-                    .into_any_element()
-            });
             let create_resize_handle = || {
                 let handle = div()
                     .id("resize-handle")
@@ -1745,7 +1407,7 @@ impl Render for Dock {
                         handle
                             .absolute()
                             .top(px(0.))
-                            .right(-RESIZE_HANDLE_SIZE / 2.)
+                            .left(-RESIZE_HANDLE_SIZE / 2.)
                             .h_full()
                             .w(RESIZE_HANDLE_SIZE)
                             .cursor_col_resize(),
@@ -1770,47 +1432,24 @@ impl Render for Dock {
                 })
                 .map(|this| match self.position() {
                     DockPosition::Left => this.border_l_1(),
-                    DockPosition::Right => this.border_r_1(),
+                    DockPosition::Right => this.border_l_1(),
                     DockPosition::Bottom => this.border_t_1(),
                 })
-                .map(|this| {
-                    let panel = entry
-                        .panel
-                        .to_any()
-                        .cached(StyleRefinement::default().v_flex().size_full());
-                    if let Some(pin_bar) = pin_bar {
-                        this.child(
-                            v_flex()
-                                .size_full()
-                                .child(pin_bar)
-                                .child(div().flex_1().min_h_0().w_full().child(panel)),
-                        )
-                    } else {
-                        this.child(
-                            div()
-                                .map(|this| match self.position().axis() {
-                                    Axis::Horizontal => this.w_full().h_full(),
-                                    Axis::Vertical => this.h_full().w_full(),
-                                })
-                                .child(panel),
-                        )
-                    }
-                })
+                .child(
+                    div()
+                        .map(|this| match self.position().axis() {
+                            Axis::Horizontal => this.w_full().h_full(),
+                            Axis::Vertical => this.h_full().w_full(),
+                        })
+                        .child(
+                            entry
+                                .panel
+                                .to_any()
+                                .cached(StyleRefinement::default().v_flex().size_full()),
+                        ),
+                )
                 .when(self.resizable(cx), |this| {
                     this.child(create_resize_handle())
-                })
-                .when(self.supports_auto_hide(), |this| {
-                    let dock = cx.weak_entity();
-                    this.child(
-                        canvas(
-                            move |bounds, _, cx| {
-                                dock.update(cx, |dock, _| dock.bounds = Some(bounds)).ok();
-                            },
-                            |_, _, _, _| {},
-                        )
-                        .absolute()
-                        .size_full(),
-                    )
                 })
         } else {
             div()

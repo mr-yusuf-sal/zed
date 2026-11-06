@@ -385,12 +385,6 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
         false
     }
 
-    /// The persistent name of the right-dock panel to reveal at the editor's left edge while this
-    /// item is active, instead of the project panel.
-    fn edge_panel(&self, _cx: &App) -> Option<&'static str> {
-        None
-    }
-
     fn include_in_nav_history() -> bool {
         true
     }
@@ -582,7 +576,6 @@ pub trait ItemHandle: 'static + Send {
     fn workspace_settings<'a>(&self, cx: &'a App) -> &'a WorkspaceSettings;
     fn preserve_preview(&self, cx: &App) -> bool;
     fn is_permanent(&self, cx: &App) -> bool;
-    fn edge_panel(&self, cx: &App) -> Option<&'static str>;
     fn include_in_nav_history(&self) -> bool;
     fn relay_action(&self, action: Box<dyn Action>, window: &mut Window, cx: &mut App);
     fn handle_drop(
@@ -1162,10 +1155,6 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn is_permanent(&self, cx: &App) -> bool {
         self.read(cx).is_permanent(cx)
-    }
-
-    fn edge_panel(&self, cx: &App) -> Option<&'static str> {
-        self.read(cx).edge_panel(cx)
     }
 
     fn include_in_nav_history(&self) -> bool {

@@ -545,9 +545,6 @@ impl MultiWorkspace {
             return;
         }
         self.auto_hide_sidebar_on_mouse_move(mouse_position, window, cx);
-        self.workspace().clone().update(cx, |workspace, cx| {
-            workspace.auto_hide_docks_on_mouse_move(mouse_position, window, cx);
-        });
     }
 
     fn auto_hide_sidebar_on_mouse_move(

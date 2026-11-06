@@ -1062,7 +1062,8 @@ impl ProjectPanel {
     /// Shows the permanent tab in the center that holds the panel, instead of a dock, and focuses
     /// the panel.
     /// Brings the panel on screen and focuses it. It is drawn in the Workspaces panel, under
-    /// this workspace's Files node; a window without that panel shows it in the permanent tab.
+    /// this workspace's Files node, the only place it is shown; the right dock it is registered
+    /// in never opens.
     pub fn activate_tab(
         workspace: &mut Workspace,
         window: &mut Window,
@@ -1070,9 +1071,7 @@ impl ProjectPanel {
     ) -> Option<Entity<Self>> {
         let project_panel = workspace.panel::<ProjectPanel>(cx)?;
         if !MultiWorkspace::reveal_files_in_sidebar(cx.entity(), window, cx) {
-            workspace.activate_permanent_item(window, cx);
-            let focus_handle = project_panel.read(cx).focus_handle.clone();
-            window.focus(&focus_handle, cx);
+            log::info!("the project panel was asked for in a window without a Workspaces panel");
         }
         Some(project_panel)
     }
