@@ -187,6 +187,8 @@ struct DatabasesView {
     /// Quarry's buttons, drawn in the Databases header.
     header_buttons: AnyView,
     focus_handle: FocusHandle,
+    /// Filters Quarry's tree by the panel's search.
+    set_query: Rc<dyn Fn(&str, &mut Window, &mut App)>,
 }
 
 /// The active workspace's group in `SidebarContents::entries`.
@@ -1119,6 +1121,9 @@ pub struct Sidebar {
     /// drag ends. gpui doesn't say what is being dragged, and the keep-in-sight strip must not
     /// appear while a region is being resized.
     dragging_project_group: bool,
+    /// The project panel the search last filtered, so it is unfiltered when another workspace
+    /// becomes active or the search is cleared.
+    searched_project_panel: Option<WeakEntity<ProjectPanel>>,
 }
 
 impl Sidebar {
@@ -1157,6 +1162,7 @@ impl Sidebar {
             window,
             |this, _multi_workspace, event: &MultiWorkspaceEvent, window, cx| match event {
                 MultiWorkspaceEvent::ActiveWorkspaceChanged { .. } => {
+                    this.apply_search_to_regions(window, cx);
                     if let Some(key) = this.active_project_group_key(cx)
                         && this.is_group_collapsed(&key, cx)
                     {
@@ -1178,15 +1184,20 @@ impl Sidebar {
         )
         .detach();
 
-        cx.subscribe(&filter_editor, |this: &mut Self, _, event, cx| {
-            if let editor::EditorEvent::BufferEdited = event {
-                let query = this.filter_editor.read(cx).text(cx);
-                if !query.is_empty() {
-                    this.selection.take();
+        cx.subscribe_in(
+            &filter_editor,
+            window,
+            |this: &mut Self, _, event, window, cx| {
+                if let editor::EditorEvent::BufferEdited = event {
+                    let query = this.filter_editor.read(cx).text(cx);
+                    if !query.is_empty() {
+                        this.selection.take();
+                    }
+                    this.apply_search_to_regions(window, cx);
+                    this.schedule_update_entries(!query.is_empty(), cx);
                 }
-                this.schedule_update_entries(!query.is_empty(), cx);
-            }
-        })
+            },
+        )
         .detach();
 
         cx.subscribe_in(
@@ -1277,6 +1288,7 @@ impl Sidebar {
             other_workspaces_expanded: false,
             kept_in_sight: HashSet::new(),
             dragging_project_group: false,
+            searched_project_panel: None,
         }
     }
 
@@ -2213,7 +2225,8 @@ impl Sidebar {
             };
             let has_threads = has_visible_rows || has_stored_thread_rows;
 
-            if !query.is_empty() {
+            // The search only looks in the active workspace; the others stay as they are.
+            if !query.is_empty() && is_active {
                 let workspace_highlight_positions =
                     fuzzy_match_positions(&query, &label).unwrap_or_default();
                 let workspace_matched = !workspace_highlight_positions.is_empty();
@@ -2267,11 +2280,6 @@ impl Sidebar {
                     if workspace_matched || terminal_matched || worktree_matched {
                         matched_terminals.push(terminal);
                     }
-                }
-
-                if matched_threads.is_empty() && matched_terminals.is_empty() && !workspace_matched
-                {
-                    continue;
                 }
 
                 // Check for notifications: threads that completed while not active.
@@ -2596,19 +2604,15 @@ impl Sidebar {
         }
     }
 
+    /// Selects the active workspace's first thread, or its header when it has none.
     fn select_first_entry(&mut self) {
-        self.selection = self
-            .contents
-            .entries
-            .iter()
-            .position(|entry| matches!(entry, ListEntry::Thread(_) | ListEntry::Terminal(_)))
-            .or_else(|| {
-                if self.contents.entries.is_empty() {
-                    None
-                } else {
-                    Some(0)
-                }
-            });
+        self.selection = self.contents.active_group.as_ref().map(|group| {
+            if group.rows.is_empty() {
+                group.header_ix
+            } else {
+                group.rows.start
+            }
+        });
     }
 
     fn render_list_entry(
@@ -3498,12 +3502,14 @@ impl Sidebar {
         tree: AnyView,
         header_buttons: AnyView,
         focus_handle: FocusHandle,
+        set_query: Rc<dyn Fn(&str, &mut Window, &mut App)>,
         cx: &mut Context<Self>,
     ) {
         self.databases = Some(DatabasesView {
             tree,
             header_buttons,
             focus_handle,
+            set_query,
         });
         cx.notify();
     }
@@ -3545,14 +3551,10 @@ impl Sidebar {
         cx.notify();
     }
 
-    /// The regions are only drawn in the thread list outside a search.
+    /// The regions are only drawn in the thread list, not the thread history.
     fn show_thread_list_unfiltered(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.view, SidebarView::Archive(_)) {
             self.show_thread_list(window, cx);
-        }
-        if self.has_filter_query(cx) {
-            self.reset_filter_editor_text(window, cx);
-            self.update_entries(cx);
         }
     }
 
@@ -3560,10 +3562,7 @@ impl Sidebar {
     /// inactive workspaces' headers that need attention, the rest when Other Workspaces is
     /// unfolded, then the active workspace's header and rows. The inactive workspaces' threads
     /// are kept in `entries` but not shown.
-    fn visible_entry_order(&self, cx: &App) -> Vec<usize> {
-        if self.has_filter_query(cx) {
-            return (0..self.contents.entries.len()).collect();
-        }
+    fn visible_entry_order(&self) -> Vec<usize> {
         let active_group = self.contents.active_group.as_ref();
         let (mut order, quiet) = self.inactive_workspace_headers();
         if self.other_workspaces_expanded {
@@ -3576,11 +3575,7 @@ impl Sidebar {
         order
     }
 
-    fn reveal_entry(&self, ix: usize, cx: &App) {
-        if self.has_filter_query(cx) {
-            self.list_state.scroll_to_reveal_item(ix);
-            return;
-        }
+    fn reveal_entry(&self, ix: usize) {
         if let Some(active_group) = &self.contents.active_group
             && active_group.rows.contains(&ix)
         {
@@ -3603,6 +3598,94 @@ impl Sidebar {
         if let Some(child_position) = child_position {
             self.other_workspaces_scroll.scroll_to_item(child_position);
         }
+    }
+
+    fn is_search_shown(&self, window: &Window, cx: &App) -> bool {
+        self.has_filter_query(cx) || self.filter_editor.focus_handle(cx).is_focused(window)
+    }
+
+    /// A character typed at the thread list, the file tree or the databases tree starts the
+    /// search with it. Typing into a text field, like the file tree's rename field, is left alone.
+    fn start_search_on_typing(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(self.view, SidebarView::ThreadList) {
+            return;
+        }
+        let keystroke = &event.keystroke;
+        let modifiers = keystroke.modifiers;
+        // AltGr arrives as ctrl+alt on Windows and types characters like `@` on many layouts.
+        let is_alt_gr = modifiers.control && modifiers.alt;
+        if modifiers.platform
+            || modifiers.function
+            || ((modifiers.control || modifiers.alt) && !is_alt_gr)
+        {
+            return;
+        }
+        let Some(text) = keystroke.key_char.as_deref() else {
+            return;
+        };
+        if text.is_empty() || text.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            return;
+        }
+        let in_threads = self.focus_handle.is_focused(window);
+        let in_files = self
+            .active_workspace(cx)
+            .and_then(|workspace| workspace.read(cx).panel::<ProjectPanel>(cx))
+            .is_some_and(|panel| panel.read(cx).focus_handle(cx).is_focused(window));
+        let in_databases = self
+            .databases
+            .as_ref()
+            .is_some_and(|databases| databases.focus_handle.is_focused(window));
+        if !(in_threads || in_files || in_databases) {
+            return;
+        }
+        self.filter_editor.update(cx, |editor, cx| {
+            editor.move_to_end(&editor::actions::MoveToEnd, window, cx);
+            editor.insert(text, window, cx);
+        });
+        self.filter_editor.focus_handle(cx).focus(window, cx);
+        // Handling the key down here keeps the platform from also delivering the character as
+        // text input, which would type it a second time.
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// Filters the active workspace's file tree and the databases tree by the search, and drops
+    /// the filter of a file tree the search filtered before another workspace became active.
+    fn apply_search_to_regions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.filter_editor.read(cx).text(cx);
+        let project_panel = self
+            .active_workspace(cx)
+            .and_then(|workspace| workspace.read(cx).panel::<ProjectPanel>(cx));
+        if let Some(previous) = self
+            .searched_project_panel
+            .take()
+            .and_then(|panel| panel.upgrade())
+            && Some(&previous) != project_panel.as_ref()
+        {
+            previous.update(cx, |panel, cx| panel.set_external_filter("", window, cx));
+        }
+        if let Some(project_panel) = project_panel {
+            project_panel.update(cx, |panel, cx| {
+                panel.set_external_filter(&query, window, cx)
+            });
+            self.searched_project_panel = Some(project_panel.downgrade());
+        }
+        if let Some(databases) = &self.databases {
+            (databases.set_query)(&query, window, cx);
+        }
+    }
+
+    fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reset_filter_editor_text(window, cx);
+        self.selection = None;
+        self.update_entries(cx);
+        self.focus_handle.focus(window, cx);
+        cx.notify();
     }
 
     fn render_new_thread_button(
@@ -4178,92 +4261,6 @@ impl Sidebar {
             .into_any_element()
     }
 
-    fn render_sticky_header(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let scroll_top = self.list_state.logical_scroll_top();
-
-        let &header_idx = self
-            .contents
-            .project_header_indices
-            .iter()
-            .rev()
-            .find(|&&idx| idx <= scroll_top.item_ix)?;
-
-        let needs_sticky = header_idx < scroll_top.item_ix
-            || (header_idx == scroll_top.item_ix && scroll_top.offset_in_item > px(0.));
-
-        if !needs_sticky {
-            return None;
-        }
-
-        let ListEntry::ProjectHeader {
-            key,
-            label,
-            highlight_positions,
-            has_running_threads,
-            waiting_thread_count,
-            has_notifications,
-            is_active,
-            has_threads,
-        } = self.contents.entries.get(header_idx)?
-        else {
-            return None;
-        };
-
-        let is_focused = self.focus_handle.is_focused(window);
-        let is_selected = is_focused && self.selection == Some(header_idx);
-
-        let header_element = self.render_project_header(
-            header_idx,
-            true,
-            HeaderPresentation::List,
-            key,
-            &label,
-            &highlight_positions,
-            *has_running_threads,
-            *waiting_thread_count,
-            *has_notifications,
-            *is_active,
-            is_selected,
-            *has_threads,
-            cx,
-        );
-
-        let top_offset = self
-            .contents
-            .project_header_indices
-            .iter()
-            .find(|&&idx| idx > header_idx)
-            .and_then(|&next_idx| {
-                let bounds = self.list_state.bounds_for_item(next_idx)?;
-                let viewport = self.list_state.viewport_bounds();
-                let y_in_viewport = bounds.origin.y - viewport.origin.y;
-                let header_height = bounds.size.height;
-                (y_in_viewport < header_height).then_some(y_in_viewport - header_height)
-            })
-            .unwrap_or(px(0.));
-
-        let color = cx.theme().colors();
-        let background = color.panel_background_for_overlay();
-
-        let element = v_flex()
-            .absolute()
-            .top(top_offset)
-            .left_0()
-            .w_full()
-            .bg(background)
-            .border_b_1()
-            .border_color(color.border.opacity(0.5))
-            .child(header_element)
-            .shadow_sm()
-            .into_any_element();
-
-        Some(element)
-    }
-
     fn toggle_collapse(
         &mut self,
         project_group_key: &ProjectGroupKey,
@@ -4320,9 +4317,8 @@ impl Sidebar {
         }
 
         if self.filter_editor.read(cx).is_focused(window) {
-            if self.reset_filter_editor_text(window, cx) {
-                self.selection = None;
-                self.update_entries(cx);
+            if self.has_filter_query(cx) {
+                self.close_search(window, cx);
                 return;
             }
 
@@ -4336,12 +4332,9 @@ impl Sidebar {
             return;
         }
 
-        if self.reset_filter_editor_text(window, cx) {
-            self.update_entries(cx);
-        } else {
-            self.selection = None;
-            self.filter_editor.focus_handle(cx).focus(window, cx);
-            cx.notify();
+        // The search only shows once typed into, so Escape in the list no longer moves into it.
+        if self.has_filter_query(cx) {
+            self.close_search(window, cx);
         }
     }
 
@@ -4543,7 +4536,7 @@ impl Sidebar {
     }
 
     fn select_next(&mut self, _: &SelectNext, _window: &mut Window, cx: &mut Context<Self>) {
-        let order = self.visible_entry_order(cx);
+        let order = self.visible_entry_order();
         let current = self
             .selection
             .and_then(|selection| order.iter().position(|&ix| ix == selection));
@@ -4555,12 +4548,12 @@ impl Sidebar {
             },
         };
         self.selection = Some(next);
-        self.reveal_entry(next, cx);
+        self.reveal_entry(next);
         cx.notify();
     }
 
     fn select_previous(&mut self, _: &SelectPrevious, window: &mut Window, cx: &mut Context<Self>) {
-        let order = self.visible_entry_order(cx);
+        let order = self.visible_entry_order();
         let current = self
             .selection
             .and_then(|selection| order.iter().position(|&ix| ix == selection));
@@ -4573,13 +4566,13 @@ impl Sidebar {
             Some(position) => {
                 let previous = order[position - 1];
                 self.selection = Some(previous);
-                self.reveal_entry(previous, cx);
+                self.reveal_entry(previous);
                 cx.notify();
             }
             None => {
                 if let Some(&last) = order.last() {
                     self.selection = Some(last);
-                    self.reveal_entry(last, cx);
+                    self.reveal_entry(last);
                     cx.notify();
                 }
             }
@@ -4587,17 +4580,17 @@ impl Sidebar {
     }
 
     fn select_first(&mut self, _: &SelectFirst, _window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(&first) = self.visible_entry_order(cx).first() {
+        if let Some(&first) = self.visible_entry_order().first() {
             self.selection = Some(first);
-            self.reveal_entry(first, cx);
+            self.reveal_entry(first);
             cx.notify();
         }
     }
 
     fn select_last(&mut self, _: &SelectLast, _window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(&last) = self.visible_entry_order(cx).last() {
+        if let Some(&last) = self.visible_entry_order().last() {
             self.selection = Some(last);
-            self.reveal_entry(last, cx);
+            self.reveal_entry(last);
             cx.notify();
         }
     }
@@ -8326,27 +8319,6 @@ impl Sidebar {
         self.cycle_thread_impl(false, window, cx);
     }
 
-    fn render_no_results(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let has_query = self.has_filter_query(cx);
-        let message = if has_query {
-            "No threads match your search."
-        } else {
-            "No threads yet"
-        };
-
-        v_flex()
-            .id("sidebar-no-results")
-            .p_4()
-            .size_full()
-            .items_center()
-            .justify_center()
-            .child(
-                Label::new(message)
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-    }
-
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
         ProjectEmptyState::new(
             "Workspaces",
@@ -8372,14 +8344,16 @@ impl Sidebar {
         })
     }
 
+    /// The panel's title, replaced by the search field once the user types in the panel or
+    /// focuses the search.
     fn render_sidebar_header(
         &self,
         no_open_projects: bool,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let has_query = self.has_filter_query(cx);
         let header_height = platform_title_bar_height(window);
+        let searching = self.is_search_shown(window, cx);
 
         h_flex()
             .h(header_height)
@@ -8388,34 +8362,42 @@ impl Sidebar {
             .when(!no_open_projects, |this| {
                 this.border_b_1()
                     .border_color(cx.theme().colors().border)
-                    .child(
-                        div().ml_1().child(
-                            Icon::new(IconName::MagnifyingGlass)
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
-                        ),
-                    )
-                    .child(self.render_filter_input(cx))
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .when(
-                                self.selection.is_some()
-                                    && !self.filter_editor.focus_handle(cx).is_focused(window),
-                                |this| this.child(KeyBinding::for_action(&FocusSidebarFilter, cx)),
+                    .map(|this| {
+                        if searching {
+                            this.child(
+                                div().ml_1().child(
+                                    Icon::new(IconName::MagnifyingGlass)
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted),
+                                ),
                             )
-                            .when(has_query, |this| {
-                                this.child(
-                                    IconButton::new("clear_filter", IconName::Close)
-                                        .icon_size(IconSize::Small)
-                                        .tooltip(Tooltip::text("Clear Search"))
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.reset_filter_editor_text(window, cx);
-                                            this.update_entries(cx);
-                                        })),
-                                )
-                            }),
-                    )
+                            .child(self.render_filter_input(cx))
+                            .child(
+                                IconButton::new("clear_filter", IconName::Close)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Clear Search"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.close_search(window, cx);
+                                    })),
+                            )
+                        } else {
+                            this.child(
+                                div().ml_1().child(
+                                    Label::new("Workspaces")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                            )
+                            // Kept in the tree, unseen, so typing while the panel itself has
+                            // focus still reaches it.
+                            .child(
+                                div()
+                                    .w_0()
+                                    .overflow_hidden()
+                                    .child(self.render_filter_input(cx)),
+                            )
+                        }
+                    })
             })
     }
 
@@ -8932,20 +8914,18 @@ impl Render for Sidebar {
                 .entry(header_ix)
                 .or_default();
         }
-        let has_filter_query = self.has_filter_query(cx);
         let ui_font = theme_settings::setup_ui_font(window, cx);
-        let sticky_header = self.render_sticky_header(window, cx);
 
         let color = cx.theme().colors();
         let bg = color.background.blend(color.panel_background);
 
         let no_open_projects = !self.contents.has_open_projects;
-        let no_search_results = self.contents.entries.is_empty();
 
         v_flex()
             .id("workspace-sidebar")
             .key_context(self.dispatch_context(window, cx))
             .track_focus(&self.focus_handle)
+            .capture_key_down(cx.listener(Self::start_search_on_typing))
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::editor_move_down))
@@ -9019,33 +8999,8 @@ impl Render for Sidebar {
                     .map(|this| {
                         if no_open_projects {
                             this.child(self.render_empty_state(cx))
-                        } else if !has_filter_query {
-                            this.child(self.render_split_layout(window, cx))
                         } else {
-                            this.child(
-                                v_flex()
-                                    .relative()
-                                    .flex_1()
-                                    .overflow_hidden()
-                                    .child(
-                                        list(
-                                            self.list_state.clone(),
-                                            cx.processor(Self::render_list_entry),
-                                        )
-                                        .flex_1()
-                                        .size_full(),
-                                    )
-                                    .when(no_search_results, |this| {
-                                        this.child(self.render_no_results(cx))
-                                    })
-                                    .when_some(sticky_header, |this, header| this.child(header))
-                                    .custom_scrollbars(
-                                        Scrollbars::new(ScrollAxes::Vertical)
-                                            .tracked_scroll_handle(&self.list_state),
-                                        window,
-                                        cx,
-                                    ),
-                            )
+                            this.child(self.render_split_layout(window, cx))
                         }
                     }),
                 SidebarView::Archive(archive_view) => this.child(archive_view.clone()),

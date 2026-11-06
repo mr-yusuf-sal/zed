@@ -2263,7 +2263,7 @@ async fn test_agent_panel_terminals_appear_in_sidebar_and_search(cx: &mut TestAp
     type_in_search(&sidebar, "missing", cx);
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
-        Vec::<String>::new()
+        vec!["v [my-project]  <== selected"]
     );
 }
 
@@ -4734,11 +4734,12 @@ async fn test_search_narrows_visible_threads_to_matches(cx: &mut TestAppContext)
         ]
     );
 
-    // User changes query to something with no matches — list is empty.
+    // User changes query to something with no matches — the active workspace's header stays,
+    // with no rows under it.
     type_in_search(&sidebar, "nonexistent", cx);
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
-        Vec::<String>::new()
+        vec!["v [my-project]  <== selected"]
     );
 }
 
@@ -4830,8 +4831,8 @@ async fn test_escape_from_search_focuses_first_thread(cx: &mut TestAppContext) {
         ]
     );
 
-    // First Escape clears the search text, restoring the full list.
-    // Focus stays on the filter editor.
+    // Escape clears the search, which hides it, restores the full list and hands keyboard
+    // control to the thread list.
     cx.dispatch_action(Cancel);
     cx.run_until_parked();
     assert_eq!(
@@ -4844,15 +4845,14 @@ async fn test_escape_from_search_focuses_first_thread(cx: &mut TestAppContext) {
         ]
     );
     sidebar.update_in(cx, |sidebar, window, cx| {
-        assert!(sidebar.filter_editor.read(cx).is_focused(window));
-        assert!(!sidebar.focus_handle.is_focused(window));
+        assert!(sidebar.focus_handle.is_focused(window));
+        assert!(!sidebar.filter_editor.read(cx).is_focused(window));
     });
 
-    // Second Escape moves focus from the empty search field to the thread list.
+    // Escape in the list with no search leaves focus there rather than opening the search.
     cx.dispatch_action(Cancel);
     cx.run_until_parked();
     sidebar.update_in(cx, |sidebar, window, cx| {
-        assert_eq!(sidebar.selection, Some(1));
         assert!(sidebar.focus_handle.is_focused(window));
         assert!(!sidebar.filter_editor.read(cx).is_focused(window));
     });
@@ -4906,6 +4906,17 @@ async fn test_search_only_shows_workspace_headers_with_matches(cx: &mut TestAppC
     }
     cx.run_until_parked();
 
+    // The search only looks in the active workspace, so switch back to project A's.
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        let workspace_a = multi_workspace
+            .workspaces()
+            .next()
+            .expect("project A's workspace")
+            .clone();
+        multi_workspace.activate(workspace_a, None, window, cx);
+    });
+    cx.run_until_parked();
+
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
         vec![
@@ -4927,11 +4938,12 @@ async fn test_search_only_shows_workspace_headers_with_matches(cx: &mut TestAppC
         ]
     );
 
-    // "typo" only matches in the second workspace — the first header disappears.
+    // "typo" only matches in the second workspace, which the search doesn't look in — the
+    // active workspace's header stays, with no rows under it.
     type_in_search(&sidebar, "typo", cx);
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
-        Vec::<String>::new()
+        vec!["v [project-a]  <== selected"]
     );
 
     // "project-a" matches the first workspace name — the header appears
@@ -4994,6 +5006,17 @@ async fn test_search_matches_workspace_name(cx: &mut TestAppContext) {
             cx,
         )
     }
+    cx.run_until_parked();
+
+    // The search only looks in the active workspace, so switch back to project A's.
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        let workspace_a = multi_workspace
+            .workspaces()
+            .next()
+            .expect("project A's workspace")
+            .clone();
+        multi_workspace.activate(workspace_a, None, window, cx);
+    });
     cx.run_until_parked();
 
     // "alpha" matches the workspace name "alpha-project" but no thread titles.
@@ -5930,7 +5953,7 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
     type_in_search(&sidebar, "0", cx);
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
-        Vec::<String>::new()
+        vec!["v [my-project]  <== selected"]
     );
 
     type_in_search(&sidebar, "é", cx);

@@ -157,6 +157,9 @@ pub struct ProjectPanel {
     filter_editor: Entity<Editor>,
     /// `Some` while the type-to-filter bar is open, holding its text, which may be empty.
     filter_query: Option<String>,
+    /// Set while the query comes from the Workspaces panel's search rather than the panel's own
+    /// filter bar, which then stays hidden.
+    filter_is_external: bool,
     /// Set when the filter text changes, so the next visible entries update selects the first
     /// match instead of keeping a selection the filter may have hidden.
     filter_selects_first_match: bool,
@@ -925,6 +928,7 @@ impl ProjectPanel {
                 filename_editor,
                 filter_editor,
                 filter_query: None,
+                filter_is_external: false,
                 filter_selects_first_match: false,
                 clipboard: None,
                 _dragged_entry_destination: None,
@@ -2521,7 +2525,35 @@ impl ProjectPanel {
         cx.notify();
     }
 
+    /// Filters the tree by a query typed in the Workspaces panel's search, without the panel's
+    /// own filter bar. An empty query drops the filter and leaves focus where it is.
+    pub fn set_external_filter(
+        &mut self,
+        query: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if query.is_empty() {
+            if self.filter_query.is_some() {
+                self.drop_filter(window, cx);
+            }
+            return;
+        }
+        self.filter_query = Some(query.to_string());
+        self.filter_is_external = true;
+        self.filter_selects_first_match = true;
+        self.update_visible_entries(None, false, false, window, cx);
+        cx.notify();
+    }
+
     fn close_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.drop_filter(window, cx);
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    fn drop_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.filter_is_external = false;
         self.filter_query = None;
         self.filter_selects_first_match = false;
         self.filter_editor
@@ -2539,7 +2571,6 @@ impl ProjectPanel {
             window,
             cx,
         );
-        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
@@ -7957,36 +7988,39 @@ impl Render for ProjectPanel {
                 .track_focus(&self.focus_handle(cx))
                 .child(
                     v_flex()
-                        .when(self.filter_query.is_some(), |this| {
-                            this.child(
-                                h_flex()
-                                    .flex_none()
-                                    .w_full()
-                                    .gap_1()
-                                    .px_2()
-                                    .py_1()
-                                    .border_b_1()
-                                    .border_color(cx.theme().colors().border_variant)
-                                    .child(
-                                        Icon::new(IconName::MagnifyingGlass)
-                                            .size(IconSize::Small)
-                                            .color(Color::Muted),
-                                    )
-                                    .child(div().flex_1().child(self.filter_editor.clone()))
-                                    .child(
-                                        IconButton::new(
-                                            "project-panel-close-filter",
-                                            IconName::Close,
+                        .when(
+                            self.filter_query.is_some() && !self.filter_is_external,
+                            |this| {
+                                this.child(
+                                    h_flex()
+                                        .flex_none()
+                                        .w_full()
+                                        .gap_1()
+                                        .px_2()
+                                        .py_1()
+                                        .border_b_1()
+                                        .border_color(cx.theme().colors().border_variant)
+                                        .child(
+                                            Icon::new(IconName::MagnifyingGlass)
+                                                .size(IconSize::Small)
+                                                .color(Color::Muted),
                                         )
-                                        .icon_size(IconSize::Small)
-                                        .on_click(
-                                            cx.listener(|this, _, window, cx| {
-                                                this.close_filter(window, cx);
-                                            }),
+                                        .child(div().flex_1().child(self.filter_editor.clone()))
+                                        .child(
+                                            IconButton::new(
+                                                "project-panel-close-filter",
+                                                IconName::Close,
+                                            )
+                                            .icon_size(IconSize::Small)
+                                            .on_click(
+                                                cx.listener(|this, _, window, cx| {
+                                                    this.close_filter(window, cx);
+                                                }),
+                                            ),
                                         ),
-                                    ),
-                            )
-                        })
+                                )
+                            },
+                        )
                         .child(
                             uniform_list("entries", item_count, {
                                 cx.processor(|this, range: Range<usize>, window, cx| {

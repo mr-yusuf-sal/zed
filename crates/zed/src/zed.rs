@@ -86,6 +86,7 @@ use workspace::workspace_error::{ErrorAction, ErrorSeverity, WorkspaceError};
 use std::{
     borrow::Cow,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::Arc,
     sync::atomic::{self, AtomicBool},
 };
@@ -1506,8 +1507,24 @@ fn add_databases_to_sidebar(
     .detach();
     let focus_handle = quarry.focus_handle(cx);
     let header_buttons = cx.new(|cx| quarry::panel::QuarryHeaderButtons::new(quarry.clone(), cx));
+    let set_query: Rc<dyn Fn(&str, &mut Window, &mut App)> = Rc::new({
+        let quarry = quarry.downgrade();
+        move |query, window, cx| {
+            quarry
+                .update(cx, |quarry, cx| {
+                    quarry.set_external_filter(query, window, cx)
+                })
+                .log_err();
+        }
+    });
     sidebar.update(cx, |sidebar, cx| {
-        sidebar.set_databases_view(quarry.into(), header_buttons.into(), focus_handle, cx);
+        sidebar.set_databases_view(
+            quarry.into(),
+            header_buttons.into(),
+            focus_handle,
+            set_query,
+            cx,
+        );
     });
 }
 

@@ -413,6 +413,20 @@ impl QuarryPanel {
         cx.notify();
     }
 
+    /// Filters the tree by a query typed in the Workspaces panel's search, without showing the
+    /// panel's own filter field.
+    pub fn set_external_filter(
+        &mut self,
+        query: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.filter_visible = false;
+        self.filter
+            .update(cx, |editor, cx| editor.set_text(query, window, cx));
+        cx.notify();
+    }
+
     fn hide_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.filter_visible = false;
         self.filter
