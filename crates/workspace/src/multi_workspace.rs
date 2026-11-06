@@ -159,6 +159,18 @@ pub trait Sidebar: Focusable + Render + EventEmitter<SidebarEvent> + Sized {
         _cx: &mut Context<Self>,
     ) {
     }
+
+    /// Shows `workspace`'s file tree and moves focus into it.
+    fn reveal_files(
+        &mut self,
+        _workspace: &Entity<Workspace>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    /// Shows the databases tree and moves focus into it.
+    fn focus_databases(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
 }
 
 pub trait SidebarHandle: 'static + Send + Sync {
@@ -179,6 +191,8 @@ pub trait SidebarHandle: 'static + Send + Sync {
     fn side(&self, cx: &App) -> SidebarSide;
     fn serialized_state(&self, cx: &App) -> Option<String>;
     fn restore_serialized_state(&self, state: &str, window: &mut Window, cx: &mut App);
+    fn reveal_files(&self, workspace: Entity<Workspace>, window: &mut Window, cx: &mut App);
+    fn focus_databases(&self, window: &mut Window, cx: &mut App);
 }
 
 #[derive(Clone)]
@@ -229,6 +243,24 @@ impl<T: Sidebar> SidebarHandle for Entity<T> {
         window.defer(cx, move |window, cx| {
             entity.update(cx, |this, cx| {
                 this.toggle_thread_switcher(select_last, window, cx);
+            });
+        });
+    }
+
+    fn reveal_files(&self, workspace: Entity<Workspace>, window: &mut Window, cx: &mut App) {
+        let entity = self.clone();
+        window.defer(cx, move |window, cx| {
+            entity.update(cx, |this, cx| {
+                this.reveal_files(&workspace, window, cx);
+            });
+        });
+    }
+
+    fn focus_databases(&self, window: &mut Window, cx: &mut App) {
+        let entity = self.clone();
+        window.defer(cx, move |window, cx| {
+            entity.update(cx, |this, cx| {
+                this.focus_databases(window, cx);
             });
         });
     }
@@ -414,6 +446,58 @@ impl MultiWorkspace {
 
     pub fn sidebar(&self) -> Option<&dyn SidebarHandle> {
         self.sidebar.as_deref()
+    }
+
+    /// Opens the sidebar on `workspace`'s file tree and focuses it. Returns false when this
+    /// window has no sidebar to show it in. The work is deferred because callers are usually
+    /// in the middle of updating `workspace`, and opening the sidebar updates every workspace.
+    pub fn reveal_files_in_sidebar(
+        workspace: Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let Some(multi_workspace) = Self::with_usable_sidebar(window, cx) else {
+            return false;
+        };
+        window.defer(cx, move |window, cx| {
+            multi_workspace.update(cx, |multi_workspace, cx| {
+                if !multi_workspace.sidebar_open() {
+                    multi_workspace.open_sidebar(cx);
+                }
+                if let Some(sidebar) = &multi_workspace.sidebar {
+                    sidebar.reveal_files(workspace, window, cx);
+                }
+            });
+        });
+        true
+    }
+
+    /// Opens the sidebar on its databases tree and focuses it. Returns false when this window
+    /// has no sidebar to show it in.
+    pub fn focus_databases_in_sidebar(window: &mut Window, cx: &mut App) -> bool {
+        let Some(multi_workspace) = Self::with_usable_sidebar(window, cx) else {
+            return false;
+        };
+        window.defer(cx, move |window, cx| {
+            multi_workspace.update(cx, |multi_workspace, cx| {
+                if !multi_workspace.sidebar_open() {
+                    multi_workspace.open_sidebar(cx);
+                }
+                if let Some(sidebar) = &multi_workspace.sidebar {
+                    sidebar.focus_databases(window, cx);
+                }
+            });
+        });
+        true
+    }
+
+    fn with_usable_sidebar(window: &Window, cx: &App) -> Option<Entity<MultiWorkspace>> {
+        let multi_workspace = window.root::<MultiWorkspace>().flatten()?;
+        let usable = {
+            let multi_workspace = multi_workspace.read(cx);
+            multi_workspace.sidebar.is_some() && multi_workspace.multi_workspace_enabled(cx)
+        };
+        usable.then_some(multi_workspace)
     }
 
     pub fn set_sidebar_overlay(&mut self, overlay: Option<AnyView>, cx: &mut Context<Self>) {

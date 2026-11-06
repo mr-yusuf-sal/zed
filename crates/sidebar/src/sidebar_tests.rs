@@ -701,6 +701,7 @@ fn visible_entries_as_strings(
                         let worktree = format_linked_worktree_chips(&terminal.worktrees);
                         format!("  {title}{worktree}{selected}")
                     }
+                    ListEntry::Databases => format!("[Databases]{selected}"),
                 }
             })
             .collect()
@@ -1246,6 +1247,9 @@ async fn test_restore_serialized_archive_view_does_not_panic(cx: &mut TestAppCon
         width_set_by_user: true,
         active_view: SerializedSidebarView::History,
         files_height: None,
+        databases_height: None,
+        databases_collapsed: false,
+        databases_slot: None,
     })
     .expect("serialization should succeed");
 

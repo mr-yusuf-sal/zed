@@ -1808,10 +1808,6 @@ impl Item for QueryView {
     fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
         f(*event)
     }
-
-    fn edge_panel(&self, _cx: &App) -> Option<&'static str> {
-        Some(<crate::panel::QuarryDockPanel as workspace::Panel>::persistent_name())
-    }
 }
 
 impl Render for QueryView {
