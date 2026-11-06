@@ -10098,10 +10098,11 @@ impl Render for Workspace {
                                                 Some(e.event.position);
 
                                             match e.drag(cx).0 {
+                                                // The left dock is drawn at the right edge.
                                                 DockPosition::Left => {
                                                     workspace.resize_left_dock(
-                                                        e.event.position.x
-                                                            - workspace.bounds.left(),
+                                                        workspace.bounds.right()
+                                                            - e.event.position.x,
                                                         window,
                                                         cx,
                                                     );
@@ -10146,12 +10147,6 @@ impl Render for Workspace {
                                                 .flex_row()
                                                 .flex_1()
                                                 .overflow_hidden()
-                                                .children(self.render_dock(
-                                                    DockPosition::Left,
-                                                    &self.left_dock,
-                                                    window,
-                                                    cx,
-                                                ))
                                                 .child(
                                                     div()
                                                         .flex()
@@ -10186,7 +10181,13 @@ impl Render for Workspace {
                                                                     },
                                                                 ),
                                                         ),
-                                                ),
+                                                )
+                                                .children(self.render_dock(
+                                                    DockPosition::Left,
+                                                    &self.left_dock,
+                                                    window,
+                                                    cx,
+                                                )),
                                         )
                                         .child(div().w_full().children(self.render_dock(
                                             DockPosition::Bottom,
@@ -10207,12 +10208,6 @@ impl Render for Workspace {
                                                         .flex()
                                                         .flex_row()
                                                         .flex_1()
-                                                        .children(self.render_dock(
-                                                            DockPosition::Left,
-                                                            &self.left_dock,
-                                                            window,
-                                                            cx,
-                                                        ))
                                                         .child(
                                                             div()
                                                                 .flex()
@@ -10251,7 +10246,13 @@ impl Render for Workspace {
                                                                             },
                                                                         ),
                                                                 ),
-                                                        ),
+                                                        )
+                                                        .children(self.render_dock(
+                                                            DockPosition::Left,
+                                                            &self.left_dock,
+                                                            window,
+                                                            cx,
+                                                        )),
                                                 )
                                                 .child(div().w_full().children(self.render_dock(
                                                     DockPosition::Bottom,
@@ -10265,12 +10266,6 @@ impl Render for Workspace {
                                         .flex()
                                         .flex_row()
                                         .h_full()
-                                        .children(self.render_dock(
-                                            DockPosition::Left,
-                                            &self.left_dock,
-                                            window,
-                                            cx,
-                                        ))
                                         .child(
                                             div()
                                                 .flex()
@@ -10324,17 +10319,17 @@ impl Render for Workspace {
                                                     window,
                                                     cx,
                                                 ))),
-                                        ),
-                                    BottomDockLayout::Contained => div()
-                                        .flex()
-                                        .flex_row()
-                                        .h_full()
+                                        )
                                         .children(self.render_dock(
                                             DockPosition::Left,
                                             &self.left_dock,
                                             window,
                                             cx,
-                                        ))
+                                        )),
+                                    BottomDockLayout::Contained => div()
+                                        .flex()
+                                        .flex_row()
+                                        .h_full()
                                         .child(
                                             div()
                                                 .flex()
@@ -10371,7 +10366,13 @@ impl Render for Workspace {
                                                     window,
                                                     cx,
                                                 )),
-                                        ),
+                                        )
+                                        .children(self.render_dock(
+                                            DockPosition::Left,
+                                            &self.left_dock,
+                                            window,
+                                            cx,
+                                        )),
                                 }
                             })
                             .children(self.zoomed.as_ref().and_then(|view| {
@@ -10415,7 +10416,7 @@ impl Render for Workspace {
                                 }
 
                                 Some(match self.zoomed_position {
-                                    Some(DockPosition::Left) => overlay.right_2().border_r_1(),
+                                    Some(DockPosition::Left) => overlay.left_2().border_l_1(),
                                     Some(DockPosition::Right) => overlay.left_2().border_l_1(),
                                     Some(DockPosition::Bottom) => overlay.top_2().border_t_1(),
                                     None => {

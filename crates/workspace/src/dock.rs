@@ -850,7 +850,7 @@ impl Dock {
         let Some(area) = self.reveal_area else {
             return false;
         };
-        // The left dock's resize handle straddles the center's left edge.
+        // The resize handle of the threads sidebar, left of the center, straddles its left edge.
         let edge_start = area.left() + RESIZE_HANDLE_SIZE / 2.;
         mouse_position.y >= area.top()
             && mouse_position.y <= area.bottom()
@@ -1723,11 +1723,13 @@ impl Render for Dock {
                         }),
                     )
                     .occlude();
+                // The left dock holds the agent panel, which this fork draws to the right of the
+                // center (see `Workspace::render`), so its handle is on its left side.
                 match self.position() {
                     DockPosition::Left => deferred(
                         handle
                             .absolute()
-                            .right(-RESIZE_HANDLE_SIZE / 2.)
+                            .left(-RESIZE_HANDLE_SIZE / 2.)
                             .top(px(0.))
                             .h_full()
                             .w(RESIZE_HANDLE_SIZE)
@@ -1770,7 +1772,7 @@ impl Render for Dock {
                     Axis::Vertical => this.h_full().w_full().flex_col(),
                 })
                 .map(|this| match self.position() {
-                    DockPosition::Left => this.border_r_1(),
+                    DockPosition::Left => this.border_l_1(),
                     DockPosition::Right => this.border_r_1(),
                     DockPosition::Bottom => this.border_t_1(),
                 })
