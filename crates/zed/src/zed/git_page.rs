@@ -96,13 +96,13 @@ impl GitPage {
 pub fn register_actions(workspace: &mut Workspace) {
     workspace
         .register_action(|workspace, _: &git_graph::Open, window, cx| {
-            show_git_graph(workspace, None, window, cx);
+            toggle_git_and_search(workspace, window, cx);
         })
         .register_action(|workspace, action: &git_graph::OpenAtCommit, window, cx| {
             show_git_graph(workspace, Some(action.sha.clone()), window, cx);
         })
         .register_action(|workspace, _: &quarry::panel::ToggleFocus, window, cx| {
-            toggle_search(workspace, window, cx);
+            focus_databases(workspace, window, cx);
         });
 }
 
@@ -136,10 +136,45 @@ fn show_git_graph(
     }
 }
 
-/// Quarry's shortcut opens and closes the Workspaces panel's search, which also filters Quarry's
-/// tree there. A window without that panel opens Quarry as a tab.
-fn toggle_search(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
-    if !MultiWorkspace::toggle_search_in_sidebar(window, cx) {
+/// The git graph's shortcut moves between the Git tab and the Workspaces panel's search: from
+/// anywhere else it brings up the Git tab, from the Git tab it opens the search, and from the
+/// search it clears and closes it and goes back to the Git tab.
+fn toggle_git_and_search(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    if MultiWorkspace::is_search_focused_in_sidebar(window, cx) {
+        MultiWorkspace::clear_search_in_sidebar(window, cx);
+        show_git_graph(workspace, None, window, cx);
+        return;
+    }
+    let git_tab_focused = workspace
+        .items_of_type::<GitPage>(cx)
+        .next()
+        .is_some_and(|git_page| {
+            is_active_item(workspace, &git_page, cx)
+                && git_page
+                    .read(cx)
+                    .focus_handle(cx)
+                    .contains_focused(window, cx)
+        });
+    if git_tab_focused && MultiWorkspace::toggle_search_in_sidebar(window, cx) {
+        return;
+    }
+    show_git_graph(workspace, None, window, cx);
+}
+
+fn is_active_item(workspace: &Workspace, git_page: &Entity<GitPage>, cx: &App) -> bool {
+    workspace
+        .active_item(cx)
+        .is_some_and(|item| item.item_id() == git_page.entity_id())
+}
+
+/// Quarry's tree is in the Workspaces panel's Databases region; a window without that panel
+/// opens Quarry as a tab.
+fn focus_databases(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    if !MultiWorkspace::focus_databases_in_sidebar(window, cx) {
         quarry::panel::open(workspace, window, cx);
     }
 }
