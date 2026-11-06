@@ -6,11 +6,10 @@ use git_ui::{
     working_tree_changes::WorkingTreeChanges,
 };
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, SharedString, Subscription,
-    WeakEntity, Window,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, SharedString, WeakEntity,
+    Window,
 };
 use project::git_store::GitStore;
-use project_panel::ProjectPanel;
 use quarry::{connection_store::ConnectionStore, panel::QuarryPanel};
 use ui::prelude::*;
 use workspace::{
@@ -18,20 +17,17 @@ use workspace::{
     item::{Item, ItemEvent},
 };
 
-/// The permanent "Main" tab: the project panel, the project's uncommitted and staged changes
-/// with a commit form, and Quarry, side by side. The git graph opens in its place instead of in
-/// a tab of its own.
+/// The permanent "Main" tab: the project's uncommitted and staged changes with a commit form,
+/// and Quarry, side by side. The git graph opens in its place instead of in a tab of its own.
+/// The project's files are in the Workspaces panel.
 pub struct MainPage {
-    workspace: WeakEntity<Workspace>,
     view: MainView,
-    project_panel: Entity<ProjectPanel>,
     working_tree_changes: Entity<WorkingTreeChanges>,
     /// Kept while the overview is shown, so coming back finds it as it was left.
     git_graph: Option<Entity<GitGraph>>,
     /// `None` only when the Quarry connection store failed to start.
     quarry: Option<Entity<QuarryPanel>>,
     nav_history: Option<ItemNavHistory>,
-    _project_panel_focus: Subscription,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,7 +50,6 @@ impl MainView {
 impl MainPage {
     pub fn new(
         workspace: WeakEntity<Workspace>,
-        project_panel: Entity<ProjectPanel>,
         git_store: Entity<GitStore>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -71,37 +66,17 @@ impl MainPage {
                 None
             }
         };
-        let project_panel_focus_handle = project_panel.read(cx).focus_handle(cx);
-        // The project panel is only on screen in the overview, so whatever focuses it while the
-        // tab shows something else, like Reveal in Project Panel, means to see it.
-        let project_panel_focus =
-            cx.on_focus_in(&project_panel_focus_handle, window, |this, window, cx| {
-                if this.view != MainView::Overview && this.is_active(cx) {
-                    let back_to = this.view;
-                    this.set_view(MainView::Overview, Some(back_to), window, cx);
-                }
-            });
         Self {
-            workspace,
             view: MainView::Overview,
-            project_panel,
             working_tree_changes,
             git_graph: None,
             quarry,
             nav_history: None,
-            _project_panel_focus: project_panel_focus,
         }
     }
 
     pub fn quarry(&self) -> Option<&Entity<QuarryPanel>> {
         self.quarry.as_ref()
-    }
-
-    fn is_active(&self, cx: &Context<Self>) -> bool {
-        self.workspace
-            .upgrade()
-            .and_then(|workspace| workspace.read(cx).active_item(cx))
-            .is_some_and(|item| item.item_id() == cx.entity_id())
     }
 
     /// Switches what the tab shows. `back_to` is recorded in the navigation history, so Go Back
@@ -276,15 +251,6 @@ impl MainPage {
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .child(self.project_panel.clone()),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .border_l_1()
-                    .border_color(border_color)
                     .child(self.working_tree_changes.clone()),
             )
             .children(self.quarry.clone().map(|quarry| {
@@ -313,7 +279,7 @@ impl Focusable for MainPage {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match (self.view, &self.git_graph) {
             (MainView::GitGraph, Some(git_graph)) => git_graph.focus_handle(cx),
-            _ => self.project_panel.read(cx).focus_handle(cx),
+            _ => self.working_tree_changes.read(cx).focus_handle(cx),
         }
     }
 }

@@ -910,14 +910,14 @@ async fn test_thread_status_update_does_not_reset_list_measurements(cx: &mut Tes
 
     let before = sidebar.read_with(cx, |sidebar, app| {
         sidebar
-            .entry_shapes(multi_workspace.read(app))
+            .entry_shapes(multi_workspace.read(app), false)
             .collect::<Vec<_>>()
     });
     sidebar.update_in(cx, |sidebar, _window, cx| sidebar.update_entries(cx));
     cx.run_until_parked();
     let after = sidebar.read_with(cx, |sidebar, app| {
         sidebar
-            .entry_shapes(multi_workspace.read(app))
+            .entry_shapes(multi_workspace.read(app), false)
             .collect::<Vec<_>>()
     });
 
@@ -941,7 +941,7 @@ async fn test_collapse_changes_entry_shape(cx: &mut TestAppContext) {
 
     let before = sidebar.read_with(cx, |sidebar, app| {
         sidebar
-            .entry_shapes(multi_workspace.read(app))
+            .entry_shapes(multi_workspace.read(app), false)
             .collect::<Vec<_>>()
     });
     sidebar.update_in(cx, |sidebar, window, cx| {
@@ -950,7 +950,7 @@ async fn test_collapse_changes_entry_shape(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let after = sidebar.read_with(cx, |sidebar, app| {
         sidebar
-            .entry_shapes(multi_workspace.read(app))
+            .entry_shapes(multi_workspace.read(app), false)
             .collect::<Vec<_>>()
     });
 
@@ -1245,6 +1245,7 @@ async fn test_restore_serialized_archive_view_does_not_panic(cx: &mut TestAppCon
         width: Some(400.0),
         width_set_by_user: true,
         active_view: SerializedSidebarView::History,
+        files_height: None,
     })
     .expect("serialization should succeed");
 
