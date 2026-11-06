@@ -35,7 +35,8 @@ pub use multi_workspace::{
     MoveProjectToNewWindow, MoveProjectUp, MultiWorkspace, MultiWorkspaceEvent, NewThread,
     NextProject, NextThread, PreviousProject, PreviousThread, ProjectGroup, ProjectGroupKey,
     RemovalIntent, SerializedProjectGroupState, Sidebar, SidebarEvent, SidebarHandle,
-    SidebarRenderState, SidebarSide, ToggleWorkspaceSidebar, sidebar_side_context_menu,
+    SidebarRenderState, SidebarSide, ToggleWorkspaceSidebar, ToggleWorkspaceSidebarSearch,
+    sidebar_side_context_menu,
 };
 pub use path_list::{PathList, SerializedPathList};
 pub use remote::{

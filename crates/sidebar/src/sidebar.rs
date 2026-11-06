@@ -70,7 +70,8 @@ use util::path_list::PathList;
 use workspace::{
     MoveProjectDown, MoveProjectUp, MultiWorkspace, MultiWorkspaceEvent, NextProject, NextThread,
     Open, OpenMode, PreviousProject, PreviousThread, ProjectGroupKey, RemovalIntent, SaveIntent,
-    Sidebar as WorkspaceSidebar, SidebarSide, Toast, Workspace, notifications::NotificationId,
+    SerializedProjectGroup, Sidebar as WorkspaceSidebar, SidebarSide, Toast, Workspace,
+    notifications::NotificationId,
 };
 
 use git_ui_core::worktree_service::{RemoteBranchName, worktree_create_targets};
@@ -143,6 +144,8 @@ struct SerializedSidebar {
     files_hidden: bool,
     #[serde(default)]
     other_workspaces_expanded: bool,
+    #[serde(default)]
+    pinned_workspaces: Vec<SerializedProjectGroup>,
 }
 
 const DEFAULT_THREADS_MAX_HEIGHT: Pixels = px(240.);
@@ -171,12 +174,23 @@ enum HeaderPresentation {
     /// In the single list a search shows.
     List,
     /// An inactive workspace kept in sight above Other Workspaces. Dropping a workspace on it
-    /// keeps that one in sight too.
+    /// pins that one.
     InSight,
-    /// An inactive workspace under Other Workspaces. Dropping a workspace on it gathers that
-    /// one there too.
+    /// An inactive workspace under Other Workspaces. Dropping a workspace on it unpins that one,
+    /// which gathers it there too unless its threads need attention.
     Gathered,
     ActiveWorkspace,
+}
+
+/// A workspace listed in the menu the panel's title opens.
+#[derive(Clone)]
+struct WorkspaceMenuRow {
+    key: ProjectGroupKey,
+    label: SharedString,
+    is_active: bool,
+    has_running_threads: bool,
+    waiting_thread_count: usize,
+    has_notifications: bool,
 }
 
 /// Quarry's views, handed in by the zed crate, which keeps this crate from depending on Quarry
@@ -1114,12 +1128,13 @@ pub struct Sidebar {
     /// Whether the Other Workspaces heading, which gathers the inactive workspaces that need
     /// no attention, is unfolded.
     other_workspaces_expanded: bool,
-    /// Groups the user dragged out of Other Workspaces. Forgotten once a group has no open
-    /// workspace, so a workspace closed and opened again goes back under the heading.
-    kept_in_sight: HashSet<ProjectGroupKey>,
+    /// Groups the user pinned, from the Workspaces menu or by dragging them out of Other
+    /// Workspaces, which stay in sight above that heading. Saved with the panel's state and
+    /// forgotten once a group is removed from the window.
+    pinned: HashSet<ProjectGroupKey>,
     /// Set when a project header starts being dragged, and cleared on the first render after the
-    /// drag ends. gpui doesn't say what is being dragged, and the keep-in-sight strip must not
-    /// appear while a region is being resized.
+    /// drag ends. gpui doesn't say what is being dragged, and the strip to drop a workspace on to
+    /// pin it must not appear while a region is being resized.
     dragging_project_group: bool,
     /// The project panel the search last filtered, so it is unfiltered when another workspace
     /// becomes active or the search is cleared.
@@ -1286,7 +1301,7 @@ impl Sidebar {
             databases_hidden: false,
             files_hidden: false,
             other_workspaces_expanded: false,
-            kept_in_sight: HashSet::new(),
+            pinned: HashSet::new(),
             dragging_project_group: false,
             searched_project_panel: None,
         }
@@ -2432,12 +2447,12 @@ impl Sidebar {
         }
 
         let had_notifications = self.has_notifications(cx);
-        self.kept_in_sight.retain(|key| {
-            !multi_workspace
-                .read(cx)
-                .workspaces_for_project_group(key, cx)
-                .is_empty()
-        });
+        let group_keys = multi_workspace.read(cx).project_group_keys();
+        let pinned_count = self.pinned.len();
+        self.pinned.retain(|key| group_keys.contains(key));
+        if self.pinned.len() != pinned_count {
+            self.serialize(cx);
+        }
         let previous_shapes: Vec<EntryShape> =
             self.entry_shapes(multi_workspace.read(cx)).collect();
         let previous_active_group = self.contents.active_group.clone();
@@ -2849,10 +2864,10 @@ impl Sidebar {
                         move |this, dragged: &DraggedProjectGroup, _window, cx| {
                             match presentation {
                                 HeaderPresentation::InSight => {
-                                    this.keep_in_sight(&dragged.key, true, cx)
+                                    this.set_pinned(&dragged.key, true, cx)
                                 }
                                 HeaderPresentation::Gathered => {
-                                    this.keep_in_sight(&dragged.key, false, cx)
+                                    this.set_pinned(&dragged.key, false, cx)
                                 }
                                 HeaderPresentation::List | HeaderPresentation::ActiveWorkspace => {}
                             }
@@ -3085,10 +3100,10 @@ impl Sidebar {
         let active_group = self.contents.active_group.clone();
         let (needing_attention, quiet) = self.inactive_workspace_headers();
         let mut other_headers = Vec::with_capacity(needing_attention.len() + quiet.len() + 1);
-        // While a workspace is dragged, a strip on top keeps it in sight when dropped there, which
-        // is the only way in when no inactive workspace is in sight yet.
+        // While a workspace is dragged, a strip on top pins it when dropped there, which is the
+        // only place to drop it when no inactive workspace is in sight yet.
         if self.dragging_project_group && cx.has_active_drag() {
-            other_headers.push(self.render_keep_in_sight_drop_zone(cx));
+            other_headers.push(self.render_pin_drop_zone(cx));
         }
         for ix in needing_attention {
             if let Some(header) =
@@ -3134,9 +3149,9 @@ impl Sidebar {
             .into_any_element()
     }
 
-    /// The inactive workspaces' headers: those the user dragged out of Other Workspaces or with a
-    /// thread running, waiting for confirmation or finished unread, which stay in sight, and the
-    /// rest, gathered under Other Workspaces.
+    /// The inactive workspaces' headers: those the user pinned or with a thread running, waiting
+    /// for confirmation or finished unread, which stay in sight, and the rest, gathered under
+    /// Other Workspaces.
     fn inactive_workspace_headers(&self) -> (Vec<usize>, Vec<usize>) {
         let active_header_ix = self
             .contents
@@ -3157,7 +3172,7 @@ impl Sidebar {
                         waiting_thread_count,
                         has_notifications,
                         ..
-                    }) if self.kept_in_sight.contains(key)
+                    }) if self.pinned.contains(key)
                         || *has_running_threads
                         || *waiting_thread_count > 0
                         || *has_notifications
@@ -3165,25 +3180,26 @@ impl Sidebar {
             })
     }
 
-    fn keep_in_sight(&mut self, key: &ProjectGroupKey, keep: bool, cx: &mut Context<Self>) {
-        let changed = if keep {
-            self.kept_in_sight.insert(key.clone())
+    fn set_pinned(&mut self, key: &ProjectGroupKey, pinned: bool, cx: &mut Context<Self>) {
+        let changed = if pinned {
+            self.pinned.insert(key.clone())
         } else {
-            self.kept_in_sight.remove(key)
+            self.pinned.remove(key)
         };
         if changed {
+            self.serialize(cx);
             cx.notify();
         }
     }
 
-    fn render_keep_in_sight_drop_zone(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_pin_drop_zone(&self, cx: &mut Context<Self>) -> AnyElement {
         h_flex()
-            .id("keep-in-sight-drop-zone")
+            .id("pin-drop-zone")
             .h(Tab::content_height(cx))
             .w_full()
             .px_2()
             .child(
-                Label::new("Drop here to keep in sight")
+                Label::new("Drop here to pin")
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
@@ -3194,7 +3210,7 @@ impl Sidebar {
             })
             .on_drop(
                 cx.listener(|this, dragged: &DraggedProjectGroup, _window, cx| {
-                    this.keep_in_sight(&dragged.key, true, cx);
+                    this.set_pinned(&dragged.key, true, cx);
                 }),
             )
             .into_any_element()
@@ -3238,7 +3254,7 @@ impl Sidebar {
             })
             .on_drop(
                 cx.listener(|this, dragged: &DraggedProjectGroup, _window, cx| {
-                    this.keep_in_sight(&dragged.key, false, cx);
+                    this.set_pinned(&dragged.key, false, cx);
                 }),
             )
             .into_any_element()
@@ -4357,13 +4373,13 @@ impl Sidebar {
             return;
         }
 
+        // Unlike the thread history, the thread list keeps the focus instead of handing it to its
+        // search, so clicking the panel doesn't open the search.
         if let SidebarView::Archive(archive) = &self.view {
             let has_selection = archive.read(cx).has_selection();
             if !has_selection {
                 archive.update(cx, |view, cx| view.focus_filter_editor(window, cx));
             }
-        } else if self.selection.is_none() {
-            self.filter_editor.focus_handle(cx).focus(window, cx);
         }
     }
 
@@ -4617,7 +4633,10 @@ impl Sidebar {
         match current {
             Some(0) => {
                 self.selection = None;
-                self.filter_editor.focus_handle(cx).focus(window, cx);
+                // Going back up into the search only makes sense while it is open.
+                if self.has_filter_query(cx) {
+                    self.filter_editor.focus_handle(cx).focus(window, cx);
+                }
                 cx.notify();
             }
             Some(position) => {
@@ -8401,8 +8420,58 @@ impl Sidebar {
         })
     }
 
-    /// The panel's title, replaced by the search field once the user types in the panel or
-    /// focuses the search.
+    /// The window's workspaces, in the panel's order, for the menu the panel's title opens.
+    fn workspace_menu_rows(&self) -> Vec<WorkspaceMenuRow> {
+        self.contents
+            .project_header_indices
+            .iter()
+            .filter_map(|&ix| match self.contents.entries.get(ix)? {
+                ListEntry::ProjectHeader {
+                    key,
+                    label,
+                    has_running_threads,
+                    waiting_thread_count,
+                    has_notifications,
+                    is_active,
+                    ..
+                } => Some(WorkspaceMenuRow {
+                    key: key.clone(),
+                    label: label.clone(),
+                    is_active: *is_active,
+                    has_running_threads: *has_running_threads,
+                    waiting_thread_count: *waiting_thread_count,
+                    has_notifications: *has_notifications,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The panel's title. Clicking it lists the window's workspaces in a popover rather than in
+    /// the panel, to switch to one or to pin it so it stays in sight above Other Workspaces.
+    fn render_workspaces_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let sidebar = cx.weak_entity();
+        PopoverMenu::new("sidebar-workspaces-menu")
+            .trigger(
+                Button::new("sidebar-workspaces-menu-trigger", "Workspaces")
+                    .label_size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .end_icon(
+                        Icon::new(IconName::ChevronDown)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            )
+            .menu(move |window, cx| {
+                let rows = sidebar
+                    .read_with(cx, |sidebar, _| sidebar.workspace_menu_rows())
+                    .ok()?;
+                Some(build_workspaces_menu(rows, sidebar.clone(), window, cx))
+            })
+    }
+
+    /// The panel's title, which opens the workspaces menu, replaced by the search field once the
+    /// user types in the panel or opens the search from its shortcut.
     fn render_sidebar_header(
         &self,
         no_open_projects: bool,
@@ -8438,21 +8507,15 @@ impl Sidebar {
                                     })),
                             )
                         } else {
-                            this.child(
-                                div().ml_1().child(
-                                    Label::new("Workspaces")
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
-                                ),
-                            )
-                            // Kept in the tree, unseen, so typing while the panel itself has
-                            // focus still reaches it.
-                            .child(
-                                div()
-                                    .w_0()
-                                    .overflow_hidden()
-                                    .child(self.render_filter_input(cx)),
-                            )
+                            this.child(self.render_workspaces_menu(cx))
+                                // Kept in the tree, unseen, so typing while the panel itself has
+                                // focus still reaches it.
+                                .child(
+                                    div()
+                                        .w_0()
+                                        .overflow_hidden()
+                                        .child(self.render_filter_input(cx)),
+                                )
                         }
                     })
             })
@@ -8917,18 +8980,6 @@ impl WorkspaceSidebar for Sidebar {
         self.toggle_search_impl(window, cx);
     }
 
-    fn is_search_focused(&self, window: &Window, cx: &App) -> bool {
-        self.filter_editor.focus_handle(cx).is_focused(window)
-    }
-
-    fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.reset_filter_editor_text(window, cx) {
-            self.selection = None;
-            self.update_entries(cx);
-        }
-        cx.notify();
-    }
-
     fn serialized_state(&self, _cx: &App) -> Option<String> {
         let serialized = SerializedSidebar {
             width: self.width_set_by_user.then(|| f32::from(self.width)),
@@ -8944,6 +8995,11 @@ impl WorkspaceSidebar for Sidebar {
             databases_hidden: self.databases_hidden,
             files_hidden: self.files_hidden,
             other_workspaces_expanded: self.other_workspaces_expanded,
+            pinned_workspaces: self
+                .pinned
+                .iter()
+                .map(|key| SerializedProjectGroup::from_group(key, true))
+                .collect(),
         };
         serde_json::to_string(&serialized).ok()
     }
@@ -8972,6 +9028,11 @@ impl WorkspaceSidebar for Sidebar {
             self.databases_hidden = serialized.databases_hidden;
             self.files_hidden = serialized.files_hidden;
             self.other_workspaces_expanded = serialized.other_workspaces_expanded;
+            self.pinned = serialized
+                .pinned_workspaces
+                .into_iter()
+                .map(ProjectGroupKey::from)
+                .collect();
             if serialized.active_view == SerializedSidebarView::History {
                 cx.defer_in(window, |this, window, cx| {
                     this.show_archive(window, cx);
@@ -9110,6 +9171,121 @@ impl Render for Sidebar {
             })
             .child(self.render_sidebar_bottom_bar(cx))
     }
+}
+
+fn build_workspaces_menu(
+    rows: Vec<WorkspaceMenuRow>,
+    sidebar: WeakEntity<Sidebar>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<ContextMenu> {
+    ContextMenu::build(window, cx, move |mut menu, _window, cx| {
+        let weak_menu = cx.weak_entity();
+        for (row_ix, row) in rows.into_iter().enumerate() {
+            let key = row.key.clone();
+            let row_sidebar = sidebar.clone();
+            let activate_sidebar = sidebar.clone();
+            let weak_menu = weak_menu.clone();
+            menu = menu.custom_entry(
+                move |_window, cx| {
+                    render_workspace_menu_row(&row, row_ix, &row_sidebar, &weak_menu, cx)
+                },
+                move |window, cx| {
+                    activate_sidebar
+                        .update(cx, |sidebar, cx| {
+                            sidebar.activate_or_open_workspace_for_group(&key, window, cx);
+                        })
+                        .ok();
+                },
+            );
+        }
+        menu
+    })
+}
+
+/// A row of the workspaces menu: the workspace's name and what its threads are doing, like its
+/// header in the panel, and a pin that keeps it in sight above Other Workspaces. The pin is read
+/// from the sidebar on every render, so it follows a click while the menu stays open.
+fn render_workspace_menu_row(
+    row: &WorkspaceMenuRow,
+    row_ix: usize,
+    sidebar: &WeakEntity<Sidebar>,
+    menu: &WeakEntity<ContextMenu>,
+    cx: &App,
+) -> AnyElement {
+    let is_pinned = sidebar
+        .read_with(cx, |sidebar, _| sidebar.pinned.contains(&row.key))
+        .unwrap_or(false);
+    let has_running_threads = row.has_running_threads;
+    let waiting_thread_count = row.waiting_thread_count;
+
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .gap_2()
+        .justify_between()
+        .child(
+            h_flex()
+                .min_w_0()
+                .gap_1()
+                .child(
+                    Label::new(row.label.clone())
+                        .when(!row.is_active, |this| this.color(Color::Muted))
+                        .truncate(),
+                )
+                .when(has_running_threads, |this| {
+                    this.child(
+                        Icon::new(IconName::LoadCircle)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted)
+                            .with_rotate_animation(2),
+                    )
+                })
+                .when(waiting_thread_count > 0, |this| {
+                    this.child(
+                        Icon::new(IconName::Warning)
+                            .size(IconSize::XSmall)
+                            .color(Color::Warning),
+                    )
+                })
+                .when(
+                    row.has_notifications && !has_running_threads && waiting_thread_count == 0,
+                    |this| {
+                        this.child(
+                            Icon::new(IconName::Circle)
+                                .size(IconSize::Small)
+                                .color(Color::Accent),
+                        )
+                    },
+                ),
+        )
+        .child(
+            IconButton::new(("pin-workspace", row_ix), IconName::Pin)
+                .icon_size(IconSize::Small)
+                .icon_color(if is_pinned {
+                    Color::Accent
+                } else {
+                    Color::Muted
+                })
+                .toggle_state(is_pinned)
+                .tooltip(Tooltip::text(if is_pinned {
+                    "Unpin Workspace"
+                } else {
+                    "Pin Workspace"
+                }))
+                .on_click({
+                    let sidebar = sidebar.clone();
+                    let menu = menu.clone();
+                    let key = row.key.clone();
+                    move |_, _window, cx| {
+                        sidebar
+                            .update(cx, |sidebar, cx| sidebar.set_pinned(&key, !is_pinned, cx))
+                            .ok();
+                        menu.update(cx, |_, cx| cx.notify()).ok();
+                    }
+                }),
+        )
+        .into_any_element()
 }
 
 /// Splices only the range of `list_state` whose item shapes changed, so items before and after it

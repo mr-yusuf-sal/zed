@@ -43,6 +43,9 @@ actions!(
         CloseWorkspaceSidebar,
         /// Moves focus to or from the workspace sidebar without closing it.
         FocusWorkspaceSidebar,
+        /// Opens the workspace sidebar's search and focuses it, or clears and closes it when it
+        /// has focus.
+        ToggleWorkspaceSidebarSearch,
         /// Activates the next project in the sidebar.
         NextProject,
         /// Activates the previous project in the sidebar.
@@ -174,13 +177,6 @@ pub trait Sidebar: Focusable + Render + EventEmitter<SidebarEvent> + Sized {
 
     /// Opens the search and focuses it, or, when it already has focus, clears and closes it.
     fn toggle_search(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
-
-    fn is_search_focused(&self, _window: &Window, _cx: &App) -> bool {
-        false
-    }
-
-    /// Clears the search, which hides it, without moving focus.
-    fn clear_search(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
 }
 
 pub trait SidebarHandle: 'static + Send + Sync {
@@ -204,8 +200,6 @@ pub trait SidebarHandle: 'static + Send + Sync {
     fn reveal_files(&self, workspace: Entity<Workspace>, window: &mut Window, cx: &mut App);
     fn focus_databases(&self, window: &mut Window, cx: &mut App);
     fn toggle_search(&self, window: &mut Window, cx: &mut App);
-    fn is_search_focused(&self, window: &Window, cx: &App) -> bool;
-    fn clear_search(&self, window: &mut Window, cx: &mut App);
 }
 
 #[derive(Clone)]
@@ -283,19 +277,6 @@ impl<T: Sidebar> SidebarHandle for Entity<T> {
         window.defer(cx, move |window, cx| {
             entity.update(cx, |this, cx| {
                 this.toggle_search(window, cx);
-            });
-        });
-    }
-
-    fn is_search_focused(&self, window: &Window, cx: &App) -> bool {
-        self.read(cx).is_search_focused(window, cx)
-    }
-
-    fn clear_search(&self, window: &mut Window, cx: &mut App) {
-        let entity = self.clone();
-        window.defer(cx, move |window, cx| {
-            entity.update(cx, |this, cx| {
-                this.clear_search(window, cx);
             });
         });
     }
@@ -524,50 +505,6 @@ impl MultiWorkspace {
             });
         });
         true
-    }
-
-    /// Opens the sidebar's search and focuses it, or closes it when it has focus. Returns false
-    /// when this window has no sidebar.
-    pub fn toggle_search_in_sidebar(window: &mut Window, cx: &mut App) -> bool {
-        let Some(multi_workspace) = Self::with_usable_sidebar(window, cx) else {
-            return false;
-        };
-        window.defer(cx, move |window, cx| {
-            multi_workspace.update(cx, |multi_workspace, cx| {
-                if !multi_workspace.sidebar_open() {
-                    multi_workspace.open_sidebar(cx);
-                }
-                if let Some(sidebar) = &multi_workspace.sidebar {
-                    sidebar.toggle_search(window, cx);
-                }
-            });
-        });
-        true
-    }
-
-    /// Whether the sidebar's search has focus.
-    pub fn is_search_focused_in_sidebar(window: &Window, cx: &App) -> bool {
-        Self::with_usable_sidebar(window, cx).is_some_and(|multi_workspace| {
-            multi_workspace
-                .read(cx)
-                .sidebar
-                .as_ref()
-                .is_some_and(|sidebar| sidebar.is_search_focused(window, cx))
-        })
-    }
-
-    /// Clears the sidebar's search, which hides it, leaving focus to the caller.
-    pub fn clear_search_in_sidebar(window: &mut Window, cx: &mut App) {
-        let Some(multi_workspace) = Self::with_usable_sidebar(window, cx) else {
-            return;
-        };
-        window.defer(cx, move |window, cx| {
-            multi_workspace.update(cx, |multi_workspace, cx| {
-                if let Some(sidebar) = &multi_workspace.sidebar {
-                    sidebar.clear_search(window, cx);
-                }
-            });
-        });
     }
 
     fn with_usable_sidebar(window: &Window, cx: &App) -> Option<Entity<MultiWorkspace>> {
@@ -2441,6 +2378,16 @@ impl Render for MultiWorkspace {
                     .on_action(cx.listener(
                         |this: &mut Self, _: &FocusWorkspaceSidebar, window, cx| {
                             this.focus_sidebar(window, cx);
+                        },
+                    ))
+                    .on_action(cx.listener(
+                        |this: &mut Self, _: &ToggleWorkspaceSidebarSearch, window, cx| {
+                            if !this.sidebar_open() {
+                                this.open_sidebar(cx);
+                            }
+                            if let Some(sidebar) = &this.sidebar {
+                                sidebar.toggle_search(window, cx);
+                            }
                         },
                     ))
                     .on_action(cx.listener(
