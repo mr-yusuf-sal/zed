@@ -1224,6 +1224,7 @@ async fn test_restore_serialized_archive_view_does_not_panic(cx: &mut TestAppCon
         databases_height: None,
         databases_hidden: false,
         files_hidden: false,
+        other_workspaces_expanded: false,
     })
     .expect("serialization should succeed");
 
