@@ -197,6 +197,10 @@ pub struct ConnectionConfig {
     /// The panel groups connections that share a folder under one heading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder: Option<String>,
+    /// The root paths of the project the connection belongs to, sorted. The Workspaces panel
+    /// lists a project's own connections, and those without a project under Shared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<Vec<std::path::PathBuf>>,
     /// A bastion the connection goes through: `host` and `port` are then as the bastion sees
     /// them, and a local port forwarded over SSH is what the driver actually connects to.
     #[serde(default, skip_serializing_if = "Option::is_none")]

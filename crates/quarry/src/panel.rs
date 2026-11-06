@@ -77,6 +77,13 @@ enum Script {
     Create,
 }
 
+/// Which project moves a connection's menu offers.
+#[derive(Clone, Copy, Default)]
+struct ProjectMoves {
+    to_project: bool,
+    to_shared: bool,
+}
+
 /// The actions on a saved connection, shared by its "⋯" button and its right-click menu.
 fn connection_menu(
     menu: ContextMenu,
@@ -84,6 +91,7 @@ fn connection_menu(
     index: usize,
     connected: bool,
     busy: bool,
+    moves: ProjectMoves,
 ) -> ContextMenu {
     let update = |action: fn(&mut QuarryPanel, usize, &mut Window, &mut Context<QuarryPanel>)| {
         let panel = panel.clone();
@@ -124,6 +132,20 @@ fn connection_menu(
         None,
         update(|this, index, _, cx| this.duplicate(index, cx)),
     )
+    .when(moves.to_project, |menu| {
+        menu.entry(
+            "Move to This Project",
+            None,
+            update(|this, index, _, cx| this.move_to_current_project(index, cx)),
+        )
+    })
+    .when(moves.to_shared, |menu| {
+        menu.entry(
+            "Move to Shared",
+            None,
+            update(|this, index, _, cx| this.move_to_shared(index, cx)),
+        )
+    })
     .entry(
         "Set Password",
         None,
@@ -265,14 +287,86 @@ pub struct QuarryPanel {
     compare_source: Option<CompareSource>,
     /// Folders whose connections are hidden. Not persisted: a restart opens every folder.
     collapsed_folders: HashSet<String>,
+    /// Set for the tree in the Workspaces panel, which lists the active project's connections
+    /// and, under Shared, those of no project. A Quarry tab lists every connection.
+    scoped_to_project: bool,
+    shared_collapsed: bool,
     _tasks: Vec<Task<()>>,
 }
 
 impl QuarryPanel {
     /// Points the panel at the workspace its queries open in. The Workspaces panel shows one
     /// tree per window, which follows the active workspace.
-    pub fn set_workspace(&mut self, workspace: WeakEntity<Workspace>) {
+    pub fn set_workspace(&mut self, workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) {
         self.workspace = workspace;
+        cx.notify();
+    }
+
+    /// Lists only the workspace's project's connections, and those of no project under Shared.
+    pub fn scope_to_project(&mut self, cx: &mut Context<Self>) {
+        self.scoped_to_project = true;
+        cx.notify();
+    }
+
+    /// The root paths, sorted, of the project the panel lists connections for.
+    fn current_project(&self, cx: &App) -> Option<Vec<std::path::PathBuf>> {
+        if !self.scoped_to_project {
+            return None;
+        }
+        let workspace = self.workspace.upgrade()?;
+        let mut paths: Vec<std::path::PathBuf> = workspace
+            .read(cx)
+            .root_paths(cx)
+            .into_iter()
+            .map(|path| path.to_path_buf())
+            .collect();
+        paths.sort();
+        (!paths.is_empty()).then_some(paths)
+    }
+
+    /// A connection added from the Workspaces panel belongs to the project it was added in.
+    fn in_current_project(&self, mut config: ConnectionConfig, cx: &App) -> ConnectionConfig {
+        if config.project.is_none() {
+            config.project = self.current_project(cx);
+        }
+        config
+    }
+
+    fn project_moves(&self, index: usize, cx: &App) -> ProjectMoves {
+        let Some(config) = self.store.read(cx).get(index) else {
+            return ProjectMoves::default();
+        };
+        let current_project = self.current_project(cx);
+        ProjectMoves {
+            to_project: current_project.is_some() && config.project != current_project,
+            to_shared: self.scoped_to_project && config.project.is_some(),
+        }
+    }
+
+    fn move_to_current_project(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(project) = self.current_project(cx) else {
+            return;
+        };
+        self.set_connection_project(index, Some(project), cx);
+    }
+
+    fn move_to_shared(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.set_connection_project(index, None, cx);
+    }
+
+    fn set_connection_project(
+        &mut self,
+        index: usize,
+        project: Option<Vec<std::path::PathBuf>>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut config) = self.store.read(cx).get(index).cloned() else {
+            return;
+        };
+        config.project = project;
+        self.store
+            .update(cx, |store, cx| store.replace(index, config, cx));
+        cx.notify();
     }
 
     pub fn new(
@@ -317,6 +411,8 @@ impl QuarryPanel {
             filter,
             context_menu: None,
             collapsed_folders: HashSet::default(),
+            scoped_to_project: false,
+            shared_collapsed: false,
             compare_source: None,
             discovering: None,
             notice: None,
@@ -473,6 +569,7 @@ impl QuarryPanel {
             if !password.is_empty() {
                 self.save_password(&config, password, cx);
             }
+            let config = self.in_current_project(config, cx);
             self.store.update(cx, |store, cx| store.add(config, cx));
             return;
         };
@@ -482,6 +579,11 @@ impl QuarryPanel {
         };
         let Some(previous) = self.store.read(cx).get(index).cloned() else {
             return;
+        };
+        // The form doesn't show the project, so an edit keeps the one the connection had.
+        let config = ConnectionConfig {
+            project: previous.project.clone(),
+            ..config
         };
         self.store
             .update(cx, |store, cx| store.replace(index, config.clone(), cx));
@@ -602,8 +704,8 @@ impl QuarryPanel {
         if let Some(password) = server.password {
             self.save_password(&server.config, password, cx);
         }
-        self.store
-            .update(cx, |store, cx| store.add(server.config, cx));
+        let config = self.in_current_project(server.config, cx);
+        self.store.update(cx, |store, cx| store.add(config, cx));
     }
 
     /// Adds Quarry's MCP server to `context_servers` in the user's settings.json, which is how
@@ -1467,6 +1569,7 @@ impl QuarryPanel {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let panel = cx.entity().downgrade();
+        let moves = self.project_moves(index, cx);
         PopoverMenu::new(SharedString::from(format!(
             "quarry-connection-menu-{index}"
         )))
@@ -1482,7 +1585,7 @@ impl QuarryPanel {
         .menu(move |window, cx| {
             let panel = panel.clone();
             Some(ContextMenu::build(window, cx, move |menu, _, _| {
-                connection_menu(menu, panel, index, connected, busy)
+                connection_menu(menu, panel, index, connected, busy, moves)
             }))
         })
     }
@@ -1513,9 +1616,10 @@ impl QuarryPanel {
         let state = self.states.get(index);
         let connected = state.is_some_and(|state| state.driver.is_some());
         let busy = state.is_some_and(|state| state.busy);
+        let moves = self.project_moves(index, cx);
         let panel = cx.entity().downgrade();
         let menu = ContextMenu::build(window, cx, move |menu, _, _| {
-            connection_menu(menu, panel, index, connected, busy)
+            connection_menu(menu, panel, index, connected, busy, moves)
         });
         self.deploy_context_menu(position, menu, window, cx);
     }
@@ -1897,30 +2001,112 @@ impl QuarryPanel {
         }
     }
 
-    /// Connections in folders first, each folder under a heading that folds it away, then the
-    /// ones without a folder. Positions in the store are kept, so every row still addresses
-    /// its connection by index.
+    /// Every connection, or in the Workspaces panel the active project's own and then, under a
+    /// Shared heading that folds away, those of no project.
     fn render_connection_list(
         &self,
         connections: &[ConnectionConfig],
         filter: &str,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
+        if !self.scoped_to_project {
+            let all = (0..connections.len()).collect();
+            return self.render_connection_group("", connections, all, filter, cx);
+        }
+        let current_project = self.current_project(cx);
+        let mut own = Vec::new();
+        let mut shared = Vec::new();
+        for (index, config) in connections.iter().enumerate() {
+            match &config.project {
+                None => shared.push(index),
+                Some(project) if Some(project) == current_project.as_ref() => own.push(index),
+                Some(_) => {}
+            }
+        }
+
+        let mut elements = self.render_connection_group("own-", connections, own, filter, cx);
+        if !shared.is_empty() {
+            let collapsed = self.shared_collapsed;
+            elements.push(
+                h_flex()
+                    .id("quarry-shared")
+                    .w_full()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                    .child(
+                        Icon::new(if collapsed {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new("Shared")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(SharedString::from(shared.len().to_string()))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.shared_collapsed = !this.shared_collapsed;
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+            if !collapsed {
+                for element in self.render_connection_group("shared-", connections, shared, filter, cx)
+                {
+                    elements.push(div().w_full().pl_3().child(element).into_any_element());
+                }
+            }
+        }
+        elements
+    }
+
+    /// The connections at `indexes`: those in folders first, each folder under a heading that
+    /// folds it away, then the ones without a folder. Positions in the store are kept, so every
+    /// row still addresses its connection by index. `id_prefix` keeps a folder of the same name
+    /// in two groups apart.
+    fn render_connection_group(
+        &self,
+        id_prefix: &str,
+        connections: &[ConnectionConfig],
+        indexes: Vec<usize>,
+        filter: &str,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         let mut folders: BTreeMap<String, Vec<usize>> = BTreeMap::default();
         let mut loose = Vec::new();
-        for (index, config) in connections.iter().enumerate() {
+        for index in indexes {
+            let Some(config) = connections.get(index) else {
+                continue;
+            };
             match &config.folder {
-                Some(folder) => folders.entry(folder.clone()).or_default().push(index),
+                Some(folder) => folders
+                    .entry(format!("{id_prefix}{folder}"))
+                    .or_default()
+                    .push(index),
                 None => loose.push(index),
             }
         }
 
         let mut elements = Vec::new();
-        for (folder, indexes) in folders {
-            let collapsed = self.collapsed_folders.contains(&folder);
+        for (folder_key, indexes) in folders {
+            let folder = folder_key
+                .strip_prefix(id_prefix)
+                .unwrap_or(&folder_key)
+                .to_string();
+            let collapsed = self.collapsed_folders.contains(&folder_key);
             elements.push(
                 h_flex()
-                    .id(SharedString::from(format!("quarry-folder-{folder}")))
+                    .id(SharedString::from(format!("quarry-folder-{folder_key}")))
                     .w_full()
                     .gap_1()
                     .px_2()
@@ -1951,8 +2137,8 @@ impl QuarryPanel {
                             .color(Color::Muted),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if !this.collapsed_folders.remove(&folder) {
-                            this.collapsed_folders.insert(folder.clone());
+                        if !this.collapsed_folders.remove(&folder_key) {
+                            this.collapsed_folders.insert(folder_key.clone());
                         }
                         cx.notify();
                     }))
