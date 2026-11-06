@@ -1059,7 +1059,7 @@ impl Sidebar {
 
         let filter_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Search threads…", window, cx);
+            editor.set_placeholder_text("Search workspaces…", window, cx);
             editor
         });
         let rename_editor = cx.new(|cx| Editor::single_line(window, cx));
@@ -7583,7 +7583,7 @@ impl Sidebar {
 
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
         ProjectEmptyState::new(
-            "Threads Sidebar",
+            "Workspaces",
             self.focus_handle(cx),
             KeyBinding::for_action(&workspace::Open::default(), cx),
         )
