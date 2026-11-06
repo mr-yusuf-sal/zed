@@ -1114,7 +1114,6 @@ pub struct Sidebar {
     /// The active workspace's thread rows, a list of their own below the other workspaces.
     threads_list_state: ListState,
     other_workspaces_scroll: ScrollHandle,
-    workspaces_below_scroll: ScrollHandle,
     threads_max_height: Pixels,
     /// Quarry's connection tree and its focus handle, handed in by the zed crate, which keeps
     /// this crate from depending on Quarry and its database drivers.
@@ -1289,7 +1288,6 @@ impl Sidebar {
             cross_channel_import_channels: Vec::new(),
             threads_list_state: ListState::new(0, gpui::ListAlignment::Top, px(200.)),
             other_workspaces_scroll: ScrollHandle::new(),
-            workspaces_below_scroll: ScrollHandle::new(),
             threads_max_height: DEFAULT_THREADS_MAX_HEIGHT,
             databases: None,
             databases_height: DEFAULT_DATABASES_HEIGHT,
@@ -3082,87 +3080,76 @@ impl Sidebar {
         ))
     }
 
-    /// Outside a search: the other workspaces' headers, folded, around the active workspace with
-    /// its threads, databases and files. The active workspace keeps its place among the pinned
-    /// ones when it is pinned, and is on top otherwise, so switching workspaces moves none of
-    /// them. The headers above it, the active workspace and the headers below it each scroll by
+    /// Outside a search: the workspaces' headers, folded, in a list of their own that stays put,
+    /// and below it the active workspace's threads, databases and files. The active workspace's
+    /// header keeps its place among the pinned ones when it is pinned, and is on top otherwise,
+    /// so switching workspaces moves none of them. The list and each region below it scroll by
     /// themselves, and none is inside another, so their scrolling doesn't mix.
     fn render_split_layout(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let border_color = cx.theme().colors().border;
         let is_focused = self.focus_handle.is_focused(window);
         let active_group = self.contents.active_group.clone();
-        let (above, below) = self.workspace_headers_around_active();
-        let mut headers_above = Vec::with_capacity(above.len() + 1);
+        let active_header_ix = active_group.as_ref().map(|group| group.header_ix);
+        let order = self.workspace_header_order();
+        let mut headers = Vec::with_capacity(order.len() + 1);
         // While a workspace is dragged, a strip on top pins it when dropped there, which is the
         // only place to drop it when no inactive workspace is in sight yet.
         if self.dragging_project_group && cx.has_active_drag() {
-            headers_above.push(self.render_pin_drop_zone(cx));
+            headers.push(self.render_pin_drop_zone(cx));
         }
-        headers_above.extend(above.into_iter().filter_map(|ix| {
-            self.render_header_at(ix, HeaderPresentation::InSight, is_focused, cx)
+        headers.extend(order.into_iter().filter_map(|ix| {
+            let presentation = if Some(ix) == active_header_ix {
+                HeaderPresentation::ActiveWorkspace
+            } else {
+                HeaderPresentation::InSight
+            };
+            self.render_header_at(ix, presentation, is_focused, cx)
         }));
-        let headers_below: Vec<_> = below
-            .into_iter()
-            .filter_map(|ix| self.render_header_at(ix, HeaderPresentation::InSight, is_focused, cx))
-            .collect();
         let active_workspace = active_group
             .as_ref()
-            .map(|group| self.render_active_workspace(group, is_focused, window, cx));
+            .map(|group| self.render_active_workspace(group, window, cx));
 
         v_flex()
             .flex_1()
             .min_h_0()
             .w_full()
-            .when(!headers_above.is_empty(), |this| {
+            .when(!headers.is_empty(), |this| {
                 this.child(
                     v_flex()
-                        .id("workspaces-above")
+                        .id("workspaces")
                         .flex_shrink_0()
                         .max_h(relative(0.4))
                         .overflow_y_scroll()
                         .track_scroll(&self.other_workspaces_scroll)
-                        .border_b_1()
-                        .border_color(border_color)
-                        .children(headers_above),
+                        .children(headers),
                 )
             })
             .children(active_workspace)
-            .when(!headers_below.is_empty(), |this| {
-                this.child(
-                    v_flex()
-                        .id("workspaces-below")
-                        .flex_shrink_0()
-                        .max_h(relative(0.4))
-                        .overflow_y_scroll()
-                        .track_scroll(&self.workspaces_below_scroll)
-                        .border_t_1()
-                        .border_color(border_color)
-                        .children(headers_below),
-                )
-            })
             .into_any_element()
     }
 
-    /// The inactive workspaces' headers in sight, split into those drawn above the active
-    /// workspace and those below it. A pinned active workspace keeps its place in the panel's
+    /// The workspace headers in sight, in the order they are listed: the active workspace's and
+    /// the inactive ones kept in sight. A pinned active workspace keeps its place in the panel's
     /// order among them; one that isn't pinned is on top of them all.
-    fn workspace_headers_around_active(&self) -> (Vec<usize>, Vec<usize>) {
-        let in_sight = self.inactive_workspace_headers();
-        let pinned_active_ix = self
+    fn workspace_header_order(&self) -> Vec<usize> {
+        let mut order = self.inactive_workspace_headers();
+        if let Some(active_ix) = self
             .contents
             .active_group
             .as_ref()
             .map(|group| group.header_ix)
-            .filter(|&ix| {
-                matches!(
-                    self.contents.entries.get(ix),
-                    Some(ListEntry::ProjectHeader { key, .. }) if self.pinned.contains(key)
-                )
-            });
-        match pinned_active_ix {
-            Some(active_ix) => in_sight.into_iter().partition(|&ix| ix < active_ix),
-            None => (Vec::new(), in_sight),
+        {
+            let is_pinned = matches!(
+                self.contents.entries.get(active_ix),
+                Some(ListEntry::ProjectHeader { key, .. }) if self.pinned.contains(key)
+            );
+            let position = if is_pinned {
+                order.partition_point(|&ix| ix < active_ix)
+            } else {
+                0
+            };
+            order.insert(position, active_ix);
         }
+        order
     }
 
     /// The inactive workspaces' headers kept in sight: those the user pinned or with a thread
@@ -3236,16 +3223,28 @@ impl Sidebar {
     fn render_active_workspace(
         &self,
         group: &ActiveGroup,
-        is_focused: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let header = self.render_header_at(
-            group.header_ix,
-            HeaderPresentation::ActiveWorkspace,
-            is_focused,
-            cx,
-        );
+        let threads_header = h_flex()
+            .flex_shrink_0()
+            .h(REGION_HEADER_HEIGHT)
+            .w_full()
+            .pl_2()
+            .pr_1()
+            .gap_1()
+            .border_t_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                Icon::new(IconName::Thread)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(
+                Label::new("Threads")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            );
 
         let threads = if group.rows.is_empty() {
             h_flex()
@@ -3400,7 +3399,7 @@ impl Sidebar {
             .flex_1()
             .min_h_0()
             .w_full()
-            .children(header)
+            .child(threads_header)
             .child(threads_region)
             .children(databases)
             .child(files)
@@ -3550,16 +3549,13 @@ impl Sidebar {
     }
 
     /// Entry indices in the order they are on screen: everything during a search; otherwise the
-    /// inactive workspaces' headers in sight above the active workspace, its header and rows,
-    /// then the headers below it. The inactive workspaces' threads are kept in `entries` but not
-    /// shown.
+    /// workspaces' headers in sight, then the active workspace's rows. The inactive workspaces'
+    /// threads are kept in `entries` but not shown.
     fn visible_entry_order(&self) -> Vec<usize> {
-        let (mut order, below) = self.workspace_headers_around_active();
+        let mut order = self.workspace_header_order();
         if let Some(active_group) = self.contents.active_group.as_ref() {
-            order.push(active_group.header_ix);
             order.extend(active_group.rows.clone());
         }
-        order.extend(below);
         order
     }
 
@@ -3571,11 +3567,12 @@ impl Sidebar {
                 .scroll_to_reveal_item(ix - active_group.rows.start);
             return;
         }
-        let (above, below) = self.workspace_headers_around_active();
-        if let Some(position) = above.iter().position(|&header_ix| header_ix == ix) {
+        if let Some(position) = self
+            .workspace_header_order()
+            .iter()
+            .position(|&header_ix| header_ix == ix)
+        {
             self.other_workspaces_scroll.scroll_to_item(position);
-        } else if let Some(position) = below.iter().position(|&header_ix| header_ix == ix) {
-            self.workspaces_below_scroll.scroll_to_item(position);
         }
     }
 
@@ -8430,11 +8427,18 @@ impl Sidebar {
             .collect()
     }
 
-    /// The panel's title. Clicking it lists the window's workspaces in a popover rather than in
-    /// the panel, to switch to one or to pin it so it stays in sight on top.
+    /// The panel's title, followed by the active workspace's name. Clicking it lists the window's
+    /// workspaces in a popover rather than in the panel, to switch to one or to pin it so it stays
+    /// in sight on top.
     fn render_workspaces_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let sidebar = cx.weak_entity();
-        PopoverMenu::new("sidebar-workspaces-menu")
+        let active_label = self.contents.active_group.as_ref().and_then(|group| {
+            match self.contents.entries.get(group.header_ix) {
+                Some(ListEntry::ProjectHeader { label, .. }) => Some(label.clone()),
+                _ => None,
+            }
+        });
+        let menu = PopoverMenu::new("sidebar-workspaces-menu")
             .trigger(
                 Button::new("sidebar-workspaces-menu-trigger", "Workspaces")
                     .label_size(LabelSize::Small)
@@ -8450,7 +8454,17 @@ impl Sidebar {
                     .read_with(cx, |sidebar, _| sidebar.workspace_menu_rows())
                     .ok()?;
                 Some(build_workspaces_menu(rows, sidebar.clone(), window, cx))
-            })
+            });
+        h_flex()
+            .min_w_0()
+            .gap_1()
+            .child(menu)
+            .children(active_label.map(|label| {
+                Label::new(SharedString::from(format!("Active - {label}")))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .truncate()
+            }))
     }
 
     /// The panel's title, which opens the workspaces menu, replaced by the search field once the
