@@ -8917,6 +8917,18 @@ impl WorkspaceSidebar for Sidebar {
         self.toggle_search_impl(window, cx);
     }
 
+    fn is_search_focused(&self, window: &Window, cx: &App) -> bool {
+        self.filter_editor.focus_handle(cx).is_focused(window)
+    }
+
+    fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.reset_filter_editor_text(window, cx) {
+            self.selection = None;
+            self.update_entries(cx);
+        }
+        cx.notify();
+    }
+
     fn serialized_state(&self, _cx: &App) -> Option<String> {
         let serialized = SerializedSidebar {
             width: self.width_set_by_user.then(|| f32::from(self.width)),
