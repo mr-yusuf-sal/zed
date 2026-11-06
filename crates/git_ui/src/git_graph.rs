@@ -1390,7 +1390,7 @@ pub fn init(cx: &mut App) {
 }
 
 /// What `Open` and `OpenAtCommit` show. The zed crate handles those actions: it shows the
-/// project's graph in the Main tab, and falls back to `open_or_reuse_graph` without one.
+/// project's graph in the permanent Git tab, and falls back to `open_or_reuse_graph` without one.
 pub fn active_repository_target(
     workspace: &Workspace,
     cx: &App,
@@ -1401,7 +1401,7 @@ pub fn active_repository_target(
 }
 
 /// The repository and branch the project's graph was last left showing, most recently shown
-/// first. Kept per repository path rather than per workspace because the Main tab's graph is not
+/// first. Kept per repository path rather than per workspace because the Git tab's graph is not
 /// a serialized item, and so that each project finds its own repository among the entries.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct LastGraphSelection {

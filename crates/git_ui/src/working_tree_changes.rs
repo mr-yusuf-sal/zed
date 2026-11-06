@@ -1008,7 +1008,7 @@ impl WorkingTreeChanges {
     }
 
     /// The layout is global and survives restarts, like the git graph's detail panel position,
-    /// so it applies to the Main tab's list and every git graph's alike.
+    /// so it applies to every git graph's list alike.
     fn restore_sections_side_by_side(cx: &App) -> bool {
         KeyValueStore::global(cx)
             .read_kvp(SECTIONS_SIDE_BY_SIDE_KEY)
