@@ -2770,6 +2770,7 @@ impl Sidebar {
             == WindowBackgroundAppearance::Opaque
             && sidebar_base_bg.a >= 1.0;
 
+        let project_label = label.clone();
         let label = if highlight_positions.is_empty() {
             Label::new(label.clone())
                 .when(!is_active, |this| this.color(Color::Muted))
@@ -2979,6 +2980,7 @@ impl Sidebar {
                                 ix,
                                 id_prefix,
                                 key,
+                                &project_label,
                                 is_active,
                                 has_threads,
                                 &group_name,
@@ -3834,6 +3836,7 @@ impl Sidebar {
         ix: usize,
         id_prefix: &str,
         project_group_key: &ProjectGroupKey,
+        project_label: &SharedString,
         is_active: bool,
         has_threads: bool,
         group_name: &SharedString,
@@ -3841,6 +3844,7 @@ impl Sidebar {
     ) -> AnyElement {
         let multi_workspace = self.multi_workspace.clone();
         let project_group_key = project_group_key.clone();
+        let project_label = project_label.clone();
 
         let single_window = workspace::WorkspaceSettings::get_global(cx).single_window;
         let show_multi_project_entries = !single_window
@@ -3905,6 +3909,16 @@ impl Sidebar {
                     })
                     .unwrap_or((None, 0));
                 let show_reorder_entries = total_groups >= 2;
+                let has_archived_threads = {
+                    let store = ThreadMetadataStore::global(cx).read(cx);
+                    let host = project_group_key.host();
+                    store.archived_entries().any(|thread| {
+                        (thread.main_worktree_paths() == project_group_key.path_list()
+                            || thread.folder_paths() == project_group_key.path_list())
+                            && thread.matches_remote_connection(host.as_ref())
+                    })
+                };
+                let project_label = project_label.clone();
                 let can_move_up = group_index.is_some_and(|i| i > 0);
                 let can_move_down = group_index.is_some_and(|i| i + 1 < total_groups);
 
@@ -4202,6 +4216,29 @@ impl Sidebar {
                                 );
                             }
                             menu
+                        };
+
+                        let menu = {
+                            let this = this_for_menu.clone();
+                            let project_group_key = project_group_key.clone();
+                            let project_label = project_label.clone();
+                            let weak_menu = weak_menu.clone();
+                            menu.separator().item(
+                                ContextMenuEntry::new("Show Archived Threads")
+                                    .disabled(!has_archived_threads)
+                                    .handler(move |window, cx| {
+                                        this.update(cx, |sidebar, cx| {
+                                            sidebar.show_project_archive(
+                                                project_group_key.clone(),
+                                                project_label.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        })
+                                        .ok();
+                                        weak_menu.update(cx, |_, cx| cx.emit(DismissEvent)).ok();
+                                    }),
+                            )
                         };
 
                         let menu = menu.when(show_reorder_entries, |this| {
@@ -8723,6 +8760,21 @@ impl Sidebar {
         archive_view.update(cx, |view, cx| view.focus_filter_editor(window, cx));
         self.serialize(cx);
         cx.notify();
+    }
+
+    fn show_project_archive(
+        &mut self,
+        project_group_key: ProjectGroupKey,
+        project_label: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_archive(window, cx);
+        if let SidebarView::Archive(archive) = &self.view {
+            archive.update(cx, |archive, cx| {
+                archive.show_archived_of_project(project_group_key, project_label, window, cx)
+            });
+        }
     }
 
     fn show_thread_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {

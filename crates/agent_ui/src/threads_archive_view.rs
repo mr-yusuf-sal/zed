@@ -29,7 +29,7 @@ use picker::{
     highlighted_match_with_paths::{HighlightedMatch, HighlightedMatchWithPaths},
 };
 use platform_title_bar::apply_title_bar_insets;
-use project::{AgentId, AgentServerStore};
+use project::{AgentId, AgentServerStore, ProjectGroupKey};
 use settings::Settings as _;
 use theme::ActiveTheme;
 use ui::{
@@ -157,6 +157,8 @@ pub struct ThreadsArchiveView {
     archived_branch_names: HashMap<ThreadId, HashMap<PathBuf, String>>,
     _load_branch_names_task: Task<()>,
     thread_filter: ThreadFilter,
+    /// The workspace whose archived threads alone are listed, with its name.
+    project_scope: Option<(ProjectGroupKey, SharedString)>,
 }
 
 impl ThreadsArchiveView {
@@ -231,6 +233,7 @@ impl ThreadsArchiveView {
             archived_branch_names: HashMap::default(),
             _load_branch_names_task: Task::ready(()),
             thread_filter: ThreadFilter::All,
+            project_scope: None,
         };
 
         this.update_items(cx);
@@ -270,6 +273,22 @@ impl ThreadsArchiveView {
         self.thread_filter == ThreadFilter::ArchivedOnly
     }
 
+    /// Lists only the archived threads of the workspace that `key` names.
+    pub fn show_archived_of_project(
+        &mut self,
+        key: ProjectGroupKey,
+        name: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.filter_editor.update(cx, |editor, cx| {
+            editor.set_placeholder_text(&format!("Search archived threads in {name}…"), window, cx);
+        });
+        self.project_scope = Some((key, name));
+        self.thread_filter = ThreadFilter::ArchivedOnly;
+        self.update_items(cx);
+    }
+
     pub fn is_filter_editor_focused(&self, window: &Window, cx: &App) -> bool {
         self.filter_editor
             .read(cx)
@@ -284,17 +303,28 @@ impl ThreadsArchiveView {
         // user just deleted the last one), fall back to showing all threads
         // so they aren't stranded with an empty list and a disabled toggle.
         if self.thread_filter == ThreadFilter::ArchivedOnly
+            && self.project_scope.is_none()
             && store.archived_entries().next().is_none()
         {
             self.thread_filter = ThreadFilter::All;
         }
 
         let thread_filter = self.thread_filter;
+        let project_scope = self.project_scope.as_ref().map(|(key, _)| key);
         let sessions = store
             .entries()
             .filter(|t| match thread_filter {
                 ThreadFilter::All => true,
                 ThreadFilter::ArchivedOnly => t.archived,
+            })
+            .filter(|t| {
+                project_scope.is_none_or(|key| {
+                    // A thread run in a linked worktree belongs to its main
+                    // worktree's workspace too, as in the sidebar's list.
+                    (t.main_worktree_paths() == key.path_list()
+                        || t.folder_paths() == key.path_list())
+                        && t.matches_remote_connection(key.host().as_ref())
+                })
             })
             .sorted_by_cached_key(|t| t.created_at.unwrap_or(t.updated_at))
             .rev()
@@ -973,10 +1003,11 @@ impl ThreadsArchiveView {
             store.archived_entries().next().is_some()
         };
 
-        let count_label = if entry_count == 1 {
-            "1 thread".to_string()
-        } else {
-            format!("{} threads", entry_count)
+        let count_label = match (&self.project_scope, entry_count) {
+            (Some((_, name)), 1) => format!("1 archived thread in {name}"),
+            (Some((_, name)), _) => format!("{entry_count} archived threads in {name}"),
+            (None, 1) => "1 thread".to_string(),
+            (None, _) => format!("{entry_count} threads"),
         };
 
         h_flex()
@@ -990,7 +1021,8 @@ impl ThreadsArchiveView {
             .child(
                 Label::new(count_label)
                     .size(LabelSize::Small)
-                    .color(Color::Muted),
+                    .color(Color::Muted)
+                    .truncate(),
             )
             .child(
                 h_flex()
@@ -1011,28 +1043,30 @@ impl ThreadsArchiveView {
                                 cx.emit(ThreadsArchiveViewEvent::Import);
                             })),
                     )
-                    .child(
-                        IconButton::new("filter-archived-only", IconName::Archive)
-                            .icon_size(IconSize::Small)
-                            .disabled(!has_archived_threads)
-                            .toggle_state(self.thread_filter == ThreadFilter::ArchivedOnly)
-                            .tooltip(Tooltip::text(
-                                if self.thread_filter == ThreadFilter::ArchivedOnly {
-                                    "Show All Threads"
-                                } else {
-                                    "Show Only Archived Threads"
-                                },
-                            ))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.thread_filter =
-                                    if this.thread_filter == ThreadFilter::ArchivedOnly {
-                                        ThreadFilter::All
+                    .when(self.project_scope.is_none(), |this| {
+                        this.child(
+                            IconButton::new("filter-archived-only", IconName::Archive)
+                                .icon_size(IconSize::Small)
+                                .disabled(!has_archived_threads)
+                                .toggle_state(self.thread_filter == ThreadFilter::ArchivedOnly)
+                                .tooltip(Tooltip::text(
+                                    if self.thread_filter == ThreadFilter::ArchivedOnly {
+                                        "Show All Threads"
                                     } else {
-                                        ThreadFilter::ArchivedOnly
-                                    };
-                                this.update_items(cx);
-                            })),
-                    ),
+                                        "Show Only Archived Threads"
+                                    },
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.thread_filter =
+                                        if this.thread_filter == ThreadFilter::ArchivedOnly {
+                                            ThreadFilter::All
+                                        } else {
+                                            ThreadFilter::ArchivedOnly
+                                        };
+                                    this.update_items(cx);
+                                })),
+                        )
+                    }),
             )
     }
 }
@@ -1072,10 +1106,10 @@ impl Render for ThreadsArchiveView {
         let has_query = !self.filter_editor.read(cx).text(cx).is_empty();
 
         let content = if is_empty {
-            let message = if has_query {
-                "No threads match your search."
-            } else {
-                "No threads yet."
+            let message: SharedString = match (&self.project_scope, has_query) {
+                (_, true) => "No threads match your search.".into(),
+                (Some((_, name)), false) => format!("No archived threads in {name}.").into(),
+                (None, false) => "No threads yet.".into(),
             };
 
             v_flex()
