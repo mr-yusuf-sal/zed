@@ -58,6 +58,7 @@ const SESSION_SETUP_METHODS: [&str; 4] = [
     "session/fork",
 ];
 const PROMPT_METHOD: &str = "session/prompt";
+const CLOSE_METHOD: &str = "session/close";
 const CANCEL_REQUEST_METHOD: &str = "$/cancel_request";
 
 /// Sent by Zed for a session whose turn an earlier connection started. The
@@ -409,9 +410,12 @@ struct Host {
     /// Every connected Zed, by the generation it attached with. One Zed can
     /// connect more than once, from each of its projects on the same folder.
     clients: HashMap<u64, Client>,
-    /// The connection that set up each session, which its updates and
-    /// requests go to.
-    session_owners: HashMap<String, u64>,
+    /// The connections that set up each session, the latest last. Two
+    /// projects on the same folder share this host and can both show one
+    /// session, so its updates go to all of them: sent only to the latest,
+    /// the other's thread stopped mid-message until it loaded the session
+    /// again.
+    session_owners: HashMap<String, Vec<u64>>,
     /// The session each subagent session runs under, from the agent's
     /// `subagent_update`s. Zed never sets a subagent session up itself, so its
     /// messages go to the owner of the session at the root of this chain.
@@ -630,7 +634,10 @@ impl Host {
         if self.clients.remove(&generation).is_none() {
             return;
         }
-        self.session_owners.retain(|_, owner| *owner != generation);
+        self.session_owners.retain(|_, owners| {
+            owners.retain(|owner| *owner != generation);
+            !owners.is_empty()
+        });
         self.turn_waiters
             .retain(|waiter| waiter.generation != generation);
 
@@ -650,22 +657,49 @@ impl Host {
             self.answer_locally(&request);
         }
         // Requests of no session can go to any Zed that is still connected.
-        if let Some(generation) = self.target(None) {
+        if let Some(generation) = self.request_target(None) {
             self.deliver_held_requests(generation, None);
         }
     }
 
-    /// The connection that a message of `session_id` goes to: the one that set
-    /// the session up, or for a message of no session the latest one.
-    fn target(&self, session_id: Option<&str>) -> Option<u64> {
-        match session_id {
-            Some(session_id) => self
-                .session_owners
-                .get(root_session(&self.subagent_parents, session_id))
-                .copied()
-                .filter(|generation| self.clients.contains_key(generation)),
-            None => self.clients.keys().max().copied(),
-        }
+    fn claim_session(&mut self, session_id: String, generation: u64) {
+        let owners = self.session_owners.entry(session_id).or_default();
+        owners.retain(|owner| *owner != generation);
+        owners.push(generation);
+    }
+
+    /// The connected Zeds that set `session_id` up, the latest last.
+    fn owners(&self, session_id: &str) -> Vec<u64> {
+        self.session_owners
+            .get(root_session(&self.subagent_parents, session_id))
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|generation| self.clients.contains_key(generation))
+            .collect()
+    }
+
+    /// The single connection that a request of `session_id` goes to. Requests
+    /// are not fanned out like updates, since two Zeds answering an `fs/` or
+    /// `terminal/` request would both act on it. The Zed that sent the running
+    /// prompt is the one the turn is driven from, so its permission prompts
+    /// appear there; otherwise the latest owner, or for a request of no
+    /// session the latest connection.
+    fn request_target(&self, session_id: Option<&str>) -> Option<u64> {
+        let Some(session_id) = session_id else {
+            return self.clients.keys().max().copied();
+        };
+        let root = root_session(&self.subagent_parents, session_id);
+        self.client_requests
+            .values()
+            .filter(|request| {
+                request.method == PROMPT_METHOD
+                    && request.session_id.as_deref() == Some(root)
+                    && self.clients.contains_key(&request.generation)
+            })
+            .map(|request| request.generation)
+            .max()
+            .or_else(|| self.owners(root).last().copied())
     }
 
     /// Records the parent of the subagent session that `message`, a
@@ -691,7 +725,7 @@ impl Host {
             // A subagent can ask for permission before its announcement
             // reaches the host.
             let root = root_session(&self.subagent_parents, child).to_owned();
-            if let Some(generation) = self.target(Some(&root)) {
+            if let Some(generation) = self.request_target(Some(&root)) {
                 self.deliver_held_requests(generation, Some(&root));
             }
         }
@@ -766,26 +800,25 @@ impl Host {
 
         match (method, id) {
             (Some(method), Some(id)) => {
-                let host_id = self.next_request_id;
-                self.next_request_id += 1;
-                let session_id = params_session_id(&message);
-                // Loading a session replays it before the response, so its
-                // updates must already go to the connection that asked.
-                if SESSION_SETUP_METHODS.contains(&method.as_str())
-                    && let Some(session_id) = &session_id
+                if method == CLOSE_METHOD
+                    && let Some(session_id) = params_session_id(&message)
                 {
-                    self.session_owners.insert(session_id.clone(), generation);
+                    let still_shown = self
+                        .owners(&session_id)
+                        .iter()
+                        .any(|owner| *owner != generation);
+                    if let Some(owners) = self.session_owners.get_mut(&session_id) {
+                        owners.retain(|owner| *owner != generation);
+                    }
+                    // Closed at the agent, it would end for the other Zeds
+                    // that still show it too.
+                    if still_shown {
+                        let response = json!({ "jsonrpc": "2.0", "id": id, "result": {} });
+                        self.send_to(generation, STDOUT_TAG, &response.to_string());
+                        return;
+                    }
                 }
-                self.client_requests.insert(
-                    host_id,
-                    ClientRequest {
-                        generation,
-                        id,
-                        method,
-                        session_id,
-                    },
-                );
-                message["id"] = host_id.into();
+                self.forward_client_request(generation, &mut message, method, id);
             }
             (Some(method), None) if method == CANCEL_REQUEST_METHOD => {
                 let request_id = message
@@ -819,6 +852,37 @@ impl Host {
         self.send_to_agent(message.to_string());
     }
 
+    /// Renumbers a request of Zed's with an id unique to the host and records
+    /// which connection its response goes to.
+    fn forward_client_request(
+        &mut self,
+        generation: u64,
+        message: &mut Value,
+        method: String,
+        id: Value,
+    ) {
+        let host_id = self.next_request_id;
+        self.next_request_id += 1;
+        let session_id = params_session_id(message);
+        // Loading a session replays it before the response, so its updates
+        // must already go to the connection that asked.
+        if SESSION_SETUP_METHODS.contains(&method.as_str())
+            && let Some(session_id) = &session_id
+        {
+            self.claim_session(session_id.clone(), generation);
+        }
+        self.client_requests.insert(
+            host_id,
+            ClientRequest {
+                generation,
+                id,
+                method,
+                session_id,
+            },
+        );
+        message["id"] = host_id.into();
+    }
+
     fn handle_agent_line(&mut self, line: String) {
         let Ok(mut message) = serde_json::from_str::<Value>(&line) else {
             self.broadcast(STDOUT_TAG, &line);
@@ -833,7 +897,7 @@ impl Host {
         match (method, id) {
             (Some(method), Some(id)) => {
                 let session_id = params_session_id(&message);
-                let delivered_to = self.target(session_id.as_deref());
+                let delivered_to = self.request_target(session_id.as_deref());
                 match delivered_to {
                     Some(generation) => self.send_to(generation, STDOUT_TAG, &line),
                     // No Zed that knows the session is connected to answer it.
@@ -913,19 +977,21 @@ impl Host {
                 // After the response, so that Zed knows the session by the time
                 // the requests that waited for it arrive.
                 if let Some(session_id) = loaded_session {
-                    self.session_owners
-                        .insert(session_id.clone(), request.generation);
+                    self.claim_session(session_id.clone(), request.generation);
                     self.deliver_held_requests(request.generation, Some(&session_id));
                 }
             }
             _ => {
-                match params_session_id(&message)
-                    .as_deref()
-                    .and_then(|session_id| self.target(Some(session_id)))
-                {
-                    Some(generation) => self.send_to(generation, STDOUT_TAG, &line),
+                let owners = params_session_id(&message)
+                    .map(|session_id| self.owners(&session_id))
+                    .unwrap_or_default();
+                if owners.is_empty() {
                     // A Zed ignores updates of a session it has not loaded.
-                    None => self.broadcast(STDOUT_TAG, &line),
+                    self.broadcast(STDOUT_TAG, &line);
+                } else {
+                    for generation in owners {
+                        self.send_to(generation, STDOUT_TAG, &line);
+                    }
                 }
                 // After the update, so that Zed knows the subagent by the
                 // time its held requests arrive.
@@ -1291,6 +1357,79 @@ mod tests {
             json!(2),
             "a turn that already ended is answered at once"
         );
+    }
+
+    #[test]
+    fn a_session_shown_by_two_connections_streams_to_both() {
+        let (mut host, mut agent) = test_host();
+        let (first, mut first_client) = attach(&mut host);
+        let (second, mut second_client) = attach(&mut host);
+
+        for (generation, client) in [(first, &mut first_client), (second, &mut second_client)] {
+            host.handle_client_line(
+                generation,
+                json!({"jsonrpc": "2.0", "id": 0, "method": "session/load", "params": {"sessionId": "s"}})
+                    .to_string(),
+            );
+            let load_request = next_message(&mut agent);
+            host.handle_agent_line(
+                json!({"jsonrpc": "2.0", "id": load_request["id"], "result": {}}).to_string(),
+            );
+            assert_eq!(next_message(client)["id"], json!(0));
+        }
+
+        host.handle_client_line(
+            first,
+            json!({"jsonrpc": "2.0", "id": 1, "method": PROMPT_METHOD, "params": {"sessionId": "s"}})
+                .to_string(),
+        );
+        next_message(&mut agent);
+
+        host.handle_agent_line(
+            json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s"}})
+                .to_string(),
+        );
+        assert_eq!(
+            next_message(&mut first_client)["method"],
+            json!("session/update"),
+            "a later load elsewhere must not take the updates away from the first"
+        );
+        assert_eq!(
+            next_message(&mut second_client)["method"],
+            json!("session/update")
+        );
+
+        host.handle_agent_line(
+            json!({"jsonrpc": "2.0", "id": 3, "method": "session/request_permission", "params": {"sessionId": "s"}})
+                .to_string(),
+        );
+        assert_eq!(
+            next_message(&mut first_client)["id"],
+            json!(3),
+            "requests go to the connection that sent the prompt"
+        );
+        assert_eq!(next_line(&mut second_client), "");
+
+        host.handle_client_line(
+            second,
+            json!({"jsonrpc": "2.0", "id": 1, "method": CLOSE_METHOD, "params": {"sessionId": "s"}})
+                .to_string(),
+        );
+        assert_eq!(next_message(&mut second_client)["id"], json!(1));
+        assert_eq!(
+            next_line(&mut agent),
+            "",
+            "the session stays open at the agent while the first still shows it"
+        );
+        host.handle_agent_line(
+            json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s"}})
+                .to_string(),
+        );
+        assert_eq!(
+            next_message(&mut first_client)["method"],
+            json!("session/update")
+        );
+        assert_eq!(next_line(&mut second_client), "");
     }
 
     #[test]
