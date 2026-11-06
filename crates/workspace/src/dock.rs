@@ -107,6 +107,21 @@ impl AutoHideMode {
             Self::Pinned => "Pinned",
         }
     }
+
+    fn to_stored(self) -> &'static str {
+        match self {
+            Self::Hidden => "hidden",
+            Self::Hover => "hover",
+            Self::Pinned => "pinned",
+        }
+    }
+
+    pub(crate) fn store(self, key: String, cx: &App) {
+        let kvp = KeyValueStore::global(cx);
+        db::write_and_log(cx, move || async move {
+            kvp.write_kvp(key, self.to_stored().to_string()).await
+        });
+    }
 }
 
 pub enum PanelEvent {
