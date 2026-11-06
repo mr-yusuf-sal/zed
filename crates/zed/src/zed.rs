@@ -561,6 +561,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
                 .update(cx, |_, window, cx| {
                     let sidebar =
                         cx.new(|cx| Sidebar::new(multi_workspace_handle.clone(), window, cx));
+                    add_databases_to_sidebar(&multi_workspace_handle, &sidebar, window, cx);
                     multi_workspace_handle.update(cx, |multi_workspace, cx| {
                         multi_workspace.register_sidebar(sidebar, cx);
                     });
@@ -837,12 +838,6 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
                         let main_page = cx.new(|cx| {
                             main_page::MainPage::new(weak_workspace, git_store, window, cx)
                         });
-                        // Query tabs reveal the Main tab's Quarry tree at the editor's left edge.
-                        if let Some(quarry) = main_page.read(cx).quarry().cloned() {
-                            let quarry_dock_panel =
-                                cx.new(|_| quarry::panel::QuarryDockPanel::new(quarry));
-                            workspace.add_panel(quarry_dock_panel, window, cx);
-                        }
                         workspace.add_permanent_item(Box::new(main_page), window, cx);
                     })
                     .log_err();
@@ -1475,6 +1470,39 @@ fn register_actions(
 
         workspace.show_error(DebugError, cx);
         workspace.show_error(SecondDebugError, cx);
+    });
+}
+
+/// Gives the window's Workspaces panel one Quarry tree, which opens queries in whichever
+/// workspace is active. The sidebar crate takes it as a plain view so that it doesn't depend on
+/// Quarry and its database drivers.
+fn add_databases_to_sidebar(
+    multi_workspace: &Entity<MultiWorkspace>,
+    sidebar: &Entity<Sidebar>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(store) = quarry::connection_store::ConnectionStore::global(cx) else {
+        log::error!("the Quarry connection store is unavailable");
+        return;
+    };
+    let active_workspace = multi_workspace.read(cx).workspace().downgrade();
+    let quarry = cx.new(|cx| quarry::panel::QuarryPanel::new(active_workspace, store, window, cx));
+    cx.subscribe(multi_workspace, {
+        let quarry = quarry.downgrade();
+        move |multi_workspace, event: &workspace::MultiWorkspaceEvent, cx| {
+            if let workspace::MultiWorkspaceEvent::ActiveWorkspaceChanged { .. } = event {
+                let workspace = multi_workspace.read(cx).workspace().downgrade();
+                quarry
+                    .update(cx, |quarry, _| quarry.set_workspace(workspace))
+                    .log_err();
+            }
+        }
+    })
+    .detach();
+    let focus_handle = quarry.focus_handle(cx);
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.set_databases_view(quarry.into(), focus_handle, cx);
     });
 }
 

@@ -10,23 +10,20 @@ use gpui::{
     Window,
 };
 use project::git_store::GitStore;
-use quarry::{connection_store::ConnectionStore, panel::QuarryPanel};
 use ui::prelude::*;
 use workspace::{
-    ItemNavHistory, Workspace,
+    ItemNavHistory, MultiWorkspace, Workspace,
     item::{Item, ItemEvent},
 };
 
-/// The permanent "Main" tab: the project's uncommitted and staged changes with a commit form,
-/// and Quarry, side by side. The git graph opens in its place instead of in a tab of its own.
-/// The project's files are in the Workspaces panel.
+/// The permanent "Main" tab: the project's uncommitted and staged changes with a commit form.
+/// The git graph opens in its place instead of in a tab of its own. The project's files and
+/// Quarry are in the Workspaces panel.
 pub struct MainPage {
     view: MainView,
     working_tree_changes: Entity<WorkingTreeChanges>,
     /// Kept while the overview is shown, so coming back finds it as it was left.
     git_graph: Option<Entity<GitGraph>>,
-    /// `None` only when the Quarry connection store failed to start.
-    quarry: Option<Entity<QuarryPanel>>,
     nav_history: Option<ItemNavHistory>,
 }
 
@@ -55,28 +52,13 @@ impl MainPage {
         cx: &mut Context<Self>,
     ) -> Self {
         let working_tree_changes =
-            cx.new(|cx| WorkingTreeChanges::new(workspace.clone(), git_store, None, window, cx));
-        let quarry = match ConnectionStore::global(cx) {
-            Some(store) => {
-                let workspace = workspace.clone();
-                Some(cx.new(|cx| QuarryPanel::new(workspace, store, window, cx)))
-            }
-            None => {
-                log::error!("the Quarry connection store is unavailable");
-                None
-            }
-        };
+            cx.new(|cx| WorkingTreeChanges::new(workspace, git_store, None, window, cx));
         Self {
             view: MainView::Overview,
             working_tree_changes,
             git_graph: None,
-            quarry,
             nav_history: None,
         }
-    }
-
-    pub fn quarry(&self) -> Option<&Entity<QuarryPanel>> {
-        self.quarry.as_ref()
     }
 
     /// Switches what the tab shows. `back_to` is recorded in the navigation history, so Go Back
@@ -183,16 +165,10 @@ fn show_git_graph(
     show(workspace, &main_page, MainView::GitGraph, window, cx);
 }
 
-/// Quarry is always on screen in the overview, so its shortcut only brings the overview up and
-/// moves focus into it.
+/// Quarry's tree is in the Workspaces panel; a window without one opens Quarry as a tab.
 fn show_quarry(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
-    let Some(main_page) = workspace.items_of_type::<MainPage>(cx).next() else {
+    if !MultiWorkspace::focus_databases_in_sidebar(window, cx) {
         quarry::panel::open(workspace, window, cx);
-        return;
-    };
-    show(workspace, &main_page, MainView::Overview, window, cx);
-    if let Some(quarry) = main_page.read(cx).quarry.clone() {
-        window.focus(&quarry.focus_handle(cx), cx);
     }
 }
 
@@ -242,35 +218,19 @@ fn show(
 }
 
 impl MainPage {
-    fn render_overview(&self, cx: &mut Context<Self>) -> AnyElement {
-        let border_color = cx.theme().colors().border;
-        h_flex()
+    fn render_overview(&self) -> AnyElement {
+        div()
             .size_full()
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .child(self.working_tree_changes.clone()),
-            )
-            .children(self.quarry.clone().map(|quarry| {
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .border_l_1()
-                    .border_color(border_color)
-                    .child(quarry)
-            }))
+            .child(self.working_tree_changes.clone())
             .into_any_element()
     }
 }
 
 impl Render for MainPage {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         match (self.view, &self.git_graph) {
             (MainView::GitGraph, Some(git_graph)) => git_graph.clone().into_any_element(),
-            _ => self.render_overview(cx),
+            _ => self.render_overview(),
         }
     }
 }
