@@ -129,6 +129,10 @@ const DETAIL_PANEL_POSITION_KEY: &str = "git_graph_detail_panel_position";
 const AUTO_FETCH_KEY: &str = "git_graph_auto_fetch";
 const AUTO_FETCH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const DETAIL_PANEL_RATIOS_KEY: &str = "git_graph_detail_panel_ratios";
+const LAST_SELECTION_KEY: &str = "git_graph_last_selection";
+/// One entry per repository ever shown, so the store is bounded; repositories of projects not
+/// opened in a long time fall off the end.
+const LAST_SELECTION_LIMIT: usize = 64;
 const ROW_VERTICAL_PADDING: Pixels = px(4.0);
 
 struct CopiedState {
@@ -1387,6 +1391,59 @@ pub fn active_repository_target(
     Some((repository.read(cx).id, project.git_store().clone()))
 }
 
+/// The repository and branch the project's graph was last left showing, most recently shown
+/// first. Kept per repository path rather than per workspace because the Main tab's graph is not
+/// a serialized item, and so that each project finds its own repository among the entries.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct LastGraphSelection {
+    repositories: Vec<RememberedRepository>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RememberedRepository {
+    path: PathBuf,
+    branch: Option<String>,
+}
+
+fn read_last_graph_selection(cx: &App) -> LastGraphSelection {
+    KeyValueStore::global(cx)
+        .read_kvp(LAST_SELECTION_KEY)
+        .log_err()
+        .flatten()
+        .and_then(|json| serde_json::from_str::<LastGraphSelection>(&json).log_err())
+        .unwrap_or_default()
+}
+
+/// What the project's graph showed when it was last left, if one of the project's repositories
+/// was shown before. A remembered branch that no longer exists falls back to all branches.
+pub fn remembered_project_graph_target(
+    git_store: &Entity<GitStore>,
+    cx: &App,
+) -> Option<(RepositoryId, LogSource)> {
+    let selection = read_last_graph_selection(cx);
+    let repositories = git_store.read(cx).repositories();
+    selection.repositories.iter().find_map(|remembered| {
+        let (repo_id, repository) = repositories.iter().find(|(_, repository)| {
+            repository.read(cx).work_directory_abs_path.as_ref() == remembered.path.as_path()
+        })?;
+        let repository = repository.read(cx);
+        let log_source = match &remembered.branch {
+            // The branch list may not be loaded yet this early after startup, so only a loaded
+            // list that lacks the branch rules it out.
+            Some(branch)
+                if repository.branch_list.is_empty()
+                    || repository.branch_list.iter().any(|candidate| {
+                        !candidate.is_remote() && candidate.name() == branch.as_str()
+                    }) =>
+            {
+                LogSource::Branch(SharedString::from(branch.clone()))
+            }
+            _ => LogSource::All,
+        };
+        Some((*repo_id, log_source))
+    })
+}
+
 /// Points the project's graph, which is reused rather than opened again, at `repo_id`, and
 /// selects `sha` once it is loaded.
 pub fn retarget_project_graph(
@@ -1403,6 +1460,7 @@ pub fn retarget_project_graph(
         if switches_repository || sha.is_some() {
             graph.set_log_source(LogSource::All, cx);
         }
+        graph.remember_selection(cx);
     });
     select_commit_when_loaded(git_graph.clone(), sha, cx);
 }
@@ -4201,6 +4259,42 @@ Checked out in worktree {}",
         self.clear_selection(cx);
         self.invalidate_state(cx);
         self.fetch_initial_graph_data(cx);
+        self.remember_selection(cx);
+    }
+
+    /// Saves the repository and branch shown, so the project's graph comes back to them when it
+    /// is opened again, including after a restart. File history and a single commit's history are
+    /// not what the project's graph is left on, so they are not remembered.
+    fn remember_selection(&self, cx: &mut Context<Self>) {
+        let branch = match &self.log_source {
+            LogSource::All => None,
+            LogSource::Branch(branch) => Some(branch.to_string()),
+            LogSource::Sha(_) | LogSource::Path(_) => return,
+        };
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let path = repository.read(cx).work_directory_abs_path.to_path_buf();
+        // Re-read before writing: graphs in other windows remember their own repositories in
+        // the same entry.
+        let mut selection = read_last_graph_selection(cx);
+        selection
+            .repositories
+            .retain(|remembered| remembered.path != path);
+        selection
+            .repositories
+            .insert(0, RememberedRepository { path, branch });
+        selection.repositories.truncate(LAST_SELECTION_LIMIT);
+        let Some(json) = serde_json::to_string(&selection).log_err() else {
+            return;
+        };
+        let kvp = KeyValueStore::global(cx);
+        cx.background_spawn(async move {
+            kvp.write_kvp(LAST_SELECTION_KEY.to_string(), json)
+                .await
+                .log_err()
+        })
+        .detach();
     }
 
     /// Points the graph at another repository of the project, showing all of
@@ -4220,6 +4314,7 @@ Checked out in worktree {}",
         self.clear_selection(cx);
         self.invalidate_state(cx);
         self.fetch_initial_graph_data(cx);
+        self.remember_selection(cx);
     }
 
     /// A dropdown that switches the graph between the project's repositories,
