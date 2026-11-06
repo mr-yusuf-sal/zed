@@ -814,12 +814,13 @@ async fn test_sidebar_action_hover_contrasts_with_row(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn test_thread_metadata_update_preserves_sticky_header_measurements(cx: &mut TestAppContext) {
-    let (fs, project_a) = init_multi_project_test(&["/project-a", "/project-b"], cx).await;
+async fn test_thread_metadata_update_preserves_thread_row_measurements(cx: &mut TestAppContext) {
+    // The active workspace's threads are a list of their own. A metadata update that keeps
+    // every row's shape must keep their measurements, so the list doesn't jump.
+    let (_fs, project_a) = init_multi_project_test(&["/project-a"], cx).await;
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
     let sidebar = setup_sidebar(&multi_workspace, cx);
-    add_test_project("/project-b", &fs, &multi_workspace, cx).await;
 
     save_thread_metadata(
         acp::SessionId::new(Arc::from("project-a-thread")),
@@ -830,49 +831,23 @@ async fn test_thread_metadata_update_preserves_sticky_header_measurements(cx: &m
         &project_a,
         cx,
     );
-    save_thread_metadata_with_main_paths(
-        "project-b-thread",
-        "Project B Thread",
-        PathList::new(&[PathBuf::from("/project-b")]),
-        PathList::new(&[PathBuf::from("/project-b")]),
-        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 2, 0, 0, 0).unwrap(),
-        cx,
-    );
-
-    cx.draw(
-        gpui::point(px(0.), px(0.)),
-        gpui::size(px(400.), px(240.)),
-        |_, _| sidebar.clone().into_any_element(),
-    );
     cx.run_until_parked();
 
-    let next_header_ix = sidebar.read_with(cx, |sidebar, _| {
-        assert!(
-            sidebar.contents.project_header_indices.len() == 2,
-            "test setup should render exctly two project headers"
+    let draw = |cx: &mut gpui::VisualTestContext| {
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(px(400.), px(400.)),
+            |_, _| sidebar.clone().into_any_element(),
         );
-        sidebar.contents.project_header_indices[1]
-    });
-
-    sidebar.update_in(cx, |sidebar, _window, cx| {
-        sidebar.list_state.scroll_to(gpui::ListOffset {
-            item_ix: next_header_ix - 1,
-            offset_in_item: px(24.),
-        });
-        cx.notify();
-    });
-    cx.draw(
-        gpui::point(px(0.), px(0.)),
-        gpui::size(px(400.), px(240.)),
-        |_, _| sidebar.clone().into_any_element(),
-    );
-    cx.run_until_parked();
+        cx.run_until_parked();
+    };
+    draw(cx);
 
     let bounds_before = sidebar.read_with(cx, |sidebar, _| {
         sidebar
-            .list_state
-            .bounds_for_item(next_header_ix)
-            .expect("next project header should be measured before metadata update")
+            .threads_list_state
+            .bounds_for_item(0)
+            .expect("the active workspace's thread row should be measured")
     });
 
     save_thread_metadata(
@@ -887,9 +862,9 @@ async fn test_thread_metadata_update_preserves_sticky_header_measurements(cx: &m
 
     let bounds_after = sidebar.read_with(cx, |sidebar, _| {
         sidebar
-            .list_state
-            .bounds_for_item(next_header_ix)
-            .expect("same-shape metadata update should preserve next header measurements")
+            .threads_list_state
+            .bounds_for_item(0)
+            .expect("same-shape metadata update should preserve the row's measurements")
     });
     assert_eq!(bounds_before, bounds_after);
 }
@@ -5573,11 +5548,15 @@ impl SidebarClickFixture {
             gpui::size(px(400.), px(400.)),
             |_, _| self.sidebar.clone().into_any_element(),
         );
+        // Outside a search the active workspace's rows are drawn in a list of their own.
         let entry_bounds = self.sidebar.read_with(cx, |sidebar, _cx| {
-            sidebar
-                .list_state
-                .bounds_for_item(entry_index)
-                .expect("sidebar entry should be measured")
+            match &sidebar.contents.active_group {
+                Some(group) if group.rows.contains(&entry_index) => sidebar
+                    .threads_list_state
+                    .bounds_for_item(entry_index - group.rows.start),
+                _ => sidebar.list_state.bounds_for_item(entry_index),
+            }
+            .expect("sidebar entry should be measured")
         });
         cx.simulate_click(entry_bounds.center(), gpui::Modifiers::none());
         cx.run_until_parked();
