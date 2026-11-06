@@ -1,8 +1,8 @@
 mod app_menus;
 pub mod edit_prediction_registry;
+mod git_page;
 #[cfg(target_os = "macos")]
 pub(crate) mod mac_only_instance;
-mod main_page;
 mod migrate;
 #[cfg(target_os = "macos")]
 pub(crate) mod move_to_applications;
@@ -677,7 +677,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         let panels_task = initialize_panels(window, cx);
         workspace.set_panels_task(panels_task);
         register_actions(app_state.clone(), workspace, window, cx);
-        main_page::register_actions(workspace);
+        git_page::register_actions(workspace);
 
         if !workspace.has_active_modal(window, cx) {
             workspace.focus_handle(cx).focus(window, cx);
@@ -835,10 +835,10 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
                         workspace.add_panel(panel, window, cx);
                         let weak_workspace = workspace.weak_handle();
                         let git_store = workspace.project().read(cx).git_store().clone();
-                        let main_page = cx.new(|cx| {
-                            main_page::MainPage::new(weak_workspace, git_store, window, cx)
+                        let git_page = cx.new(|cx| {
+                            git_page::GitPage::new(weak_workspace, git_store, window, cx)
                         });
-                        workspace.add_permanent_item(Box::new(main_page), window, cx);
+                        workspace.add_permanent_item(Box::new(git_page), window, cx);
                     })
                     .log_err();
             }
