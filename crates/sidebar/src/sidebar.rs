@@ -177,6 +177,16 @@ enum HeaderPresentation {
     ActiveWorkspace,
 }
 
+/// Quarry's views, handed in by the zed crate, which keeps this crate from depending on Quarry
+/// and its database drivers.
+#[derive(Clone)]
+struct DatabasesView {
+    tree: AnyView,
+    /// Quarry's buttons, drawn in the Databases header.
+    header_buttons: AnyView,
+    focus_handle: FocusHandle,
+}
+
 /// The active workspace's group in `SidebarContents::entries`.
 #[derive(Clone, Debug, PartialEq)]
 struct ActiveGroup {
@@ -1107,7 +1117,7 @@ pub struct Sidebar {
     threads_max_height: Pixels,
     /// Quarry's connection tree and its focus handle, handed in by the zed crate, which keeps
     /// this crate from depending on Quarry and its database drivers.
-    databases: Option<(AnyView, FocusHandle)>,
+    databases: Option<DatabasesView>,
     databases_height: Pixels,
     databases_hidden: bool,
     files_hidden: bool,
@@ -3310,11 +3320,13 @@ impl Sidebar {
             );
 
         let databases_shown = self.databases.is_some() && !self.databases_hidden;
-        let databases = self.databases.clone().map(|(view, _)| {
+        let databases = self.databases.clone().map(|databases| {
+            let view = databases.tree;
             let header = self.render_region_header(
                 "databases",
                 IconName::DatabaseZap,
                 "Databases",
+                Some(databases.header_buttons),
                 self.databases_hidden,
                 DraggedRegionResize::Threads,
                 cx.listener(|this, _: &ClickEvent, _window, cx| {
@@ -3360,6 +3372,7 @@ impl Sidebar {
             "files",
             IconName::FileTree,
             "Files",
+            None,
             self.files_hidden,
             if databases_shown {
                 DraggedRegionResize::Databases
@@ -3434,6 +3447,7 @@ impl Sidebar {
         id: &'static str,
         icon: IconName,
         label: &'static str,
+        buttons: Option<AnyView>,
         hidden: bool,
         resizes: DraggedRegionResize,
         on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -3458,6 +3472,7 @@ impl Sidebar {
             .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
             .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
             .child(div().flex_1())
+            .when(!hidden, |this| this.children(buttons))
             .child(
                 IconButton::new(
                     SharedString::from(format!("{id}-region-visibility")),
@@ -3487,14 +3502,20 @@ impl Sidebar {
             .into_any_element()
     }
 
-    /// Hands in Quarry's connection tree, which the Databases region shows.
+    /// Hands in Quarry's connection tree, which the Databases region shows, and its buttons,
+    /// which the region's header shows.
     pub fn set_databases_view(
         &mut self,
-        view: AnyView,
+        tree: AnyView,
+        header_buttons: AnyView,
         focus_handle: FocusHandle,
         cx: &mut Context<Self>,
     ) {
-        self.databases = Some((view, focus_handle));
+        self.databases = Some(DatabasesView {
+            tree,
+            header_buttons,
+            focus_handle,
+        });
         cx.notify();
     }
 
@@ -3523,7 +3544,7 @@ impl Sidebar {
 
     /// Shows the Databases region and moves focus into it.
     fn focus_databases_impl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((_, focus_handle)) = self.databases.clone() else {
+        let Some(DatabasesView { focus_handle, .. }) = self.databases.clone() else {
             return;
         };
         self.show_thread_list_unfiltered(window, cx);
