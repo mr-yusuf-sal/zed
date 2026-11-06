@@ -93,6 +93,10 @@ impl MainPage {
         }
     }
 
+    pub fn quarry(&self) -> Option<&Entity<QuarryPanel>> {
+        self.quarry.as_ref()
+    }
+
     fn is_active(&self, cx: &Context<Self>) -> bool {
         self.workspace
             .upgrade()

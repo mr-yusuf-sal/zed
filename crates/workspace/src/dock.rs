@@ -723,44 +723,77 @@ impl Dock {
         self.auto_hide_mode
     }
 
-    // The right dock has no other way to open, so the stored mode doesn't matter.
-    fn auto_hides(&self) -> bool {
-        self.supports_auto_hide()
+    pub fn is_pinned(&self) -> bool {
+        self.supports_auto_hide() && self.auto_hide_mode == AutoHideMode::Pinned
     }
 
-    /// Returns whether the dock was closed while it held focus. Moving focus elsewhere is left to
-    /// the caller because the `ToggleLeftDock` handler calls this while the workspace is already
-    /// being updated.
-    pub fn cycle_auto_hide_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    fn auto_hides(&self) -> bool {
+        self.supports_auto_hide() && !self.is_pinned()
+    }
+
+    /// Switches the right dock between showing on hover and pinned. It skips hidden: nothing but
+    /// hovering opens the right dock, so a hidden one could never be brought back.
+    pub fn cycle_auto_hide_mode(&mut self, cx: &mut Context<Self>) {
         if !self.supports_auto_hide() {
-            return false;
+            return;
         }
-        self.auto_hide_mode = self.auto_hide_mode.next();
+        self.auto_hide_mode = match self.auto_hide_mode {
+            AutoHideMode::Pinned => AutoHideMode::Hover,
+            AutoHideMode::Hidden | AutoHideMode::Hover => AutoHideMode::Pinned,
+        };
         self.auto_hide_task = None;
         self.auto_hide_mode
             .store(Self::auto_hide_mode_key(self.position), cx);
-        let mut closed_with_focus = false;
-        match self.auto_hide_mode {
-            AutoHideMode::Hidden => {
-                if self.is_open {
-                    closed_with_focus = self.focus_handle.contains_focused(window, cx);
-                    self.set_open(false, window, cx);
-                }
-            }
-            AutoHideMode::Hover | AutoHideMode::Pinned => self.open_with_active_panel(window, cx),
-        }
+        // The pin button is inside the dock, so the mouse is too; an unpinned dock then hides once
+        // the mouse leaves, as one revealed by hovering would.
+        self.hovered_since_open = self.is_open;
         cx.notify();
-        closed_with_focus
+    }
+
+    /// Keeps a pinned dock open on `preferred_panel`, or on the first enabled panel when no panel
+    /// is asked for, as hovering would reveal it.
+    pub(crate) fn show_pinned(
+        &mut self,
+        preferred_panel: Option<&'static str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_pinned() {
+            return;
+        }
+        let Some(panel_ix) = self.panel_index_to_reveal(preferred_panel, cx) else {
+            return;
+        };
+        if !self.is_open || self.active_panel_index != Some(panel_ix) {
+            self.activate_panel_internal(panel_ix, window, cx);
+            self.apply_open(true, window, cx);
+        }
+    }
+
+    fn panel_index_to_reveal(
+        &mut self,
+        preferred_panel: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        preferred_panel
+            .and_then(|name| self.panel_index_for_persistent_name(name, cx))
+            .or_else(|| {
+                self.first_enabled_panel_idx(cx)
+                    .log_with_level(log::Level::Info)
+            })
     }
 
     fn auto_hide_mode_key(position: DockPosition) -> String {
         format!("{DOCK_PINNED_KEY_PREFIX}:{}", position.label())
     }
 
+    /// `preferred_panel` is revealed instead of the first enabled panel; the active item can ask
+    /// for one.
     pub(crate) fn auto_hide_on_mouse_move(
         &mut self,
         mouse_position: Point<Pixels>,
         workspace_bounds: Bounds<Pixels>,
+        preferred_panel: Option<&'static str>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -770,7 +803,7 @@ impl Dock {
 
         if !self.is_open {
             if self.position == DockPosition::Right {
-                self.reveal_project_panel_on_mouse_move(mouse_position, window, cx);
+                self.reveal_panel_on_mouse_move(mouse_position, preferred_panel, window, cx);
                 return;
             }
             let within_height = mouse_position.y >= workspace_bounds.top()
@@ -782,7 +815,7 @@ impl Dock {
                 DockPosition::Right | DockPosition::Bottom => false,
             };
             if within_height && at_edge {
-                self.reveal_on_hover(window, cx);
+                self.reveal_on_hover(preferred_panel, window, cx);
             }
             return;
         }
@@ -825,9 +858,10 @@ impl Dock {
             && mouse_position.x <= edge_start + AUTO_HIDE_REVEAL_EDGE
     }
 
-    fn reveal_project_panel_on_mouse_move(
+    fn reveal_panel_on_mouse_move(
         &mut self,
         mouse_position: Point<Pixels>,
+        preferred_panel: Option<&'static str>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -845,37 +879,26 @@ impl Dock {
             dock.update_in(cx, |dock, window, cx| {
                 dock.reveal_task = None;
                 if !dock.is_open && dock.is_at_reveal_edge(window.mouse_position()) {
-                    dock.reveal_on_hover(window, cx);
+                    dock.reveal_on_hover(preferred_panel, window, cx);
                 }
             })
             .log_err();
         }));
     }
 
-    /// Shows the first enabled panel, whichever panel was activated in the dock before, since the
-    /// dock's other panels are not meant to be seen.
-    fn reveal_on_hover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(panel_ix) = self
-            .first_enabled_panel_idx(cx)
-            .log_with_level(log::Level::Info)
-        else {
+    /// Shows `preferred_panel`, or else the first enabled panel, whichever panel was activated in
+    /// the dock before, since the dock's other panels are not meant to be seen.
+    fn reveal_on_hover(
+        &mut self,
+        preferred_panel: Option<&'static str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel_ix) = self.panel_index_to_reveal(preferred_panel, cx) else {
             return;
         };
         self.activate_panel_internal(panel_ix, window, cx);
         self.apply_open(true, window, cx);
-    }
-
-    fn open_with_active_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active_panel().is_none() {
-            let Some(panel_ix) = self
-                .first_enabled_panel_idx(cx)
-                .log_with_level(log::Level::Info)
-            else {
-                return;
-            };
-            self.activate_panel(panel_ix, window, cx);
-        }
-        self.set_open(true, window, cx);
     }
 
     fn hide_after_mouse_left(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1557,6 +1580,58 @@ impl Dock {
         }
     }
 
+    /// The right dock is only ever revealed, so it has no status bar button to pin it from.
+    fn render_pin_bar(
+        &self,
+        panel: &dyn PanelHandle,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let pinned = self.is_pinned();
+        let (icon, tooltip) = if pinned {
+            (IconName::Pin, "Unpin: show only while hovered")
+        } else {
+            (IconName::Unpin, "Pin: keep open beside the editor")
+        };
+        h_flex()
+            .w_full()
+            .flex_none()
+            .justify_between()
+            .pl_2()
+            .pr_1()
+            .py_0p5()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .children(panel.icon_tooltip(window, cx).map(|title| {
+                Label::new(title)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .truncate()
+            }))
+            .child(
+                IconButton::new("right-dock-pin", icon)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(pinned)
+                    .aria_label(tooltip)
+                    .tooltip(Tooltip::text(tooltip))
+                    .on_click({
+                        let dock = cx.entity();
+                        let workspace = self.workspace.clone();
+                        move |_, window, cx| {
+                            dock.update(cx, |dock, cx| dock.cycle_auto_hide_mode(cx));
+                            // The center makes room for a pinned dock and is drawn under one
+                            // that isn't.
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    workspace.sync_pinned_right_dock(window, cx);
+                                    cx.notify();
+                                })
+                                .log_err();
+                        }
+                    }),
+            )
+    }
+
     fn dispatch_context() -> KeyContext {
         let mut dispatch_context = KeyContext::new_with_defaults();
         dispatch_context.add("Dock");
@@ -1608,7 +1683,7 @@ impl Dock {
 }
 
 impl Render for Dock {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dispatch_context = Self::dispatch_context();
         if let Some(entry) = self.visible_entry() {
             let position = self.position;
@@ -1691,19 +1766,29 @@ impl Render for Dock {
                     DockPosition::Right => this.border_r_1(),
                     DockPosition::Bottom => this.border_t_1(),
                 })
-                .child(
-                    div()
-                        .map(|this| match self.position().axis() {
-                            Axis::Horizontal => this.w_full().h_full(),
-                            Axis::Vertical => this.h_full().w_full(),
-                        })
-                        .child(
-                            entry
-                                .panel
-                                .to_any()
-                                .cached(StyleRefinement::default().v_flex().size_full()),
-                        ),
-                )
+                .map(|this| {
+                    let panel = entry
+                        .panel
+                        .to_any()
+                        .cached(StyleRefinement::default().v_flex().size_full());
+                    if self.supports_auto_hide() {
+                        this.child(
+                            v_flex()
+                                .size_full()
+                                .child(self.render_pin_bar(entry.panel.as_ref(), window, cx))
+                                .child(div().flex_1().min_h_0().w_full().child(panel)),
+                        )
+                    } else {
+                        this.child(
+                            div()
+                                .map(|this| match self.position().axis() {
+                                    Axis::Horizontal => this.w_full().h_full(),
+                                    Axis::Vertical => this.h_full().w_full(),
+                                })
+                                .child(panel),
+                        )
+                    }
+                })
                 .when(self.resizable(cx), |this| {
                     this.child(create_resize_handle())
                 })
@@ -1922,36 +2007,6 @@ impl Render for PanelButtons {
 
         let has_buttons = !buttons.is_empty();
 
-        let pin_button = (has_buttons && dock.supports_auto_hide()).then(|| {
-            let mode = dock.auto_hide_mode();
-            let tooltip: SharedString = format!(
-                "{} Dock: {} (click for {})",
-                dock.position.label(),
-                mode.label(),
-                mode.next().label()
-            )
-            .into();
-            let dock_entity = self.dock.clone();
-            let workspace = workspace.clone();
-            IconButton::new(("dock-auto-hide-mode", mode as u64), mode.icon())
-                .icon_size(IconSize::Small)
-                .toggle_state(mode == AutoHideMode::Pinned)
-                .aria_label(tooltip.clone())
-                .tooltip(Tooltip::text(tooltip))
-                .on_click(move |_, window, cx| {
-                    let closed_with_focus =
-                        dock_entity.update(cx, |dock, cx| dock.cycle_auto_hide_mode(window, cx));
-                    if closed_with_focus {
-                        workspace
-                            .update(cx, |workspace, cx| {
-                                let pane = workspace.active_pane().clone();
-                                window.focus(&pane.read(cx).focus_handle(cx), cx);
-                            })
-                            .log_err();
-                    }
-                })
-        });
-
         h_flex()
             .gap_1()
             .when(
@@ -1961,7 +2016,6 @@ impl Render for PanelButtons {
                 |this| this.child(Divider::vertical().color(DividerColor::Border)),
             )
             .children(buttons)
-            .children(pin_button)
             .when(has_buttons && dock.position == DockPosition::Left, |this| {
                 this.child(Divider::vertical().color(DividerColor::Border))
             })

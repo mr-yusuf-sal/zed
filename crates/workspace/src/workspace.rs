@@ -4803,22 +4803,18 @@ impl Workspace {
             return;
         }
 
-        let (closed_with_focus, panel_focus_handle) = dock.update(cx, |dock, cx| {
-            let closed_with_focus = dock.cycle_auto_hide_mode(window, cx);
-            let panel_focus_handle = dock
-                .is_open()
+        let panel_focus_handle = dock.update(cx, |dock, cx| {
+            dock.cycle_auto_hide_mode(cx);
+            dock.is_open()
                 .then(|| dock.active_panel())
                 .flatten()
-                .map(|panel| panel.activation_focus_handle(cx));
-            (closed_with_focus, panel_focus_handle)
+                .map(|panel| panel.activation_focus_handle(cx))
         });
+        self.sync_pinned_right_dock(window, cx);
 
         if let Some(focus_handle) = panel_focus_handle {
             window.focus(&focus_handle, cx);
             self.dismiss_zoomed_items_to_reveal(Some(dock_side), window, cx);
-        } else if closed_with_focus {
-            self.active_pane
-                .update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
         }
 
         cx.notify();
@@ -6392,6 +6388,7 @@ impl Workspace {
                 } else if *local {
                     self.set_active_pane(pane, window, cx);
                 }
+                self.sync_pinned_right_dock(window, cx);
             }
             pane::Event::UserSavedItem { item, save_intent } => {
                 cx.emit(Event::UserSavedItem {
@@ -6423,6 +6420,7 @@ impl Workspace {
             pane::Event::Focus => {
                 window.invalidate_character_coordinates();
                 self.handle_pane_focused(pane.clone(), window, cx);
+                self.sync_pinned_right_dock(window, cx);
             }
             pane::Event::ZoomIn => {
                 if *pane == self.active_pane {
@@ -8816,15 +8814,44 @@ impl Workspace {
             return;
         }
         let workspace_bounds = self.bounds;
-        // The project panel the right dock reveals is the one the Main tab shows, and it can't be
-        // on screen in both places.
+        // The project panel and Quarry the right dock reveals are the ones the Main tab shows, and
+        // they can't be on screen in both places.
         if self.is_permanent_item_visible(cx) {
             self.right_dock
                 .update(cx, |dock, cx| dock.set_open(false, window, cx));
             return;
         }
+        let preferred_panel = self.right_dock_edge_panel(cx);
         self.right_dock.update(cx, |dock, cx| {
-            dock.auto_hide_on_mouse_move(mouse_position, workspace_bounds, window, cx);
+            dock.show_pinned(preferred_panel, window, cx);
+            dock.auto_hide_on_mouse_move(
+                mouse_position,
+                workspace_bounds,
+                preferred_panel,
+                window,
+                cx,
+            );
+        });
+    }
+
+    fn right_dock_edge_panel(&self, cx: &App) -> Option<&'static str> {
+        self.active_item(cx).and_then(|item| item.edge_panel(cx))
+    }
+
+    /// A pinned right dock follows the active item without waiting for the mouse to move: it
+    /// closes over the Main tab and otherwise shows the panel the active item asks for.
+    fn sync_pinned_right_dock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.right_dock.read(cx).is_pinned() {
+            return;
+        }
+        if self.is_permanent_item_visible(cx) {
+            self.right_dock
+                .update(cx, |dock, cx| dock.set_open(false, window, cx));
+            return;
+        }
+        let preferred_panel = self.right_dock_edge_panel(cx);
+        self.right_dock.update(cx, |dock, cx| {
+            dock.show_pinned(preferred_panel, window, cx);
         });
     }
 
@@ -9001,12 +9028,15 @@ impl Workspace {
             // over the left of the center, which it is rendered in, instead of pushing it aside.
             .when(position == DockPosition::Right, |this| {
                 let weak_dock = dock.downgrade();
+                // A pinned dock has the center make room for it (see `render_center`), so it
+                // doesn't float over anything.
+                let floats = dock_is_open && !dock.read(cx).is_pinned();
                 this.absolute()
                     .top_0()
                     .bottom_0()
                     .left_0()
                     .occlude()
-                    .when(dock_is_open, |this| this.shadow_lg())
+                    .when(floats, |this| this.shadow_lg())
                     .child(
                         canvas(
                             move |bounds, _, cx| {
@@ -9225,6 +9255,15 @@ impl Workspace {
         window: &mut Window,
         cx: &mut App,
     ) -> impl IntoElement {
+        // The right dock is drawn over the left of the center; pinned, it keeps that strip.
+        let pinned_right_dock_width = {
+            let dock = self.right_dock.read(cx);
+            (dock.is_pinned()
+                && dock.is_open()
+                && self.zoomed_position != Some(DockPosition::Right))
+            .then(|| self.dock_size(dock, window, cx))
+            .flatten()
+        };
         div()
             .id("editor-region")
             .role(gpui::Role::Main)
@@ -9233,6 +9272,7 @@ impl Workspace {
                 this.track_focus(&self.region_focus_handles.editor)
             })
             .size_full()
+            .when_some(pinned_right_dock_width, |this, width| this.pl(width))
             .child(self.center.render(
                 self.zoomed.as_ref(),
                 self.maximized_pane.as_ref(),
