@@ -25,6 +25,48 @@ use ui::{
 use util::ResultExt as _;
 
 pub(crate) const RESIZE_HANDLE_SIZE: Pixels = px(6.);
+const AGENT_PANEL_ON_LEFT_KEY: &str = "agent_panel_on_left";
+
+/// Which side of the editor the agent panel is drawn on. The panel is always in the left dock;
+/// this fork draws that dock right of the center unless the user swapped it to the left with the
+/// status bar's button. The choice is kept across restarts.
+#[derive(Clone, Copy)]
+pub struct AgentPanelPlacement {
+    on_right: bool,
+}
+
+impl gpui::Global for AgentPanelPlacement {}
+
+impl AgentPanelPlacement {
+    pub fn agent_on_right(cx: &App) -> bool {
+        cx.try_global::<Self>()
+            .is_none_or(|placement| placement.on_right)
+    }
+
+    pub(crate) fn load(cx: &mut App) {
+        if cx.has_global::<Self>() {
+            return;
+        }
+        let on_left = KeyValueStore::global(cx)
+            .read_kvp(AGENT_PANEL_ON_LEFT_KEY)
+            .log_err()
+            .flatten()
+            .is_some_and(|value| value == "true");
+        cx.set_global(Self { on_right: !on_left });
+    }
+
+    pub fn swap(cx: &mut App) {
+        let on_right = !Self::agent_on_right(cx);
+        cx.set_global(Self { on_right });
+        let kvp = KeyValueStore::global(cx);
+        db::write_and_log(cx, move || async move {
+            kvp.write_kvp(AGENT_PANEL_ON_LEFT_KEY.to_string(), (!on_right).to_string())
+                .await
+        });
+        cx.refresh_windows();
+    }
+}
+
 /// How close to the window edge the mouse has to get to reveal an auto-hidden panel.
 pub(crate) const AUTO_HIDE_REVEAL_EDGE: Pixels = px(4.);
 /// Grace period before an auto-hidden panel closes, so brushing past its edge doesn't close it.
@@ -1354,6 +1396,7 @@ impl Render for Dock {
         let dispatch_context = Self::dispatch_context();
         if let Some(entry) = self.visible_entry() {
             let position = self.position;
+            let agent_on_right = AgentPanelPlacement::agent_on_right(cx);
             let create_resize_handle = || {
                 let handle = div()
                     .id("resize-handle")
@@ -1382,13 +1425,19 @@ impl Render for Dock {
                         }),
                     )
                     .occlude();
-                // The left dock holds the agent panel, which this fork draws to the right of the
-                // center (see `Workspace::render`), so its handle is on its left side.
+                // The left dock holds the agent panel, which is drawn right of the center unless
+                // swapped (see `AgentPanelPlacement`), so its handle faces the center.
                 match self.position() {
                     DockPosition::Left => deferred(
                         handle
                             .absolute()
-                            .left(-RESIZE_HANDLE_SIZE / 2.)
+                            .map(|handle| {
+                                if agent_on_right {
+                                    handle.left(-RESIZE_HANDLE_SIZE / 2.)
+                                } else {
+                                    handle.right(-RESIZE_HANDLE_SIZE / 2.)
+                                }
+                            })
                             .top(px(0.))
                             .h_full()
                             .w(RESIZE_HANDLE_SIZE)
@@ -1431,7 +1480,8 @@ impl Render for Dock {
                     Axis::Vertical => this.h_full().w_full().flex_col(),
                 })
                 .map(|this| match self.position() {
-                    DockPosition::Left => this.border_l_1(),
+                    DockPosition::Left if agent_on_right => this.border_l_1(),
+                    DockPosition::Left => this.border_r_1(),
                     DockPosition::Right => this.border_l_1(),
                     DockPosition::Bottom => this.border_t_1(),
                 })

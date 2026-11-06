@@ -1,6 +1,6 @@
 use crate::{
-    ItemHandle, MultiWorkspace, Pane, SidebarSide, ToggleWorkspaceSidebar,
-    sidebar_side_context_menu,
+    AgentPanelPlacement, ItemHandle, MultiWorkspace, Pane, SidebarSide, SwapAgentPanelSide,
+    ToggleWorkspaceSidebar, sidebar_side_context_menu,
 };
 use gpui::{
     Anchor, AnyView, App, Context, Decorations, Entity, FocusHandle, Focusable, IntoElement,
@@ -223,10 +223,26 @@ impl StatusBar {
                         render_hideable_item("status-bar-right", index, item.as_ref(), cx)
                     }),
             )
+            .child(Self::render_agent_panel_side_button(cx))
             .when(
                 sidebar.show_toggle && !sidebar.open && sidebar.side == SidebarSide::Right,
                 |this| this.child(self.render_sidebar_toggle(sidebar, cx)),
             )
+    }
+
+    /// Swaps the agent panel and the editor, which keep the Workspaces panel on their left.
+    fn render_agent_panel_side_button(cx: &App) -> impl IntoElement {
+        let tooltip = if AgentPanelPlacement::agent_on_right(cx) {
+            "Move Agent Panel Left of the Editor"
+        } else {
+            "Move Agent Panel Right of the Editor"
+        };
+        IconButton::new("swap-agent-panel-side", IconName::ArrowRightLeft)
+            .icon_size(IconSize::Small)
+            .tab_index(0isize)
+            .aria_label(tooltip)
+            .tooltip(move |_, cx| Tooltip::for_action(tooltip, &SwapAgentPanelSide, cx))
+            .on_click(|_, _, cx| AgentPanelPlacement::swap(cx))
     }
 
     fn render_sidebar_toggle(
