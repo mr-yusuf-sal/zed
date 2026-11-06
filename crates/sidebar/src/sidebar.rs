@@ -141,6 +141,8 @@ struct SerializedSidebar {
     databases_hidden: bool,
     #[serde(default)]
     files_hidden: bool,
+    #[serde(default)]
+    other_workspaces_expanded: bool,
 }
 
 const DEFAULT_THREADS_MAX_HEIGHT: Pixels = px(240.);
@@ -1092,6 +1094,9 @@ pub struct Sidebar {
     databases_height: Pixels,
     databases_hidden: bool,
     files_hidden: bool,
+    /// Whether the Other Workspaces heading, which gathers the inactive workspaces that need
+    /// no attention, is unfolded.
+    other_workspaces_expanded: bool,
 }
 
 impl Sidebar {
@@ -1247,6 +1252,7 @@ impl Sidebar {
             databases_height: DEFAULT_DATABASES_HEIGHT,
             databases_hidden: false,
             files_hidden: false,
+            other_workspaces_expanded: false,
         }
     }
 
@@ -3023,20 +3029,28 @@ impl Sidebar {
         let border_color = cx.theme().colors().border;
         let is_focused = self.focus_handle.is_focused(window);
         let active_group = self.contents.active_group.clone();
-        let active_header_ix = active_group.as_ref().map(|group| group.header_ix);
-        let other_header_indices: Vec<usize> = self
-            .contents
-            .project_header_indices
-            .iter()
-            .copied()
-            .filter(|&ix| Some(ix) != active_header_ix)
-            .collect();
-        let mut other_headers = Vec::with_capacity(other_header_indices.len());
-        for ix in other_header_indices {
+        let (needing_attention, quiet) = self.inactive_workspace_headers();
+        let mut other_headers = Vec::with_capacity(needing_attention.len() + quiet.len() + 1);
+        for ix in needing_attention {
             if let Some(header) =
                 self.render_header_at(ix, HeaderPresentation::OtherWorkspace, is_focused, cx)
             {
                 other_headers.push(header);
+            }
+        }
+        if !quiet.is_empty() {
+            other_headers.push(self.render_other_workspaces_heading(quiet.len(), cx));
+            if self.other_workspaces_expanded {
+                for ix in quiet {
+                    if let Some(header) = self.render_header_at(
+                        ix,
+                        HeaderPresentation::OtherWorkspace,
+                        is_focused,
+                        cx,
+                    ) {
+                        other_headers.push(div().w_full().pl_2().child(header).into_any_element());
+                    }
+                }
             }
         }
         let active_workspace = active_group
@@ -3061,6 +3075,66 @@ impl Sidebar {
                 )
             })
             .children(active_workspace)
+            .into_any_element()
+    }
+
+    /// The inactive workspaces' headers: those with a thread running, waiting for confirmation
+    /// or finished unread, which stay in sight, and the rest, gathered under Other Workspaces.
+    fn inactive_workspace_headers(&self) -> (Vec<usize>, Vec<usize>) {
+        let active_header_ix = self
+            .contents
+            .active_group
+            .as_ref()
+            .map(|group| group.header_ix);
+        self.contents
+            .project_header_indices
+            .iter()
+            .copied()
+            .filter(|&ix| Some(ix) != active_header_ix)
+            .partition(|&ix| {
+                matches!(
+                    self.contents.entries.get(ix),
+                    Some(ListEntry::ProjectHeader {
+                        has_running_threads,
+                        waiting_thread_count,
+                        has_notifications,
+                        ..
+                    }) if *has_running_threads || *waiting_thread_count > 0 || *has_notifications
+                )
+            })
+    }
+
+    fn render_other_workspaces_heading(&self, count: usize, cx: &mut Context<Self>) -> AnyElement {
+        let expanded = self.other_workspaces_expanded;
+        h_flex()
+            .id("other-workspaces-heading")
+            .h(Tab::content_height(cx))
+            .w_full()
+            .pl_2()
+            .pr_1p5()
+            .gap_1()
+            .cursor_pointer()
+            .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+            .child(
+                Icon::new(if expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size(IconSize::Small)
+                .color(Color::Muted),
+            )
+            .child(Label::new("Other Workspaces").color(Color::Muted))
+            .child(
+                Label::new(SharedString::from(count.to_string()))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                this.other_workspaces_expanded = !this.other_workspaces_expanded;
+                this.serialize(cx);
+                cx.notify();
+            }))
             .into_any_element()
     }
 
@@ -3372,20 +3446,18 @@ impl Sidebar {
     }
 
     /// Entry indices in the order they are on screen: everything during a search; otherwise the
-    /// other workspaces' headers, then the active workspace's header and rows. The other
-    /// workspaces' threads are kept in `entries` but not shown.
+    /// inactive workspaces' headers that need attention, the rest when Other Workspaces is
+    /// unfolded, then the active workspace's header and rows. The inactive workspaces' threads
+    /// are kept in `entries` but not shown.
     fn visible_entry_order(&self, cx: &App) -> Vec<usize> {
         if self.has_filter_query(cx) {
             return (0..self.contents.entries.len()).collect();
         }
         let active_group = self.contents.active_group.as_ref();
-        let mut order: Vec<usize> = self
-            .contents
-            .project_header_indices
-            .iter()
-            .copied()
-            .filter(|&ix| Some(ix) != active_group.map(|group| group.header_ix))
-            .collect();
+        let (mut order, quiet) = self.inactive_workspace_headers();
+        if self.other_workspaces_expanded {
+            order.extend(quiet);
+        }
         if let Some(active_group) = active_group {
             order.push(active_group.header_ix);
             order.extend(active_group.rows.clone());
@@ -3405,20 +3477,20 @@ impl Sidebar {
                 .scroll_to_reveal_item(ix - active_group.rows.start);
             return;
         }
-        let active_header_ix = self
-            .contents
-            .active_group
-            .as_ref()
-            .map(|group| group.header_ix);
-        let other_position = self
-            .contents
-            .project_header_indices
+        // The upper area lists the workspaces needing attention, then the Other Workspaces
+        // heading, then the rest when it is unfolded.
+        let (needing_attention, quiet) = self.inactive_workspace_headers();
+        let child_position = needing_attention
             .iter()
-            .copied()
-            .filter(|&header_ix| Some(header_ix) != active_header_ix)
-            .position(|header_ix| header_ix == ix);
-        if let Some(other_position) = other_position {
-            self.other_workspaces_scroll.scroll_to_item(other_position);
+            .position(|&header_ix| header_ix == ix)
+            .or_else(|| {
+                quiet
+                    .iter()
+                    .position(|&header_ix| header_ix == ix)
+                    .map(|position| needing_attention.len() + 1 + position)
+            });
+        if let Some(child_position) = child_position {
+            self.other_workspaces_scroll.scroll_to_item(child_position);
         }
     }
 
@@ -8690,6 +8762,7 @@ impl WorkspaceSidebar for Sidebar {
                 .then(|| f32::from(self.databases_height)),
             databases_hidden: self.databases_hidden,
             files_hidden: self.files_hidden,
+            other_workspaces_expanded: self.other_workspaces_expanded,
         };
         serde_json::to_string(&serialized).ok()
     }
@@ -8717,6 +8790,7 @@ impl WorkspaceSidebar for Sidebar {
             }
             self.databases_hidden = serialized.databases_hidden;
             self.files_hidden = serialized.files_hidden;
+            self.other_workspaces_expanded = serialized.other_workspaces_expanded;
             if serialized.active_view == SerializedSidebarView::History {
                 cx.defer_in(window, |this, window, cx| {
                     this.show_archive(window, cx);
