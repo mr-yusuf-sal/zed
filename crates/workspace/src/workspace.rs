@@ -48,6 +48,7 @@ use client::{
     proto::{self, ErrorCode, PanelId, PeerId},
 };
 use collections::{HashMap, HashSet, TypeIdHashMap, hash_map};
+pub use dock::AgentPanelPlacement;
 use dock::{Dock, DockPosition, PanelButtons, PanelHandle, RESIZE_HANDLE_SIZE};
 use fs::Fs;
 use futures::{
@@ -473,6 +474,8 @@ actions!(
         ToggleEditPrediction,
         /// Toggles the left dock.
         ToggleLeftDock,
+        /// Moves the agent panel to the other side of the editor.
+        SwapAgentPanelSide,
         /// Toggles the right dock.
         ToggleRightDock,
         /// Toggles zoom on the active pane.
@@ -2064,6 +2067,7 @@ impl Workspace {
         )
         .detach();
 
+        AgentPanelPlacement::load(cx);
         let left_dock = Dock::new(DockPosition::Left, modal_layer.clone(), window, cx);
         let bottom_dock = Dock::new(DockPosition::Bottom, modal_layer.clone(), window, cx);
         let right_dock = Dock::new(DockPosition::Right, modal_layer.clone(), window, cx);
@@ -8782,6 +8786,9 @@ impl Workspace {
             .on_action(cx.listener(|workspace, _: &MovePaneDown, _, cx| {
                 workspace.move_pane_to_border(SplitDirection::Down, cx)
             }))
+            .on_action(cx.listener(|_, _: &SwapAgentPanelSide, _, cx| {
+                AgentPanelPlacement::swap(cx);
+            }))
             .on_action(cx.listener(|this, _: &ToggleLeftDock, window, cx| {
                 this.toggle_dock(DockPosition::Left, window, cx);
             }))
@@ -10162,6 +10169,7 @@ impl Render for Workspace {
             log::info!("Rendered first frame");
         }
 
+        let agent_on_right = AgentPanelPlacement::agent_on_right(cx);
         let pad_center_pane = self.centered_layout
             && self.center.panes().len() == 1
             && self.active_item(cx).is_some();
@@ -10304,14 +10312,16 @@ impl Render for Workspace {
                                                 Some(e.event.position);
 
                                             match e.drag(cx).0 {
-                                                // The left dock is drawn at the right edge.
                                                 DockPosition::Left => {
-                                                    workspace.resize_left_dock(
-                                                        workspace.bounds.right()
-                                                            - e.event.position.x,
-                                                        window,
-                                                        cx,
-                                                    );
+                                                    let size =
+                                                        if AgentPanelPlacement::agent_on_right(cx) {
+                                                            workspace.bounds.right()
+                                                                - e.event.position.x
+                                                        } else {
+                                                            e.event.position.x
+                                                                - workspace.bounds.left()
+                                                        };
+                                                    workspace.resize_left_dock(size, window, cx);
                                                 }
                                                 DockPosition::Right => {
                                                     workspace.resize_right_dock(
@@ -10347,6 +10357,14 @@ impl Render for Workspace {
                                                 .flex_row()
                                                 .flex_1()
                                                 .overflow_hidden()
+                                                .when(!agent_on_right, |this| {
+                                                    this.children(self.render_dock(
+                                                        DockPosition::Left,
+                                                        &self.left_dock,
+                                                        window,
+                                                        cx,
+                                                    ))
+                                                })
                                                 .child(
                                                     div()
                                                         .flex()
@@ -10382,12 +10400,14 @@ impl Render for Workspace {
                                                                 ),
                                                         ),
                                                 )
-                                                .children(self.render_dock(
-                                                    DockPosition::Left,
-                                                    &self.left_dock,
-                                                    window,
-                                                    cx,
-                                                )),
+                                                .when(agent_on_right, |this| {
+                                                    this.children(self.render_dock(
+                                                        DockPosition::Left,
+                                                        &self.left_dock,
+                                                        window,
+                                                        cx,
+                                                    ))
+                                                }),
                                         )
                                         .child(div().w_full().children(self.render_dock(
                                             DockPosition::Bottom,
@@ -10408,6 +10428,14 @@ impl Render for Workspace {
                                                         .flex()
                                                         .flex_row()
                                                         .flex_1()
+                                                        .when(!agent_on_right, |this| {
+                                                            this.children(self.render_dock(
+                                                                DockPosition::Left,
+                                                                &self.left_dock,
+                                                                window,
+                                                                cx,
+                                                            ))
+                                                        })
                                                         .child(
                                                             div()
                                                                 .flex()
@@ -10447,12 +10475,14 @@ impl Render for Workspace {
                                                                         ),
                                                                 ),
                                                         )
-                                                        .children(self.render_dock(
-                                                            DockPosition::Left,
-                                                            &self.left_dock,
-                                                            window,
-                                                            cx,
-                                                        )),
+                                                        .when(agent_on_right, |this| {
+                                                            this.children(self.render_dock(
+                                                                DockPosition::Left,
+                                                                &self.left_dock,
+                                                                window,
+                                                                cx,
+                                                            ))
+                                                        }),
                                                 )
                                                 .child(div().w_full().children(self.render_dock(
                                                     DockPosition::Bottom,
@@ -10466,6 +10496,14 @@ impl Render for Workspace {
                                         .flex()
                                         .flex_row()
                                         .h_full()
+                                        .when(!agent_on_right, |this| {
+                                            this.children(self.render_dock(
+                                                DockPosition::Left,
+                                                &self.left_dock,
+                                                window,
+                                                cx,
+                                            ))
+                                        })
                                         .child(
                                             div()
                                                 .flex()
@@ -10520,16 +10558,26 @@ impl Render for Workspace {
                                                     cx,
                                                 ))),
                                         )
-                                        .children(self.render_dock(
-                                            DockPosition::Left,
-                                            &self.left_dock,
-                                            window,
-                                            cx,
-                                        )),
+                                        .when(agent_on_right, |this| {
+                                            this.children(self.render_dock(
+                                                DockPosition::Left,
+                                                &self.left_dock,
+                                                window,
+                                                cx,
+                                            ))
+                                        }),
                                     BottomDockLayout::Contained => div()
                                         .flex()
                                         .flex_row()
                                         .h_full()
+                                        .when(!agent_on_right, |this| {
+                                            this.children(self.render_dock(
+                                                DockPosition::Left,
+                                                &self.left_dock,
+                                                window,
+                                                cx,
+                                            ))
+                                        })
                                         .child(
                                             div()
                                                 .flex()
@@ -10567,12 +10615,14 @@ impl Render for Workspace {
                                                     cx,
                                                 )),
                                         )
-                                        .children(self.render_dock(
-                                            DockPosition::Left,
-                                            &self.left_dock,
-                                            window,
-                                            cx,
-                                        )),
+                                        .when(agent_on_right, |this| {
+                                            this.children(self.render_dock(
+                                                DockPosition::Left,
+                                                &self.left_dock,
+                                                window,
+                                                cx,
+                                            ))
+                                        }),
                                 }
                             })
                             .children(self.zoomed.as_ref().and_then(|view| {
@@ -10616,7 +10666,10 @@ impl Render for Workspace {
                                 }
 
                                 Some(match self.zoomed_position {
-                                    Some(DockPosition::Left) => overlay.left_2().border_l_1(),
+                                    Some(DockPosition::Left) if agent_on_right => {
+                                        overlay.left_2().border_l_1()
+                                    }
+                                    Some(DockPosition::Left) => overlay.right_2().border_r_1(),
                                     Some(DockPosition::Right) => overlay.left_2().border_l_1(),
                                     Some(DockPosition::Bottom) => overlay.top_2().border_t_1(),
                                     None => {
