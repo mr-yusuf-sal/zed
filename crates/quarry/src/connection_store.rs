@@ -253,6 +253,7 @@ pub fn parse_connection_url(input: &str) -> Result<ConnectionConfig> {
         username,
         environment: None,
         folder: None,
+        project: None,
         ssh,
         tls,
     })
@@ -364,6 +365,7 @@ mod tests {
             username: Some("app".to_string()),
             environment: None,
             folder: None,
+            project: None,
             ssh: None,
             tls: TlsMode::Default,
         };

@@ -1487,14 +1487,18 @@ fn add_databases_to_sidebar(
         return;
     };
     let active_workspace = multi_workspace.read(cx).workspace().downgrade();
-    let quarry = cx.new(|cx| quarry::panel::QuarryPanel::new(active_workspace, store, window, cx));
+    let quarry = cx.new(|cx| {
+        let mut quarry = quarry::panel::QuarryPanel::new(active_workspace, store, window, cx);
+        quarry.scope_to_project(cx);
+        quarry
+    });
     cx.subscribe(multi_workspace, {
         let quarry = quarry.downgrade();
         move |multi_workspace, event: &workspace::MultiWorkspaceEvent, cx| {
             if let workspace::MultiWorkspaceEvent::ActiveWorkspaceChanged { .. } = event {
                 let workspace = multi_workspace.read(cx).workspace().downgrade();
                 quarry
-                    .update(cx, |quarry, _| quarry.set_workspace(workspace))
+                    .update(cx, |quarry, cx| quarry.set_workspace(workspace, cx))
                     .log_err();
             }
         }

@@ -2133,6 +2133,7 @@ mod tests {
             username: None,
             environment: None,
             folder: None,
+            project: None,
             ssh: None,
             tls: Default::default(),
         };
