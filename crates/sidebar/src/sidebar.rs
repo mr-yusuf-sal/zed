@@ -29,9 +29,10 @@ use feature_flags::{
 };
 use gpui::{
     Action as _, AnyElement, AnyView, App, ClickEvent, Context, Decorations, DismissEvent,
-    DragMoveEvent, Entity, EntityId, FocusHandle, Focusable, KeyContext, ListState, Modifiers,
-    Pixels, Render, SharedString, Task, TaskExt, WeakEntity, Window, WindowBackgroundAppearance,
-    WindowHandle, linear_color_stop, linear_gradient, list, prelude::*, px,
+    DragMoveEvent, Entity, EntityId, FocusHandle, Focusable, KeyContext, ListSizingBehavior,
+    ListState, Modifiers, Pixels, Render, ScrollHandle, SharedString, Task, TaskExt, WeakEntity,
+    Window, WindowBackgroundAppearance, WindowHandle, linear_color_stop, linear_gradient, list,
+    prelude::*, px, relative,
 };
 use itertools::Itertools;
 use language_model::LanguageModelRegistry;
@@ -52,6 +53,7 @@ use settings::{Settings as _, SettingsStore};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::mem;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -130,22 +132,54 @@ struct SerializedSidebar {
     width_set_by_user: bool,
     #[serde(default)]
     active_view: SerializedSidebarView,
-    /// Height of the file tree shown under a workspace's Files node, once the user resized it.
+    /// The most the active workspace's thread rows grow to before they scroll.
     #[serde(default)]
-    files_height: Option<f32>,
+    threads_max_height: Option<f32>,
     #[serde(default)]
     databases_height: Option<f32>,
     #[serde(default)]
-    databases_collapsed: bool,
-    /// How many project groups are listed above Databases; `None` lists it last.
+    databases_hidden: bool,
     #[serde(default)]
-    databases_slot: Option<usize>,
+    files_hidden: bool,
 }
 
-/// Height of the file tree under a workspace's Files node until the user drags its bottom edge.
-const DEFAULT_FILES_HEIGHT: Pixels = px(320.);
-const MIN_FILES_HEIGHT: Pixels = px(80.);
-const GROUP_SECTION_ROW_HEIGHT: Pixels = px(22.);
+const DEFAULT_THREADS_MAX_HEIGHT: Pixels = px(240.);
+const DEFAULT_DATABASES_HEIGHT: Pixels = px(200.);
+const MIN_REGION_HEIGHT: Pixels = px(48.);
+const REGION_HEADER_HEIGHT: Pixels = px(24.);
+
+/// Dragged from the top edge of a region's header to resize the region above it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DraggedRegionResize {
+    Threads,
+    Databases,
+}
+
+impl Render for DraggedRegionResize {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+/// Where a project header is drawn. Outside a search the panel lists the other workspaces'
+/// headers on top, always folded, and pins the active workspace below them with its threads,
+/// databases and files.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeaderPresentation {
+    /// In the single list a search shows.
+    List,
+    OtherWorkspace,
+    ActiveWorkspace,
+}
+
+/// The active workspace's group in `SidebarContents::entries`.
+#[derive(Clone, Debug, PartialEq)]
+struct ActiveGroup {
+    key: ProjectGroupKey,
+    header_ix: usize,
+    /// Its thread and terminal rows.
+    rows: Range<usize>,
+}
 
 #[derive(Debug, Default)]
 enum SidebarView {
@@ -422,8 +456,6 @@ enum ListEntry {
     },
     Thread(Arc<ThreadEntry>),
     Terminal(TerminalEntry),
-    /// Quarry's connection tree, listed among the project groups wherever the user dragged it.
-    Databases,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -443,7 +475,7 @@ impl RenameTarget {
                 Self::Terminal(terminal.metadata.terminal_id),
                 terminal.metadata.editable_title(),
             )),
-            ListEntry::ProjectHeader { .. } | ListEntry::Databases => None,
+            ListEntry::ProjectHeader { .. } => None,
         }
     }
 }
@@ -469,7 +501,7 @@ impl ActivatableEntry {
                 metadata: terminal.metadata.clone(),
                 workspace: terminal.workspace.clone(),
             }),
-            ListEntry::ProjectHeader { .. } | ListEntry::Databases => None,
+            ListEntry::ProjectHeader { .. } => None,
         }
     }
 }
@@ -479,7 +511,7 @@ impl ListEntry {
     fn session_id(&self) -> Option<&acp::SessionId> {
         match self {
             ListEntry::Thread(thread_entry) => thread_entry.metadata.session_id.as_ref(),
-            ListEntry::Terminal(_) | ListEntry::ProjectHeader { .. } | ListEntry::Databases => None,
+            ListEntry::Terminal(_) | ListEntry::ProjectHeader { .. } => None,
         }
     }
 
@@ -500,7 +532,6 @@ impl ListEntry {
             ListEntry::ProjectHeader { key, .. } => {
                 multi_workspace.workspaces_for_project_group(key, cx)
             }
-            ListEntry::Databases => Vec::new(),
         }
     }
 }
@@ -524,6 +555,7 @@ struct SidebarContents {
     notified_terminals: HashSet<TerminalId>,
     project_header_indices: Vec<usize>,
     has_open_projects: bool,
+    active_group: Option<ActiveGroup>,
 }
 
 /// Identity-and-layout key for a [`ListEntry`] used to preserve measured list items
@@ -538,17 +570,9 @@ enum EntryShape {
         // Determines whether the "No threads yet" row is rendered (only shown when
         // `!is_collapsed && !has_threads`).
         is_collapsed: bool,
-        // The Files and Threads rows are only drawn outside a search, and the tree under Files
-        // and the "No threads yet" row only when their node is expanded.
-        shows_sections: bool,
-        files_expanded: bool,
-        threads_collapsed: bool,
     },
     Thread(ThreadId),
     Terminal(TerminalId),
-    Databases {
-        shows_tree: bool,
-    },
 }
 
 impl SidebarContents {
@@ -992,43 +1016,6 @@ impl Render for DraggedProjectGroup {
     }
 }
 
-/// Dragged from the bottom edge of a tree in the panel to resize it.
-#[derive(Clone, PartialEq)]
-enum DraggedTreeResize {
-    Files(ProjectGroupKey),
-    Databases,
-}
-
-impl Render for DraggedTreeResize {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        gpui::Empty
-    }
-}
-
-/// Dragged by the Databases header to move it among the project groups.
-#[derive(Clone)]
-struct DraggedDatabases;
-
-impl Render for DraggedDatabases {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
-            .px_2()
-            .py_1()
-            .elevation_2(cx)
-            .child(Label::new("Databases"))
-    }
-}
-
-/// What a workspace's Files node shows when it is expanded.
-enum FilesContent {
-    Tree(Entity<ProjectPanel>),
-    /// The workspace is open but its project panel hasn't been added yet, or a closed local
-    /// workspace is being opened in the background for its files.
-    Loading,
-    /// A closed remote workspace: opening it connects to the host, so that waits for a click.
-    NeedsConnection,
-}
-
 /// The sidebar re-derives its entire entry list from scratch on every
 /// change via `update_entries` → `rebuild_contents`. Avoid adding
 /// incremental or inter-event coordination state — if something can
@@ -1095,25 +1082,16 @@ pub struct Sidebar {
     /// Display names of other release channels that have threads available to
     /// import.
     cross_channel_import_channels: Vec<SharedString>,
-    /// Files nodes the user expanded or collapsed. A group without an entry has its Files node
-    /// expanded only while it holds the active workspace.
-    files_expanded: HashMap<ProjectGroupKey, bool>,
-    threads_collapsed: HashSet<ProjectGroupKey>,
-    files_height: Pixels,
-    /// Workspaces opened without being activated because their Files node was expanded. Only
-    /// these are closed again when that node is collapsed, and only while nothing in them is
-    /// in use; activating one takes it off this list.
-    files_opened_in_background: HashSet<EntityId>,
-    files_opening: HashMap<ProjectGroupKey, Task<()>>,
-    /// Whether a search was active when the entries were last built, which decides whether
-    /// project headers carried their Files and Threads rows then.
-    previous_shapes_had_filter: bool,
+    /// The active workspace's thread rows, a list of their own below the other workspaces.
+    threads_list_state: ListState,
+    other_workspaces_scroll: ScrollHandle,
+    threads_max_height: Pixels,
     /// Quarry's connection tree and its focus handle, handed in by the zed crate, which keeps
     /// this crate from depending on Quarry and its database drivers.
     databases: Option<(AnyView, FocusHandle)>,
-    databases_expanded: bool,
-    databases_slot: Option<usize>,
     databases_height: Pixels,
+    databases_hidden: bool,
+    files_hidden: bool,
 }
 
 impl Sidebar {
@@ -1152,11 +1130,10 @@ impl Sidebar {
             window,
             |this, _multi_workspace, event: &MultiWorkspaceEvent, window, cx| match event {
                 MultiWorkspaceEvent::ActiveWorkspaceChanged { .. } => {
-                    // A workspace the user switched to is in use, so collapsing its Files node
-                    // must no longer close it.
-                    if let Some(active_workspace) = this.active_workspace(cx) {
-                        this.files_opened_in_background
-                            .remove(&active_workspace.entity_id());
+                    if let Some(key) = this.active_project_group_key(cx)
+                        && this.is_group_collapsed(&key, cx)
+                    {
+                        this.set_group_expanded(&key, true, cx);
                     }
                     this.sync_active_entry_from_active_workspace(cx);
                     this.replace_archived_panel_thread(window, cx);
@@ -1263,16 +1240,13 @@ impl Sidebar {
             update_task: None,
             import_banners_use_verbose_labels: None,
             cross_channel_import_channels: Vec::new(),
-            files_expanded: HashMap::new(),
-            threads_collapsed: HashSet::new(),
-            files_height: DEFAULT_FILES_HEIGHT,
-            files_opened_in_background: HashSet::new(),
-            files_opening: HashMap::new(),
-            previous_shapes_had_filter: false,
+            threads_list_state: ListState::new(0, gpui::ListAlignment::Top, px(200.)),
+            other_workspaces_scroll: ScrollHandle::new(),
+            threads_max_height: DEFAULT_THREADS_MAX_HEIGHT,
             databases: None,
-            databases_expanded: true,
-            databases_slot: None,
-            databases_height: DEFAULT_FILES_HEIGHT,
+            databases_height: DEFAULT_DATABASES_HEIGHT,
+            databases_hidden: false,
+            files_hidden: false,
         }
     }
 
@@ -1365,8 +1339,8 @@ impl Sidebar {
                     if let Ok(agent_panel) = view.clone().downcast::<AgentPanel>() {
                         this.subscribe_to_agent_panel(workspace, &agent_panel, window, cx);
                         this.schedule_update_entries(false, cx);
-                    } else if let Ok(project_panel) = view.clone().downcast::<ProjectPanel>() {
-                        this.subscribe_to_project_panel(workspace, &project_panel, window, cx);
+                    } else if view.clone().downcast::<ProjectPanel>().is_ok() {
+                        // The Files region shows the active workspace's panel once it exists.
                         cx.notify();
                     }
                 }
@@ -1379,42 +1353,6 @@ impl Sidebar {
         if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
             self.subscribe_to_agent_panel(workspace, &agent_panel, window, cx);
         }
-        if let Some(project_panel) = workspace.read(cx).panel::<ProjectPanel>(cx) {
-            self.subscribe_to_project_panel(workspace, &project_panel, window, cx);
-        }
-    }
-
-    /// A file opened from the tree of a workspace that isn't active opens in that workspace,
-    /// which is then brought up so the file is seen.
-    fn subscribe_to_project_panel(
-        &mut self,
-        workspace: &Entity<Workspace>,
-        project_panel: &Entity<ProjectPanel>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let workspace = workspace.downgrade();
-        cx.subscribe_in(
-            project_panel,
-            window,
-            move |this, _project_panel, event: &project_panel::Event, window, cx| {
-                let opens_item = match event {
-                    project_panel::Event::OpenedEntry { in_background, .. } => !*in_background,
-                    project_panel::Event::SplitEntry { .. } => true,
-                    _ => false,
-                };
-                if !opens_item {
-                    return;
-                }
-                let Some(workspace) = workspace.upgrade() else {
-                    return;
-                };
-                if !this.is_active_workspace(&workspace, cx) {
-                    this.activate_workspace(&workspace, window, cx);
-                }
-            },
-        )
-        .detach();
     }
 
     fn move_entry_paths(
@@ -2375,17 +2313,6 @@ impl Sidebar {
                 if is_collapsed {
                     continue;
                 }
-                if self.threads_collapsed.contains(group_key) {
-                    // The rows are hidden, but the threads are still there: their notifications
-                    // and access times are only kept for threads seen in this rebuild.
-                    for thread in &threads {
-                        if let Some(session_id) = &thread.metadata.session_id {
-                            current_session_ids.insert(session_id.clone());
-                        }
-                        current_thread_ids.insert(thread.metadata.thread_id);
-                    }
-                    continue;
-                }
 
                 Self::push_entries_by_display_time(
                     &mut entries,
@@ -2406,23 +2333,28 @@ impl Sidebar {
 
         self.live_thread_statuses = new_live_statuses;
 
-        if self.databases.is_some() && !groups.is_empty() {
-            let header_count = project_header_indices.len();
-            let slot = self
-                .databases_slot
-                .unwrap_or(header_count)
-                .min(header_count);
-            let databases_ix = project_header_indices
-                .get(slot)
-                .copied()
-                .unwrap_or(entries.len());
-            entries.insert(databases_ix, ListEntry::Databases);
-            for header_ix in &mut project_header_indices {
-                if *header_ix >= databases_ix {
-                    *header_ix += 1;
-                }
-            }
-        }
+        let active_group =
+            project_header_indices
+                .iter()
+                .enumerate()
+                .find_map(|(position, &header_ix)| match entries.get(header_ix) {
+                    Some(ListEntry::ProjectHeader {
+                        key,
+                        is_active: true,
+                        ..
+                    }) => {
+                        let rows_end = project_header_indices
+                            .get(position + 1)
+                            .copied()
+                            .unwrap_or(entries.len());
+                        Some(ActiveGroup {
+                            key: key.clone(),
+                            header_ix,
+                            rows: header_ix + 1..rows_end,
+                        })
+                    }
+                    _ => None,
+                });
 
         self.contents = SidebarContents {
             entries,
@@ -2430,6 +2362,7 @@ impl Sidebar {
             notified_terminals,
             project_header_indices,
             has_open_projects,
+            active_group,
         };
     }
 
@@ -2461,18 +2394,21 @@ impl Sidebar {
         }
 
         let had_notifications = self.has_notifications(cx);
-        let has_filter_query = self.has_filter_query(cx);
-        let previous_shapes: Vec<EntryShape> = self
-            .entry_shapes(multi_workspace.read(cx), self.previous_shapes_had_filter)
-            .collect();
-        self.previous_shapes_had_filter = has_filter_query;
+        let previous_shapes: Vec<EntryShape> =
+            self.entry_shapes(multi_workspace.read(cx)).collect();
+        let previous_active_group = self.contents.active_group.clone();
 
         self.rebuild_contents(cx);
         self.refresh_refilled_draft_times(cx);
         self.refresh_draft_editor_observations(cx);
 
         // Preserve measurements for unchanged entries so sticky headers do not flicker.
-        self.apply_list_state_diff(&previous_shapes, multi_workspace.read(cx), has_filter_query);
+        self.apply_list_state_diff(&previous_shapes, multi_workspace.read(cx));
+        self.apply_threads_list_diff(
+            &previous_shapes,
+            previous_active_group.as_ref(),
+            multi_workspace.read(cx),
+        );
 
         self.prefetch_worktree_default_branches(cx);
 
@@ -2490,43 +2426,51 @@ impl Sidebar {
         &self,
         previous_shapes: &[EntryShape],
         multi_workspace: &MultiWorkspace,
-        has_filter_query: bool,
     ) {
-        let mut new_iter = self.entry_shapes(multi_workspace, has_filter_query);
-        let mut prefix_len = 0;
-        let leading_new = loop {
-            match (previous_shapes.get(prefix_len), new_iter.next()) {
-                (Some(prev), Some(next)) if *prev == next => prefix_len += 1,
-                (None, None) => return,
-                (_, leading) => break leading,
+        splice_changed_range(
+            &self.list_state,
+            previous_shapes,
+            self.entry_shapes(multi_workspace),
+        );
+    }
+
+    /// Keeps the active workspace's thread list in step with its rows. Another workspace
+    /// becoming active starts its list over from the top.
+    fn apply_threads_list_diff(
+        &self,
+        previous_shapes: &[EntryShape],
+        previous_active_group: Option<&ActiveGroup>,
+        multi_workspace: &MultiWorkspace,
+    ) {
+        let active_rows = self
+            .contents
+            .active_group
+            .as_ref()
+            .map_or(0..0, |group| group.rows.clone());
+        let same_group = previous_active_group.map(|group| &group.key)
+            == self.contents.active_group.as_ref().map(|group| &group.key);
+        let previous_rows = previous_active_group
+            .filter(|_| same_group)
+            .and_then(|group| previous_shapes.get(group.rows.clone()));
+        let new_shapes = self
+            .entry_shapes(multi_workspace)
+            .skip(active_rows.start)
+            .take(active_rows.len());
+        match previous_rows {
+            Some(previous_rows) => {
+                splice_changed_range(&self.threads_list_state, previous_rows, new_shapes)
             }
-        };
-
-        let new_tail: Vec<EntryShape> = leading_new.into_iter().chain(new_iter).collect();
-        let prev_tail = &previous_shapes[prefix_len..];
-        let suffix_len = prev_tail
-            .iter()
-            .rev()
-            .zip(new_tail.iter().rev())
-            .take_while(|(prev, next)| prev == next)
-            .count();
-
-        let old_changed = prefix_len..previous_shapes.len() - suffix_len;
-        let new_changed_count = new_tail.len() - suffix_len;
-        self.list_state.splice(old_changed, new_changed_count);
+            None => self.threads_list_state.reset(active_rows.len()),
+        }
     }
 
     fn entry_shapes<'a>(
         &'a self,
         multi_workspace: &'a MultiWorkspace,
-        has_filter_query: bool,
     ) -> impl Iterator<Item = EntryShape> + 'a {
         self.contents.entries.iter().map(move |entry| match entry {
             ListEntry::ProjectHeader {
-                key,
-                has_threads,
-                is_active,
-                ..
+                key, has_threads, ..
             } => EntryShape::ProjectHeader {
                 key: key.clone(),
                 has_threads: *has_threads,
@@ -2534,15 +2478,9 @@ impl Sidebar {
                     .group_state_by_key(key)
                     .map(|state| !state.expanded)
                     .unwrap_or(false),
-                shows_sections: !has_filter_query,
-                files_expanded: self.is_files_expanded(key, *is_active),
-                threads_collapsed: self.threads_collapsed.contains(key),
             },
             ListEntry::Thread(thread) => EntryShape::Thread(thread.metadata.thread_id),
             ListEntry::Terminal(terminal) => EntryShape::Terminal(terminal.metadata.terminal_id),
-            ListEntry::Databases => EntryShape::Databases {
-                shows_tree: self.databases_expanded && !has_filter_query,
-            },
         })
     }
 
@@ -2650,11 +2588,8 @@ impl Sidebar {
         // is_selected means the keyboard selector is here.
         let is_selected = is_focused && self.selection == Some(ix);
 
-        let is_group_header_after_first = ix > 0
-            && matches!(
-                entry,
-                ListEntry::ProjectHeader { .. } | ListEntry::Databases
-            );
+        let is_group_header_after_first =
+            ix > 0 && matches!(entry, ListEntry::ProjectHeader { .. });
 
         let is_active = self
             .active_entry
@@ -2674,9 +2609,10 @@ impl Sidebar {
             } => {
                 self.project_header_menu_handles.entry(ix).or_default();
 
-                let header = self.render_project_header(
+                self.render_project_header(
                     ix,
                     false,
+                    HeaderPresentation::List,
                     key,
                     label,
                     highlight_positions,
@@ -2688,14 +2624,12 @@ impl Sidebar {
                     *has_threads,
                     // has_active_draft,
                     cx,
-                );
-                self.render_group_sections(ix, key, *is_active_group, *has_threads, header, cx)
+                )
             }
             ListEntry::Thread(thread) => self.render_thread(ix, thread, is_active, is_selected, cx),
             ListEntry::Terminal(terminal) => {
                 self.render_terminal(ix, terminal, is_active, is_selected, cx)
             }
-            ListEntry::Databases => self.render_databases_entry(ix, is_selected, cx),
         };
 
         if is_group_header_after_first {
@@ -2738,6 +2672,7 @@ impl Sidebar {
         &self,
         ix: usize,
         is_sticky: bool,
+        presentation: HeaderPresentation,
         key: &ProjectGroupKey,
         label: &SharedString,
         highlight_positions: &[usize],
@@ -2757,7 +2692,14 @@ impl Sidebar {
         let id = SharedString::from(format!("{id_prefix}project-header-{ix}"));
         let group_name = SharedString::from(format!("{id_prefix}header-group-{ix}"));
 
-        let is_collapsed = self.is_group_collapsed(key, cx);
+        // The other workspaces are always folded and the active one never is; clicking either
+        // switches to the workspace rather than folding it.
+        let is_collapsed = match presentation {
+            HeaderPresentation::List => self.is_group_collapsed(key, cx),
+            HeaderPresentation::OtherWorkspace => true,
+            HeaderPresentation::ActiveWorkspace => false,
+        };
+        let is_foldable = presentation == HeaderPresentation::List;
         let disclosure_icon = if is_collapsed {
             IconName::ChevronRight
         } else {
@@ -2766,9 +2708,6 @@ impl Sidebar {
 
         let key_for_focus = key.clone();
         let key_for_drop = key.clone();
-        let databases_above = self
-            .databases_entry_index()
-            .is_some_and(|databases_ix| databases_ix < ix);
         let key_for_disclosure = key.clone();
         let key_for_label = key.clone();
         let key_for_new_thread = key.clone();
@@ -2869,19 +2808,6 @@ impl Sidebar {
                             }
                         },
                     ))
-                    .drag_over::<DraggedDatabases>(move |style, _, _, cx| {
-                        let style = style
-                            .bg(cx.theme().colors().drop_target_background)
-                            .border_color(cx.theme().colors().drop_target_border);
-                        if databases_above {
-                            style.border_b_2()
-                        } else {
-                            style.border_t_2()
-                        }
-                    })
-                    .on_drop(cx.listener(move |this, _: &DraggedDatabases, _window, cx| {
-                        this.move_databases_to_header(ix, cx);
-                    }))
             })
             .child(
                 h_flex()
@@ -2894,7 +2820,7 @@ impl Sidebar {
                             .id(format!("{id_prefix}project-header-label-{ix}"))
                             .min_w_0()
                             .child(label)
-                            .when(!has_filter, |this| {
+                            .when(!has_filter && is_foldable, |this| {
                                 // Clicking the name toggles the group, while a
                                 // click on the rest of the header focuses it.
                                 this.on_click(cx.listener(
@@ -2951,7 +2877,7 @@ impl Sidebar {
                             },
                         )
                     })
-                    .when(!has_filter, |this| {
+                    .when(!has_filter && is_foldable, |this| {
                         this.child(
                             div()
                                 .when(!is_focused, |this| this.visible_on_hover(&group_name))
@@ -3027,64 +2953,13 @@ impl Sidebar {
             }))
             .block_mouse_except_scroll();
 
-        header.into_any_element()
-    }
-
-    /// The Files and Threads nodes under a project header. A search lists matching threads
-    /// right under their header instead.
-    fn render_group_sections(
-        &self,
-        ix: usize,
-        key: &ProjectGroupKey,
-        is_active_group: bool,
-        has_threads: bool,
-        header: AnyElement,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        if self.has_filter_query(cx) || self.is_group_collapsed(key, cx) {
-            return header;
-        }
-        let files_expanded = self.is_files_expanded(key, is_active_group);
-        let threads_collapsed = self.threads_collapsed.contains(key);
-
-        let files_key = key.clone();
-        let files_row = self.render_group_section_row(
-            SharedString::from(format!("group-files-{ix}")),
-            IconName::FileTree,
-            "Files",
-            files_expanded,
-            cx.listener(move |this, _: &ClickEvent, window, cx| {
-                cx.stop_propagation();
-                this.toggle_files(&files_key, is_active_group, window, cx);
-            }),
-            cx,
-        );
-        let threads_key = key.clone();
-        let threads_row = self.render_group_section_row(
-            SharedString::from(format!("group-threads-{ix}")),
-            IconName::Thread,
-            "Threads",
-            !threads_collapsed,
-            cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                cx.stop_propagation();
-                this.toggle_threads(&threads_key, cx);
-            }),
-            cx,
-        );
-
-        v_flex()
-            .w_full()
-            .child(header)
-            .child(files_row)
-            .when(files_expanded, |this| {
-                this.child(self.render_files_tree(ix, key, cx))
-            })
-            .child(threads_row)
-            .when(!threads_collapsed && !has_threads, |this| {
-                this.child(
+        if is_foldable && !is_collapsed && !has_threads {
+            v_flex()
+                .w_full()
+                .child(header)
+                .child(
                     h_flex()
-                        .pl_6()
-                        .pr_2()
+                        .px_2()
                         .pt_1()
                         .pb_2()
                         .gap(px(7.))
@@ -3097,247 +2972,338 @@ impl Sidebar {
                                 .color(Color::Placeholder),
                         ),
                 )
-            })
-            .into_any_element()
-    }
-
-    fn render_group_section_row(
-        &self,
-        id: SharedString,
-        icon: IconName,
-        label: &'static str,
-        is_expanded: bool,
-        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let disclosure_icon = if is_expanded {
-            IconName::ChevronDown
+                .into_any_element()
         } else {
-            IconName::ChevronRight
-        };
-        h_flex()
-            .id(id)
-            .h(GROUP_SECTION_ROW_HEIGHT)
-            .w_full()
-            .pl_2()
-            .pr_2()
-            .gap_1()
-            .cursor_pointer()
-            .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
-            .child(
-                Icon::new(disclosure_icon)
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted),
-            )
-            .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
-            .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
-            .on_click(on_click)
-            .into_any_element()
+            header.into_any_element()
+        }
     }
 
-    fn render_files_tree(
+    fn render_header_at(
         &self,
         ix: usize,
-        key: &ProjectGroupKey,
+        presentation: HeaderPresentation,
+        is_focused: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let ListEntry::ProjectHeader {
+            key,
+            label,
+            highlight_positions,
+            has_running_threads,
+            waiting_thread_count,
+            has_notifications,
+            is_active,
+            has_threads,
+        } = self.contents.entries.get(ix)?
+        else {
+            return None;
+        };
+        let is_selected = is_focused && self.selection == Some(ix);
+        Some(self.render_project_header(
+            ix,
+            false,
+            presentation,
+            key,
+            label,
+            highlight_positions,
+            *has_running_threads,
+            *waiting_thread_count,
+            *has_notifications,
+            *is_active,
+            is_selected,
+            *has_threads,
+            cx,
+        ))
+    }
+
+    /// Outside a search: the other workspaces' headers, folded, in a scrolling list of their own,
+    /// and below them the active workspace with its threads, databases and files. Each of those
+    /// scrolls by itself, and none is inside another, so their scrolling doesn't mix.
+    fn render_split_layout(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let border_color = cx.theme().colors().border;
+        let is_focused = self.focus_handle.is_focused(window);
+        let active_group = self.contents.active_group.clone();
+        let active_header_ix = active_group.as_ref().map(|group| group.header_ix);
+        let other_header_indices: Vec<usize> = self
+            .contents
+            .project_header_indices
+            .iter()
+            .copied()
+            .filter(|&ix| Some(ix) != active_header_ix)
+            .collect();
+        let mut other_headers = Vec::with_capacity(other_header_indices.len());
+        for ix in other_header_indices {
+            if let Some(header) =
+                self.render_header_at(ix, HeaderPresentation::OtherWorkspace, is_focused, cx)
+            {
+                other_headers.push(header);
+            }
+        }
+        let active_workspace = active_group
+            .as_ref()
+            .map(|group| self.render_active_workspace(group, is_focused, window, cx));
+
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .when(!other_headers.is_empty(), |this| {
+                this.child(
+                    v_flex()
+                        .id("other-workspaces")
+                        .flex_shrink_0()
+                        .max_h(relative(0.4))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.other_workspaces_scroll)
+                        .border_b_1()
+                        .border_color(border_color)
+                        .children(other_headers),
+                )
+            })
+            .children(active_workspace)
+            .into_any_element()
+    }
+
+    fn render_active_workspace(
+        &self,
+        group: &ActiveGroup,
+        is_focused: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let content = match self.files_content(key, cx) {
-            FilesContent::Tree(project_panel) => project_panel.into_any_element(),
-            FilesContent::Loading => h_flex()
-                .size_full()
-                .justify_center()
+        let header = self.render_header_at(
+            group.header_ix,
+            HeaderPresentation::ActiveWorkspace,
+            is_focused,
+            cx,
+        );
+
+        let threads = if group.rows.is_empty() {
+            h_flex()
+                .px_2()
+                .pt_1()
+                .pb_2()
+                .gap(px(7.))
                 .child(
-                    Label::new("Loading…")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                    Icon::new(IconName::Circle)
+                        .size(IconSize::Small)
+                        .color(Color::Custom(
+                            cx.theme().colors().icon_placeholder.opacity(0.1),
+                        )),
                 )
-                .into_any_element(),
-            FilesContent::NeedsConnection => {
-                let key = key.clone();
-                h_flex()
+                .child(
+                    Label::new("No threads yet")
+                        .size(LabelSize::Small)
+                        .color(Color::Placeholder),
+                )
+                .into_any_element()
+        } else {
+            list(
+                self.threads_list_state.clone(),
+                cx.processor(Self::render_active_row),
+            )
+            .with_sizing_behavior(ListSizingBehavior::Infer)
+            .w_full()
+            .max_h(self.threads_max_height)
+            .into_any_element()
+        };
+        let threads_region = v_flex()
+            .relative()
+            .w_full()
+            .flex_shrink_0()
+            .overflow_hidden()
+            .on_drag_move(cx.listener(
+                |this, event: &DragMoveEvent<DraggedRegionResize>, _window, cx| {
+                    if *event.drag(cx) != DraggedRegionResize::Threads {
+                        return;
+                    }
+                    let height =
+                        (event.event.position.y - event.bounds.top()).max(MIN_REGION_HEIGHT);
+                    if height != this.threads_max_height {
+                        this.threads_max_height = height;
+                        this.serialize(cx);
+                        cx.notify();
+                    }
+                },
+            ))
+            .child(threads)
+            .custom_scrollbars(
+                Scrollbars::new(ScrollAxes::Vertical)
+                    .tracked_scroll_handle(&self.threads_list_state),
+                window,
+                cx,
+            );
+
+        let databases_shown = self.databases.is_some() && !self.databases_hidden;
+        let databases = self.databases.clone().map(|(view, _)| {
+            let header = self.render_region_header(
+                "databases",
+                IconName::DatabaseZap,
+                "Databases",
+                self.databases_hidden,
+                DraggedRegionResize::Threads,
+                cx.listener(|this, _: &ClickEvent, _window, cx| {
+                    this.databases_hidden = !this.databases_hidden;
+                    this.serialize(cx);
+                    cx.notify();
+                }),
+                cx,
+            );
+            let body = (!self.databases_hidden).then(|| {
+                div()
+                    .w_full()
+                    .h(self.databases_height)
+                    .flex_shrink_0()
+                    .overflow_hidden()
+                    .on_drag_move(cx.listener(
+                        |this, event: &DragMoveEvent<DraggedRegionResize>, _window, cx| {
+                            if *event.drag(cx) != DraggedRegionResize::Databases {
+                                return;
+                            }
+                            let height = (event.event.position.y - event.bounds.top())
+                                .max(MIN_REGION_HEIGHT);
+                            if height != this.databases_height {
+                                this.databases_height = height;
+                                this.serialize(cx);
+                                cx.notify();
+                            }
+                        },
+                    ))
+                    .child(view)
+            });
+            v_flex()
+                .w_full()
+                .flex_shrink_0()
+                .child(header)
+                .children(body)
+        });
+
+        let project_panel = self
+            .active_workspace(cx)
+            .and_then(|workspace| workspace.read(cx).panel::<ProjectPanel>(cx));
+        let files_header = self.render_region_header(
+            "files",
+            IconName::FileTree,
+            "Files",
+            self.files_hidden,
+            if databases_shown {
+                DraggedRegionResize::Databases
+            } else {
+                DraggedRegionResize::Threads
+            },
+            cx.listener(|this, _: &ClickEvent, _window, cx| {
+                this.files_hidden = !this.files_hidden;
+                this.serialize(cx);
+                cx.notify();
+            }),
+            cx,
+        );
+        let files_body = (!self.files_hidden).then(|| {
+            let content = match project_panel {
+                Some(project_panel) => project_panel.into_any_element(),
+                None => h_flex()
                     .size_full()
                     .justify_center()
                     .child(
-                        Button::new(SharedString::from(format!("files-connect-{ix}")), "Connect")
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                this.open_files_workspace(&key, window, cx);
-                            })),
-                    )
-                    .into_any_element()
-            }
-        };
-
-        let resize_key = key.clone();
-        let drag_key = key.clone();
-        v_flex()
-            .id(SharedString::from(format!("group-files-tree-{ix}")))
-            .relative()
-            .w_full()
-            .h(self.files_height)
-            .overflow_hidden()
-            .border_t_1()
-            .border_b_1()
-            .border_color(cx.theme().colors().border_variant)
-            .on_drag_move(cx.listener(
-                move |this, event: &DragMoveEvent<DraggedTreeResize>, _window, cx| {
-                    if !matches!(event.drag(cx), DraggedTreeResize::Files(key) if *key == resize_key)
-                    {
-                        return;
-                    }
-                    let height =
-                        (event.event.position.y - event.bounds.top()).max(MIN_FILES_HEIGHT);
-                    if height != this.files_height {
-                        this.files_height = height;
-                        // Every expanded tree shares this height.
-                        this.list_state.remeasure();
-                        this.serialize(cx);
-                        cx.notify();
-                    }
-                },
-            ))
-            .child(div().size_full().child(content))
-            .child(
-                div()
-                    .id(SharedString::from(format!("group-files-resize-{ix}")))
-                    .absolute()
-                    .left_0()
-                    .bottom_0()
-                    .w_full()
-                    .h(px(4.))
-                    .cursor_row_resize()
-                    .on_drag(DraggedTreeResize::Files(drag_key), |dragged, _, _, cx| {
-                        cx.stop_propagation();
-                        cx.new(|_| dragged.clone())
-                    })
-                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation();
-                    }),
-            )
-            .into_any_element()
-    }
-
-    fn render_databases_entry(
-        &self,
-        ix: usize,
-        is_selected: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let has_filter = self.has_filter_query(cx);
-        let expanded = self.databases_expanded;
-        let color = cx.theme().colors();
-        let disclosure_icon = if expanded {
-            IconName::ChevronDown
-        } else {
-            IconName::ChevronRight
-        };
-        let header = h_flex()
-            .id("databases-header")
-            .h(Tab::content_height(cx))
-            .w_full()
-            .pl_2()
-            .pr_1p5()
-            .gap_1()
-            .border_1()
-            .border_r_2()
-            .map(|this| {
-                if is_selected {
-                    this.border_color(color.panel_focused_border)
-                } else {
-                    this.border_color(gpui::transparent_black())
-                }
-            })
-            .child(
-                Icon::new(IconName::DatabaseZap)
-                    .size(IconSize::Small)
-                    .color(Color::Muted),
-            )
-            .child(Label::new("Databases").color(Color::Muted))
-            .child(div().flex_1())
-            .when(!has_filter, |this| {
-                this.cursor_pointer()
-                    .hover(|style| style.bg(color.ghost_element_hover))
-                    .child(
-                        Icon::new(disclosure_icon)
-                            .size(IconSize::Small)
+                        Label::new("Loading…")
+                            .size(LabelSize::Small)
                             .color(Color::Muted),
                     )
-                    .on_drag(DraggedDatabases, |dragged, _, _, cx| {
-                        cx.new(|_| dragged.clone())
-                    })
-                    .drag_over::<DraggedProjectGroup>(move |style, dragged, _, cx| {
-                        let style = style
-                            .bg(cx.theme().colors().drop_target_background)
-                            .border_color(cx.theme().colors().drop_target_border);
-                        if dragged.ix < ix {
-                            style.border_b_2()
-                        } else {
-                            style.border_t_2()
-                        }
-                    })
-                    .on_drop(cx.listener(
-                        move |this, dragged: &DraggedProjectGroup, _window, cx| {
-                            this.move_databases_past_group(&dragged.key, cx);
-                        },
-                    ))
-                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                        this.toggle_databases(cx);
-                    }))
-            });
-
-        let tree = (expanded && !has_filter)
-            .then(|| self.databases.clone())
-            .flatten()
-            .map(|(view, _)| self.render_databases_tree(view, cx));
+                    .into_any_element(),
+            };
+            div()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .overflow_hidden()
+                .child(content)
+        });
+        let files = v_flex()
+            .w_full()
+            .when(!self.files_hidden, |this| this.flex_1().min_h_0())
+            .child(files_header)
+            .children(files_body);
 
         v_flex()
+            .flex_1()
+            .min_h_0()
             .w_full()
-            .child(header)
-            .children(tree)
+            .children(header)
+            .child(threads_region)
+            .children(databases)
+            .child(files)
             .into_any_element()
     }
 
-    fn render_databases_tree(&self, view: AnyView, cx: &mut Context<Self>) -> AnyElement {
-        v_flex()
-            .id("databases-tree")
+    fn render_active_row(
+        &mut self,
+        local_ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(ix) = self
+            .contents
+            .active_group
+            .as_ref()
+            .map(|group| group.rows.start + local_ix)
+        else {
+            return div().into_any_element();
+        };
+        self.render_list_entry(ix, window, cx)
+    }
+
+    /// The header above the Databases or Files region: its name, a button that hides or shows
+    /// it, and along its top edge a handle that resizes the region above.
+    fn render_region_header(
+        &self,
+        id: &'static str,
+        icon: IconName,
+        label: &'static str,
+        hidden: bool,
+        resizes: DraggedRegionResize,
+        on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (visibility_icon, tooltip) = if hidden {
+            (IconName::Eye, format!("Show {label}"))
+        } else {
+            (IconName::EyeOff, format!("Hide {label}"))
+        };
+        h_flex()
+            .id(SharedString::from(format!("{id}-region-header")))
             .relative()
+            .flex_shrink_0()
+            .h(REGION_HEADER_HEIGHT)
             .w_full()
-            .h(self.databases_height)
-            .overflow_hidden()
+            .pl_2()
+            .pr_1()
+            .gap_1()
             .border_t_1()
-            .border_b_1()
-            .border_color(cx.theme().colors().border_variant)
-            .on_drag_move(cx.listener(
-                |this, event: &DragMoveEvent<DraggedTreeResize>, _window, cx| {
-                    if *event.drag(cx) != DraggedTreeResize::Databases {
-                        return;
-                    }
-                    let height =
-                        (event.event.position.y - event.bounds.top()).max(MIN_FILES_HEIGHT);
-                    if height != this.databases_height {
-                        this.databases_height = height;
-                        if let Some(databases_ix) = this.databases_entry_index() {
-                            this.list_state
-                                .remeasure_items(databases_ix..databases_ix + 1);
-                        }
-                        this.serialize(cx);
-                        cx.notify();
-                    }
-                },
-            ))
-            .child(div().size_full().child(view))
+            .border_color(cx.theme().colors().border)
+            .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+            .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+            .child(div().flex_1())
+            .child(
+                IconButton::new(
+                    SharedString::from(format!("{id}-region-visibility")),
+                    visibility_icon,
+                )
+                .icon_size(IconSize::XSmall)
+                .tooltip(Tooltip::text(tooltip))
+                .on_click(on_toggle),
+            )
             .child(
                 div()
-                    .id("databases-resize")
+                    .id(SharedString::from(format!("{id}-region-resize")))
                     .absolute()
+                    .top(px(-2.))
                     .left_0()
-                    .bottom_0()
                     .w_full()
-                    .h(px(4.))
+                    .h(px(5.))
                     .cursor_row_resize()
-                    .on_drag(DraggedTreeResize::Databases, |dragged, _, _, cx| {
+                    .on_drag(resizes, |dragged, _, _, cx| {
                         cx.stop_propagation();
-                        cx.new(|_| dragged.clone())
+                        cx.new(|_| *dragged)
                     })
                     .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
                         cx.stop_propagation();
@@ -3346,14 +3312,7 @@ impl Sidebar {
             .into_any_element()
     }
 
-    fn databases_entry_index(&self) -> Option<usize> {
-        self.contents
-            .entries
-            .iter()
-            .position(|entry| matches!(entry, ListEntry::Databases))
-    }
-
-    /// Hands in Quarry's connection tree, which is then listed as Databases.
+    /// Hands in Quarry's connection tree, which the Databases region shows.
     pub fn set_databases_view(
         &mut self,
         view: AnyView,
@@ -3361,118 +3320,24 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         self.databases = Some((view, focus_handle));
-        self.update_entries(cx);
-    }
-
-    fn toggle_databases(&mut self, cx: &mut Context<Self>) {
-        self.databases_expanded = !self.databases_expanded;
-        self.update_entries(cx);
-        if let Some(databases_ix) = self.databases_entry_index() {
-            self.list_state
-                .remeasure_items(databases_ix..databases_ix + 1);
-        }
-        self.serialize(cx);
-    }
-
-    fn set_databases_slot(&mut self, slot: usize, cx: &mut Context<Self>) {
-        let slot = slot.min(self.contents.project_header_indices.len());
-        if Some(slot) == self.databases_slot {
-            return;
-        }
-        self.databases_slot = Some(slot);
-        self.selection = None;
-        self.update_entries(cx);
-        // The shape diff keeps the measurements of items it sees as unchanged, but moving
-        // Databases moves a tall item past headers of a different height.
-        self.list_state.remeasure();
-        self.serialize(cx);
-    }
-
-    /// Databases dropped on the project header at `header_entry_ix` takes that header's place,
-    /// landing after it when dragged down and before it when dragged up.
-    fn move_databases_to_header(&mut self, header_entry_ix: usize, cx: &mut Context<Self>) {
-        let Some(header_position) = self
-            .contents
-            .project_header_indices
-            .iter()
-            .position(|&ix| ix == header_entry_ix)
-        else {
-            return;
-        };
-        let dragged_down = self
-            .databases_entry_index()
-            .is_some_and(|databases_ix| databases_ix < header_entry_ix);
-        let slot = if dragged_down {
-            header_position + 1
-        } else {
-            header_position
-        };
-        self.set_databases_slot(slot, cx);
-    }
-
-    /// A project group dropped on Databases trades places with it.
-    fn move_databases_past_group(&mut self, key: &ProjectGroupKey, cx: &mut Context<Self>) {
-        let Some(databases_ix) = self.databases_entry_index() else {
-            return;
-        };
-        let group = self
-            .contents
-            .project_header_indices
-            .iter()
-            .enumerate()
-            .find(|(_, header_ix)| {
-                matches!(
-                    self.contents.entries.get(**header_ix),
-                    Some(ListEntry::ProjectHeader { key: header_key, .. }) if header_key == key
-                )
-            })
-            .map(|(position, header_ix)| (position, *header_ix));
-        let Some((group_position, group_ix)) = group else {
-            return;
-        };
-        let slot = if group_ix < databases_ix {
-            group_position
-        } else {
-            group_position + 1
-        };
-        self.set_databases_slot(slot, cx);
-    }
-
-    /// Shows the Databases tree and moves focus into it.
-    fn focus_databases_impl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((_, focus_handle)) = self.databases.clone() else {
-            return;
-        };
-        self.show_thread_list_unfiltered(window, cx);
-        if !self.databases_expanded {
-            self.toggle_databases(cx);
-        }
-        if let Some(databases_ix) = self.databases_entry_index() {
-            self.list_state.scroll_to_reveal_item(databases_ix);
-        }
-        window.focus(&focus_handle, cx);
         cx.notify();
     }
 
-    /// Expands the Files node of `workspace`'s group and moves focus into its tree, which has
-    /// already selected whatever it was asked to reveal.
+    /// Switches to `workspace` if it isn't active, shows its Files region and moves focus into
+    /// the tree, which has already selected whatever it was asked to reveal.
     fn reveal_files_impl(
         &mut self,
         workspace: &Entity<Workspace>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let key = workspace.read(cx).project_group_key(cx);
+        if !self.is_active_workspace(workspace, cx) {
+            self.activate_workspace(workspace, window, cx);
+        }
         self.show_thread_list_unfiltered(window, cx);
-        self.set_group_expanded(&key, true, cx);
-        self.files_expanded.insert(key.clone(), true);
-        self.update_entries(cx);
-        self.remeasure_project_header(&key);
-        let header_ix = self.contents.entries.iter().position(|entry| {
-            matches!(entry, ListEntry::ProjectHeader { key: entry_key, .. } if *entry_key == key)
-        });
-        if let Some(header_ix) = header_ix {
-            self.list_state.scroll_to_reveal_item(header_ix);
+        if self.files_hidden {
+            self.files_hidden = false;
+            self.serialize(cx);
         }
         if let Some(project_panel) = workspace.read(cx).panel::<ProjectPanel>(cx) {
             let focus_handle = project_panel.read(cx).focus_handle(cx);
@@ -3481,193 +3346,80 @@ impl Sidebar {
         cx.notify();
     }
 
-    /// The Files and Databases trees are only drawn in the thread list outside a search.
+    /// Shows the Databases region and moves focus into it.
+    fn focus_databases_impl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((_, focus_handle)) = self.databases.clone() else {
+            return;
+        };
+        self.show_thread_list_unfiltered(window, cx);
+        if self.databases_hidden {
+            self.databases_hidden = false;
+            self.serialize(cx);
+        }
+        window.focus(&focus_handle, cx);
+        cx.notify();
+    }
+
+    /// The regions are only drawn in the thread list outside a search.
     fn show_thread_list_unfiltered(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.view, SidebarView::Archive(_)) {
             self.show_thread_list(window, cx);
         }
         if self.has_filter_query(cx) {
             self.reset_filter_editor_text(window, cx);
+            self.update_entries(cx);
         }
     }
 
-    fn is_files_expanded(&self, key: &ProjectGroupKey, is_active_group: bool) -> bool {
-        self.files_expanded
-            .get(key)
+    /// Entry indices in the order they are on screen: everything during a search; otherwise the
+    /// other workspaces' headers, then the active workspace's header and rows. The other
+    /// workspaces' threads are kept in `entries` but not shown.
+    fn visible_entry_order(&self, cx: &App) -> Vec<usize> {
+        if self.has_filter_query(cx) {
+            return (0..self.contents.entries.len()).collect();
+        }
+        let active_group = self.contents.active_group.as_ref();
+        let mut order: Vec<usize> = self
+            .contents
+            .project_header_indices
+            .iter()
             .copied()
-            .unwrap_or(is_active_group)
-    }
-
-    /// The workspace whose tree a group's Files node shows: the one the user was last in, or
-    /// any open one.
-    fn files_workspace_for_group(
-        &self,
-        key: &ProjectGroupKey,
-        cx: &App,
-    ) -> Option<Entity<Workspace>> {
-        let multi_workspace = self.multi_workspace.upgrade()?;
-        let multi_workspace = multi_workspace.read(cx);
-        multi_workspace
-            .last_active_workspace_for_group(key, cx)
-            .or_else(|| self.workspace_for_group(key, cx))
-            .or_else(|| {
-                multi_workspace
-                    .workspaces_for_project_group(key, cx)
-                    .into_iter()
-                    .next()
-            })
-    }
-
-    fn files_content(&self, key: &ProjectGroupKey, cx: &App) -> FilesContent {
-        match self.files_workspace_for_group(key, cx) {
-            Some(workspace) => match workspace.read(cx).panel::<ProjectPanel>(cx) {
-                Some(project_panel) => FilesContent::Tree(project_panel),
-                None => FilesContent::Loading,
-            },
-            None if self.files_opening.contains_key(key) || key.host().is_none() => {
-                FilesContent::Loading
-            }
-            None => FilesContent::NeedsConnection,
-        }
-    }
-
-    fn toggle_files(
-        &mut self,
-        key: &ProjectGroupKey,
-        is_active_group: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let expanded = !self.is_files_expanded(key, is_active_group);
-        self.files_expanded.insert(key.clone(), expanded);
-        if expanded {
-            // Connecting to a remote host can prompt for a password, so it waits for a click.
-            if key.host().is_none() {
-                self.open_files_workspace(key, window, cx);
-            }
-        } else {
-            self.files_opening.remove(key);
-            self.close_files_workspaces(key, window, cx);
-        }
-        self.update_entries(cx);
-        self.remeasure_project_header(key);
-    }
-
-    fn toggle_threads(&mut self, key: &ProjectGroupKey, cx: &mut Context<Self>) {
-        if !self.threads_collapsed.remove(key) {
-            self.threads_collapsed.insert(key.clone());
-        }
-        self.update_entries(cx);
-        self.remeasure_project_header(key);
-    }
-
-    /// A project header's height follows its Files and Threads nodes, which the shape diff in
-    /// `update_entries` doesn't see change, since it compares against the already toggled state.
-    fn remeasure_project_header(&self, key: &ProjectGroupKey) {
-        let header_ix = self.contents.entries.iter().position(
-            |entry| matches!(entry, ListEntry::ProjectHeader { key: entry_key, .. } if entry_key == key),
-        );
-        if let Some(header_ix) = header_ix {
-            self.list_state.remeasure_items(header_ix..header_ix + 1);
-        }
-    }
-
-    /// Opens a closed group's workspace without switching to it, so its Files node can show
-    /// the tree.
-    fn open_files_workspace(
-        &mut self,
-        key: &ProjectGroupKey,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.files_workspace_for_group(key, cx).is_some() || self.files_opening.contains_key(key)
-        {
-            return;
-        }
-        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
-            return;
-        };
-        let active_workspace = multi_workspace.read(cx).workspace().clone();
-        let modal_workspace = active_workspace.clone();
-        let task = multi_workspace.update(cx, |multi_workspace, cx| {
-            multi_workspace.find_or_create_workspace(
-                key.path_list().clone(),
-                key.host(),
-                Some(key.clone()),
-                |options, window, cx| connect_remote(active_workspace, options, window, cx),
-                None,
-                OpenMode::Add,
-                None,
-                window,
-                cx,
-            )
-        });
-
-        let opening_key = key.clone();
-        let opening = cx.spawn_in(window, async move |this, cx| {
-            let result = task.await;
-            remote_connection::dismiss_connection_modal(&modal_workspace, cx);
-            this.update(cx, |this, cx| {
-                this.files_opening.remove(&opening_key);
-                match result {
-                    Ok(workspace) => {
-                        this.files_opened_in_background
-                            .insert(workspace.entity_id());
-                    }
-                    Err(error) => {
-                        log::error!("failed to open a workspace for its files: {error:#}");
-                        // Collapsed again, so expanding it retries.
-                        this.files_expanded.insert(opening_key.clone(), false);
-                    }
-                }
-                this.update_entries(cx);
-                this.remeasure_project_header(&opening_key);
-            })
-            .log_err();
-        });
-        self.files_opening.insert(key.clone(), opening);
-    }
-
-    /// Closes the workspaces of a group that were only opened for their Files node, unless the
-    /// user switched to one, has unsaved changes in it or has a thread running there.
-    fn close_files_workspaces(
-        &mut self,
-        key: &ProjectGroupKey,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
-            return;
-        };
-        let workspaces_to_close: Vec<Entity<Workspace>> = multi_workspace
-            .read(cx)
-            .workspaces_for_project_group(key, cx)
-            .into_iter()
-            .filter(|workspace| {
-                self.files_opened_in_background
-                    .contains(&workspace.entity_id())
-                    && !self.is_active_workspace(workspace, cx)
-                    && !workspace.read(cx).items(cx).any(|item| item.is_dirty(cx))
-                    && !all_thread_infos_for_workspace(workspace, cx).any(|info| {
-                        matches!(
-                            info.status,
-                            AgentThreadStatus::Running | AgentThreadStatus::WaitingForConfirmation
-                        )
-                    })
-            })
+            .filter(|&ix| Some(ix) != active_group.map(|group| group.header_ix))
             .collect();
-        if workspaces_to_close.is_empty() {
+        if let Some(active_group) = active_group {
+            order.push(active_group.header_ix);
+            order.extend(active_group.rows.clone());
+        }
+        order
+    }
+
+    fn reveal_entry(&self, ix: usize, cx: &App) {
+        if self.has_filter_query(cx) {
+            self.list_state.scroll_to_reveal_item(ix);
             return;
         }
-        for workspace in &workspaces_to_close {
-            self.files_opened_in_background
-                .remove(&workspace.entity_id());
+        if let Some(active_group) = &self.contents.active_group
+            && active_group.rows.contains(&ix)
+        {
+            self.threads_list_state
+                .scroll_to_reveal_item(ix - active_group.rows.start);
+            return;
         }
-        multi_workspace
-            .update(cx, |multi_workspace, cx| {
-                multi_workspace.remove(workspaces_to_close, RemovalIntent::KeepProject, window, cx)
-            })
-            .detach_and_log_err(cx);
+        let active_header_ix = self
+            .contents
+            .active_group
+            .as_ref()
+            .map(|group| group.header_ix);
+        let other_position = self
+            .contents
+            .project_header_indices
+            .iter()
+            .copied()
+            .filter(|&header_ix| Some(header_ix) != active_header_ix)
+            .position(|header_ix| header_ix == ix);
+        if let Some(other_position) = other_position {
+            self.other_workspaces_scroll.scroll_to_item(other_position);
+        }
     }
 
     fn render_new_thread_button(
@@ -4263,11 +4015,6 @@ impl Sidebar {
         if !needs_sticky {
             return None;
         }
-        // Once Databases scrolls to the top, the rows below the header are no longer its own.
-        let databases_idx = self.databases_entry_index();
-        if databases_idx.is_some_and(|idx| header_idx < idx && idx <= scroll_top.item_ix) {
-            return None;
-        }
 
         let ListEntry::ProjectHeader {
             key,
@@ -4289,6 +4036,7 @@ impl Sidebar {
         let header_element = self.render_project_header(
             header_idx,
             true,
+            HeaderPresentation::List,
             key,
             &label,
             &highlight_positions,
@@ -4305,17 +4053,12 @@ impl Sidebar {
             .contents
             .project_header_indices
             .iter()
-            .copied()
-            .chain(databases_idx)
-            .filter(|&idx| idx > header_idx)
-            .min()
-            .and_then(|next_idx| {
+            .find(|&&idx| idx > header_idx)
+            .and_then(|&next_idx| {
                 let bounds = self.list_state.bounds_for_item(next_idx)?;
                 let viewport = self.list_state.viewport_bounds();
                 let y_in_viewport = bounds.origin.y - viewport.origin.y;
-                // The next header's item also holds its Files and Threads rows, so only the
-                // height of a header row itself pushes this one off.
-                let header_height = Tab::content_height(cx);
+                let header_height = bounds.size.height;
                 (y_in_viewport < header_height).then_some(y_in_viewport - header_height)
             })
             .unwrap_or(px(0.));
@@ -4617,51 +4360,61 @@ impl Sidebar {
     }
 
     fn select_next(&mut self, _: &SelectNext, _window: &mut Window, cx: &mut Context<Self>) {
-        let next = match self.selection {
-            Some(ix) if ix + 1 < self.contents.entries.len() => ix + 1,
-            Some(_) if !self.contents.entries.is_empty() => 0,
-            None if !self.contents.entries.is_empty() => 0,
-            _ => return,
+        let order = self.visible_entry_order(cx);
+        let current = self
+            .selection
+            .and_then(|selection| order.iter().position(|&ix| ix == selection));
+        let next = match current {
+            Some(position) if position + 1 < order.len() => order[position + 1],
+            _ => match order.first() {
+                Some(&first) => first,
+                None => return,
+            },
         };
         self.selection = Some(next);
-        self.list_state.scroll_to_reveal_item(next);
+        self.reveal_entry(next, cx);
         cx.notify();
     }
 
     fn select_previous(&mut self, _: &SelectPrevious, window: &mut Window, cx: &mut Context<Self>) {
-        match self.selection {
+        let order = self.visible_entry_order(cx);
+        let current = self
+            .selection
+            .and_then(|selection| order.iter().position(|&ix| ix == selection));
+        match current {
             Some(0) => {
                 self.selection = None;
                 self.filter_editor.focus_handle(cx).focus(window, cx);
                 cx.notify();
             }
-            Some(ix) => {
-                self.selection = Some(ix - 1);
-                self.list_state.scroll_to_reveal_item(ix - 1);
+            Some(position) => {
+                let previous = order[position - 1];
+                self.selection = Some(previous);
+                self.reveal_entry(previous, cx);
                 cx.notify();
             }
-            None if !self.contents.entries.is_empty() => {
-                let last = self.contents.entries.len() - 1;
-                self.selection = Some(last);
-                self.list_state.scroll_to_reveal_item(last);
-                cx.notify();
+            None => {
+                if let Some(&last) = order.last() {
+                    self.selection = Some(last);
+                    self.reveal_entry(last, cx);
+                    cx.notify();
+                }
             }
-            None => {}
         }
     }
 
     fn select_first(&mut self, _: &SelectFirst, _window: &mut Window, cx: &mut Context<Self>) {
-        if !self.contents.entries.is_empty() {
-            self.selection = Some(0);
-            self.list_state.scroll_to_reveal_item(0);
+        if let Some(&first) = self.visible_entry_order(cx).first() {
+            self.selection = Some(first);
+            self.reveal_entry(first, cx);
             cx.notify();
         }
     }
 
     fn select_last(&mut self, _: &SelectLast, _window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(last) = self.contents.entries.len().checked_sub(1) {
+        if let Some(&last) = self.visible_entry_order(cx).last() {
             self.selection = Some(last);
-            self.list_state.scroll_to_reveal_item(last);
+            self.reveal_entry(last, cx);
             cx.notify();
         }
     }
@@ -4681,7 +4434,6 @@ impl Sidebar {
                 let key = key.clone();
                 self.toggle_collapse(&key, window, cx);
             }
-            ListEntry::Databases => self.toggle_databases(cx),
             ListEntry::Thread(thread) => {
                 let metadata = thread.metadata.clone();
                 match &thread.workspace {
@@ -5420,11 +5172,6 @@ impl Sidebar {
                     cx.notify();
                 }
             }
-            Some(ListEntry::Databases) => {
-                if !self.databases_expanded {
-                    self.toggle_databases(cx);
-                }
-            }
             _ => {}
         }
     }
@@ -5457,11 +5204,6 @@ impl Sidebar {
                     }
                 }
             }
-            Some(ListEntry::Databases) => {
-                if self.databases_expanded {
-                    self.toggle_databases(cx);
-                }
-            }
             None => {}
         }
     }
@@ -5476,10 +5218,6 @@ impl Sidebar {
 
         // Find the group header for the current selection.
         let header_ix = match self.contents.entries.get(ix) {
-            Some(ListEntry::Databases) => {
-                self.toggle_databases(cx);
-                return;
-            }
             Some(ListEntry::ProjectHeader { .. }) => Some(ix),
             Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => (0..ix).rev().find(|&i| {
                 matches!(
@@ -6921,7 +6659,7 @@ impl Sidebar {
                 }
                 ListEntry::Thread(thread) => Sidebar::thread_display_time(&thread.metadata),
                 ListEntry::Terminal(terminal) => terminal.metadata.created_at,
-                ListEntry::ProjectHeader { .. } | ListEntry::Databases => unreachable!(),
+                ListEntry::ProjectHeader { .. } => unreachable!(),
             }
         }
 
@@ -7047,7 +6785,6 @@ impl Sidebar {
                         timestamp,
                     }))
                 }
-                ListEntry::Databases => None,
             })
             .collect();
 
@@ -8389,7 +8126,7 @@ impl Sidebar {
                 let workspace = terminal.workspace.clone();
                 self.activate_terminal_entry(metadata, workspace, true, window, cx);
             }
-            ListEntry::ProjectHeader { .. } | ListEntry::Databases => {}
+            ListEntry::ProjectHeader { .. } => {}
         }
     }
 
@@ -8947,12 +8684,12 @@ impl WorkspaceSidebar for Sidebar {
                 SidebarView::ThreadList => SerializedSidebarView::ThreadList,
                 SidebarView::Archive(_) => SerializedSidebarView::History,
             },
-            files_height: (self.files_height != DEFAULT_FILES_HEIGHT)
-                .then(|| f32::from(self.files_height)),
-            databases_height: (self.databases_height != DEFAULT_FILES_HEIGHT)
+            threads_max_height: (self.threads_max_height != DEFAULT_THREADS_MAX_HEIGHT)
+                .then(|| f32::from(self.threads_max_height)),
+            databases_height: (self.databases_height != DEFAULT_DATABASES_HEIGHT)
                 .then(|| f32::from(self.databases_height)),
-            databases_collapsed: !self.databases_expanded,
-            databases_slot: self.databases_slot,
+            databases_hidden: self.databases_hidden,
+            files_hidden: self.files_hidden,
         };
         serde_json::to_string(&serialized).ok()
     }
@@ -8972,15 +8709,14 @@ impl WorkspaceSidebar for Sidebar {
                 self.width = px(width).clamp(THREADS_LIST_MIN_WIDTH, THREADS_LIST_MAX_WIDTH);
                 self.width_set_by_user = true;
             }
-            if let Some(files_height) = serialized.files_height {
-                self.files_height = px(files_height).max(MIN_FILES_HEIGHT);
+            if let Some(height) = serialized.threads_max_height {
+                self.threads_max_height = px(height).max(MIN_REGION_HEIGHT);
             }
-            if let Some(databases_height) = serialized.databases_height {
-                self.databases_height = px(databases_height).max(MIN_FILES_HEIGHT);
+            if let Some(height) = serialized.databases_height {
+                self.databases_height = px(height).max(MIN_REGION_HEIGHT);
             }
-            self.databases_expanded = !serialized.databases_collapsed;
-            self.databases_slot = serialized.databases_slot;
-            self.schedule_update_entries(false, cx);
+            self.databases_hidden = serialized.databases_hidden;
+            self.files_hidden = serialized.files_hidden;
             if serialized.active_view == SerializedSidebarView::History {
                 cx.defer_in(window, |this, window, cx| {
                     this.show_archive(window, cx);
@@ -9002,6 +8738,13 @@ impl Focusable for Sidebar {
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _titlebar_height = ui::utils::platform_title_bar_height(window);
+        // Headers drawn outside the list keep their menus' handles here too.
+        for header_ix in self.contents.project_header_indices.clone() {
+            self.project_header_menu_handles
+                .entry(header_ix)
+                .or_default();
+        }
+        let has_filter_query = self.has_filter_query(cx);
         let ui_font = theme_settings::setup_ui_font(window, cx);
         let sticky_header = self.render_sticky_header(window, cx);
 
@@ -9088,6 +8831,8 @@ impl Render for Sidebar {
                     .map(|this| {
                         if no_open_projects {
                             this.child(self.render_empty_state(cx))
+                        } else if !has_filter_query {
+                            this.child(self.render_split_layout(window, cx))
                         } else {
                             this.child(
                                 v_flex()
@@ -9134,6 +8879,37 @@ impl Render for Sidebar {
             })
             .child(self.render_sidebar_bottom_bar(cx))
     }
+}
+
+/// Splices only the range of `list_state` whose item shapes changed, so items before and after it
+/// keep their measurements.
+fn splice_changed_range(
+    list_state: &ListState,
+    previous_shapes: &[EntryShape],
+    new_shapes: impl Iterator<Item = EntryShape>,
+) {
+    let mut new_iter = new_shapes;
+    let mut prefix_len = 0;
+    let leading_new = loop {
+        match (previous_shapes.get(prefix_len), new_iter.next()) {
+            (Some(prev), Some(next)) if *prev == next => prefix_len += 1,
+            (None, None) => return,
+            (_, leading) => break leading,
+        }
+    };
+
+    let new_tail: Vec<EntryShape> = leading_new.into_iter().chain(new_iter).collect();
+    let prev_tail = &previous_shapes[prefix_len..];
+    let suffix_len = prev_tail
+        .iter()
+        .rev()
+        .zip(new_tail.iter().rev())
+        .take_while(|(prev, next)| prev == next)
+        .count();
+
+    let old_changed = prefix_len..previous_shapes.len() - suffix_len;
+    let new_changed_count = new_tail.len() - suffix_len;
+    list_state.splice(old_changed, new_changed_count);
 }
 
 fn all_thread_infos_for_workspace(
