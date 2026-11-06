@@ -14198,15 +14198,22 @@ impl Render for ThreadView {
                     this.flex_1()
                         .size_full()
                         .relative()
-                        .on_mouse_down(
-                            MouseButton::Middle,
-                            cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                                if this.middle_click_autoscroll.is_none() {
-                                    this.start_middle_click_autoscroll(event.position, cx);
+                        // Capture phase, so the press is claimed before the
+                        // editors rendering user messages see it: they begin a
+                        // columnar selection on a middle press and swallow it.
+                        // A press while autoscroll is already running is left
+                        // to propagate, so the window-level listener ends it.
+                        .capture_any_mouse_down(cx.listener(
+                            |this, event: &MouseDownEvent, _, cx| {
+                                if event.button != MouseButton::Middle
+                                    || this.middle_click_autoscroll.is_some()
+                                {
+                                    return;
                                 }
+                                this.start_middle_click_autoscroll(event.position, cx);
                                 cx.stop_propagation();
-                            }),
-                        )
+                            },
+                        ))
                         .child(self.render_entries(cx))
                         .children(sticky_user_message)
                         .vertical_scrollbar_for(&list_state, window, cx)
