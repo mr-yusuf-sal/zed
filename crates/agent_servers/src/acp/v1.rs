@@ -1,17 +1,18 @@
 use super::{
     AcpDebugLog, AcpDebugMessage, AcpSession, ClientContext, ConfigOptions, FlattenAcpResult as _,
-    ForegroundWork, SubagentSession, UnsupportedVersion, cancellable_subagent,
+    ForegroundWork, SubagentDisplay, SubagentSession, UnsupportedVersion, cancellable_subagent,
     drain_foreground_queue, enqueue_notification, enqueue_request, first_class_terminal_auth_task,
-    handle_v2_complete_elicitation, handle_v2_create_elicitation, link_session_message,
-    link_subagent_tool_call, map_acp_error, mcp_configurations_for_project, record_subagent_update,
-    respond_err, respond_result, root_session_id, runtime, session_thread, terminal_auth_task_id,
-    transport, with_v2_client_ingress, work_dirs_from_session_info,
+    handle_session_message, handle_v2_complete_elicitation, handle_v2_create_elicitation,
+    link_subagent_tool_call, map_acp_error, mcp_configurations_for_project, message_text,
+    record_subagent_update, respond_err, respond_result, root_session_id, runtime, session_thread,
+    terminal_auth_task_id, transport, with_v2_client_ingress, work_dirs_from_session_info,
 };
 use acp_thread::{
     AgentConnection, AgentSessionInfo, AgentSessionList, AgentSessionListRequest,
     AgentSessionListResponse, ElicitationStore,
 };
 use action_log::ActionLog;
+use agent_client_protocol::schema::MaybeUndefined;
 use agent_client_protocol::schema::{
     ProtocolVersion,
     v1::{self as acp, ErrorCode},
@@ -8999,6 +9000,226 @@ exit 7
         });
     }
 
+    /// What Claude Code sends to a client that supports subagents, recorded
+    /// from claude-agent-acp 0.101.0: no tool call for the Agent launch, only
+    /// the subagent's announcement and the message that launched it; and a
+    /// Bash command that went to the background completes its tool call while
+    /// its terminal runs on.
+    #[gpui::test]
+    async fn test_subagent_announced_without_a_launch_tool_call(cx: &mut gpui::TestAppContext) {
+        let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
+        let cancelled_sessions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (connection, project, _, _, _, _, _keep_agent_alive) =
+            connect_fake_agent_recording_cancels(
+                None,
+                Some(agent_sender),
+                None,
+                cancelled_sessions.clone(),
+                cx,
+            )
+            .await;
+        let agent = agent_receiver.await.expect("receive fake agent handle");
+        let thread = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    acp_v2::SessionId::new("parent"),
+                    project,
+                    PathList::new(&[std::path::Path::new("/a")]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("session should load");
+
+        for (session_id, update) in [
+            (
+                "parent",
+                serde_json::json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "bash",
+                    "title": "ping -n 40 127.0.0.1",
+                    "kind": "execute",
+                    "status": "pending",
+                    "content": [{ "type": "terminal", "terminalId": "bash" }],
+                    "_meta": {
+                        "claudeCode": { "toolName": "Bash" },
+                        "terminal_info": { "terminal_id": "bash" },
+                    },
+                }),
+            ),
+            (
+                "parent",
+                serde_json::json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "bash",
+                    "_meta": {
+                        "terminal_output": {
+                            "terminal_id": "bash",
+                            "data": "Command running in background with ID: b1.",
+                        },
+                    },
+                }),
+            ),
+            (
+                "parent",
+                serde_json::json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "bash",
+                    "status": "completed",
+                    "_meta": { "claudeCode": { "toolName": "Bash" } },
+                }),
+            ),
+            (
+                "parent",
+                serde_json::json!({
+                    "sessionUpdate": "subagent_update",
+                    "sessionId": "child",
+                    "title": "Run short ping test",
+                    "description": "general-purpose",
+                    "capabilities": { "cancel": {} },
+                    "state": { "state": "running" },
+                }),
+            ),
+            (
+                "parent",
+                serde_json::json!({
+                    "sessionUpdate": "session_message",
+                    "messageId": "launch",
+                    "senderSessionId": "parent",
+                    "recipientSessionId": "child",
+                    "content": [{ "type": "text", "text": "Run a ping" }],
+                    "recipientMessageId": "launch",
+                }),
+            ),
+            (
+                "child",
+                serde_json::json!({
+                    "sessionUpdate": "session_message",
+                    "messageId": "launch",
+                    "senderSessionId": "parent",
+                    "recipientSessionId": "child",
+                    "content": [{ "type": "text", "text": "Run a ping" }],
+                    "senderMessageId": "launch",
+                }),
+            ),
+            (
+                "child",
+                serde_json::json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "child-bash",
+                    "title": "ping -n 15 127.0.0.1",
+                    "kind": "execute",
+                    "status": "pending",
+                    "_meta": { "claudeCode": { "toolName": "Bash", "parentToolUseId": "launch" } },
+                }),
+            ),
+        ] {
+            send_session_update(&agent, session_id, update);
+        }
+        cx.run_until_parked();
+
+        let launch_id = acp_v2::ToolCallId::new("launch");
+        thread.read_with(cx, |thread, cx| {
+            let (_, launch) = thread
+                .tool_call(&launch_id)
+                .expect("Zed shows a tool call for the launch");
+            assert_eq!(launch.label.read(cx).source(), "Run short ping test");
+            assert!(matches!(
+                launch.status(),
+                acp_thread::ToolCallStatus::InProgress
+            ));
+            assert!(thread.is_subagent_running(&launch_id));
+            assert!(thread.can_stop_subagent(&launch_id));
+            let (_, child_bash) = thread
+                .tool_call(&acp_v2::ToolCallId::new("child-bash"))
+                .expect("the subagent's tool call shows in the parent");
+            assert_eq!(
+                child_bash
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.get("claudeCode")?.get("parentToolUseId")?.as_str()),
+                Some("launch")
+            );
+            let (_, bash) = thread
+                .tool_call(&acp_v2::ToolCallId::new("bash"))
+                .expect("the background command");
+            assert!(matches!(
+                bash.status(),
+                acp_thread::ToolCallStatus::Completed
+            ));
+            assert!(
+                bash.terminals()
+                    .any(|terminal| terminal.read(cx).output().is_none()),
+                "the command's terminal runs on after its tool call completed"
+            );
+        });
+
+        thread.update(cx, |thread, cx| thread.stop_subagent(&launch_id, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            *cancelled_sessions
+                .lock()
+                .expect("cancelled sessions lock should not be poisoned"),
+            vec![acp::SessionId::new("child")],
+        );
+
+        for (session_id, update) in [
+            (
+                "parent",
+                serde_json::json!({
+                    "sessionUpdate": "session_message",
+                    "messageId": "reply",
+                    "senderSessionId": "child",
+                    "recipientSessionId": "parent",
+                    "content": [{ "type": "text", "text": "done" }],
+                    "senderMessageId": "reply",
+                }),
+            ),
+            (
+                "parent",
+                serde_json::json!({
+                    "sessionUpdate": "subagent_update",
+                    "sessionId": "child",
+                    "state": { "state": "idle", "stopReason": "end_turn" },
+                }),
+            ),
+            (
+                "parent",
+                serde_json::json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "bash",
+                    "_meta": {
+                        "terminal_exit": { "terminal_id": "bash", "exit_code": null, "signal": null },
+                    },
+                }),
+            ),
+        ] {
+            send_session_update(&agent, session_id, update);
+        }
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            let (_, launch) = thread.tool_call(&launch_id).expect("the launch");
+            assert!(matches!(
+                launch.status(),
+                acp_thread::ToolCallStatus::Completed
+            ));
+            assert!(
+                launch.to_markdown(cx).contains("done"),
+                "the launch shows the subagent's reply"
+            );
+            assert!(!thread.is_subagent_running(&launch_id));
+            let (_, bash) = thread
+                .tool_call(&acp_v2::ToolCallId::new("bash"))
+                .expect("the background command");
+            assert!(
+                bash.terminals()
+                    .all(|terminal| terminal.read(cx).output().is_some()),
+                "the command's terminal exits with its task"
+            );
+        });
+    }
+
     #[gpui::test]
     async fn test_stopping_a_subagent_cancels_only_its_session(cx: &mut gpui::TestAppContext) {
         let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
@@ -10052,7 +10273,24 @@ fn handle_subagent_notification(message: UntypedMessage, cx: &mut AsyncApp, ctx:
             let cancellable = update
                 .get("capabilities")
                 .map(|capabilities| capabilities.get("cancel").is_some());
-            record_subagent_update(ctx, session_id, subagent_id, cancellable, running, cx);
+            let display_field = |name: &str| match update.get(name) {
+                None => MaybeUndefined::Undefined,
+                Some(serde_json::Value::String(value)) => MaybeUndefined::Value(value.clone()),
+                Some(_) => MaybeUndefined::Null,
+            };
+            let display = SubagentDisplay {
+                title: display_field("title"),
+                description: display_field("description"),
+            };
+            record_subagent_update(
+                ctx,
+                session_id,
+                subagent_id,
+                display,
+                cancellable,
+                running,
+                cx,
+            );
         }
         // The message that launched or resumed a subagent. Its id is the tool
         // call that sent it, unless the agent did not know that call.
@@ -10061,7 +10299,33 @@ fn handle_subagent_notification(message: UntypedMessage, cx: &mut AsyncApp, ctx:
             else {
                 return;
             };
-            link_session_message(ctx, &session_id, message_id, cx);
+            let session_field = |name: &str| {
+                update
+                    .get(name)
+                    .and_then(serde_json::Value::as_str)
+                    .map(acp_v2::SessionId::new)
+            };
+            let text = update
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|content| {
+                    message_text(content.iter().filter_map(|block| {
+                        if block.get("type")?.as_str()? == "text" {
+                            block.get("text")?.as_str()
+                        } else {
+                            None
+                        }
+                    }))
+                });
+            handle_session_message(
+                ctx,
+                &session_id,
+                message_id,
+                session_field("senderSessionId").as_ref(),
+                session_field("recipientSessionId").as_ref(),
+                text,
+                cx,
+            );
         }
         _ => {}
     }

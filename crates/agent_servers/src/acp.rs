@@ -263,6 +263,13 @@ struct SubagentSession {
     /// Whether the agent stops the subagent alone when it gets the
     /// subagent's session in `session/cancel`.
     cancellable: bool,
+    /// The parent's display title for the subagent, from its announcement.
+    title: Option<String>,
+    /// The parent's description of the subagent's role.
+    description: Option<String>,
+    /// The tool calls that Zed shows for the messages that launched or resumed
+    /// the subagent, for an agent that reports no tool call of its own for them.
+    synthesized_tool_calls: HashSet<acp_v2::ToolCallId>,
 }
 
 fn dispatch_queue_closed_error() -> acp::Error {
@@ -766,6 +773,7 @@ fn record_subagent_update(
     ctx: &ClientContext,
     parent_session_id: acp_v2::SessionId,
     subagent_id: acp_v2::SessionId,
+    display: SubagentDisplay,
     cancellable: Option<bool>,
     running: Option<bool>,
     cx: &mut AsyncApp,
@@ -782,7 +790,12 @@ fn record_subagent_update(
                 tool_call_id: None,
                 running: false,
                 cancellable: false,
+                title: None,
+                description: None,
+                synthesized_tool_calls: HashSet::default(),
             });
+        display.title.update_to(&mut subagent.title);
+        display.description.update_to(&mut subagent.description);
         if let Some(cancellable) = cancellable {
             subagent.cancellable = cancellable;
         }
@@ -796,19 +809,170 @@ fn record_subagent_update(
     }
 }
 
-/// A `session_message` in `session_id`'s transcript. In a subagent's
-/// transcript, the message that launched or resumed it, whose id is the tool
-/// call that sent it, unless the agent did not know that call.
-fn link_session_message(
+/// The display metadata of a `subagent_update`, as patches: undefined leaves
+/// the stored value, `null` clears it.
+#[derive(Default)]
+struct SubagentDisplay {
+    title: MaybeUndefined<String>,
+    description: MaybeUndefined<String>,
+}
+
+/// A `session_message` in `session_id`'s transcript, sent by
+/// `sender_session_id` to `recipient_session_id`.
+///
+/// In a subagent's transcript, the message that launched or resumed it, whose
+/// id is the tool call that sent it, unless the agent did not know that call.
+/// In the parent's transcript, the same message, for which Zed shows a tool
+/// call when the agent reports none (Claude Code reports a subagent only as a
+/// session to a client that supports subagents), or the subagent's reply,
+/// which that tool call then shows.
+fn handle_session_message(
     ctx: &ClientContext,
     session_id: &acp_v2::SessionId,
     message_id: &str,
+    sender_session_id: Option<&acp_v2::SessionId>,
+    recipient_session_id: Option<&acp_v2::SessionId>,
+    text: Option<String>,
     cx: &mut AsyncApp,
 ) {
     if message_id.starts_with(&format!("{session_id}:")) {
         return;
     }
-    link_subagent_tool_call(ctx, session_id, acp_v2::ToolCallId::new(message_id), cx);
+    let is_subagent_of_this_session = |other: Option<&acp_v2::SessionId>| {
+        other.is_some_and(|other| {
+            other != session_id
+                && ctx
+                    .subagents
+                    .borrow()
+                    .get(other)
+                    .is_some_and(|subagent| &subagent.parent_session_id == session_id)
+        })
+    };
+    let sent_here = sender_session_id.is_none_or(|sender| sender == session_id);
+    if ctx.subagents.borrow().contains_key(session_id) {
+        if sent_here {
+            // The subagent's own message to its parent; the parent's copy shows it.
+            return;
+        }
+        link_subagent_tool_call(ctx, session_id, acp_v2::ToolCallId::new(message_id), cx);
+    } else if sent_here && is_subagent_of_this_session(recipient_session_id) {
+        if let Some(subagent_id) = recipient_session_id {
+            show_subagent_launch(
+                ctx,
+                subagent_id,
+                acp_v2::ToolCallId::new(message_id),
+                text,
+                cx,
+            );
+        }
+    } else if recipient_session_id.is_none_or(|recipient| recipient == session_id)
+        && is_subagent_of_this_session(sender_session_id)
+        && let (Some(subagent_id), Some(text)) = (sender_session_id, text)
+    {
+        show_subagent_reply(ctx, subagent_id, text, cx);
+    }
+}
+
+/// Shows a tool call for the message `tool_call_id` that launched or resumed
+/// the subagent of `subagent_id`, unless the agent reported one.
+fn show_subagent_launch(
+    ctx: &ClientContext,
+    subagent_id: &acp_v2::SessionId,
+    tool_call_id: acp_v2::ToolCallId,
+    prompt: Option<String>,
+    cx: &mut AsyncApp,
+) {
+    let Ok(thread) = session_thread(ctx, subagent_id) else {
+        return;
+    };
+    let Some((title, description, running)) =
+        ctx.subagents.borrow().get(subagent_id).map(|subagent| {
+            (
+                subagent.title.clone(),
+                subagent.description.clone(),
+                subagent.running,
+            )
+        })
+    else {
+        return;
+    };
+    let reported = thread
+        .read_with(cx, |thread, _| thread.tool_call(&tool_call_id).is_some())
+        .unwrap_or(true);
+    if reported {
+        return;
+    }
+    let title = title
+        .or_else(|| description.clone())
+        .unwrap_or_else(|| "Subagent".to_owned());
+    let mut raw_input = serde_json::Map::new();
+    if let Some(description) = description {
+        raw_input.insert("subagent_type".into(), description.into());
+    }
+    if let Some(prompt) = prompt {
+        raw_input.insert("prompt".into(), prompt.into());
+    }
+    let update = acp_v2::ToolCallUpdate::new(tool_call_id.clone())
+        .name("Agent".to_owned())
+        .title(title)
+        .kind(acp_v2::ToolKind::Think)
+        .status(subagent_tool_call_status(running))
+        .raw_input(serde_json::Value::Object(raw_input))
+        .meta(acp_v2::Meta::from_iter([(
+            "claudeCode".to_owned(),
+            serde_json::json!({ "toolName": "Agent" }),
+        )]));
+    let shown = thread
+        .update(cx, |thread, cx| thread.upsert_local_tool_call(update, cx))
+        .and_then(|result| result);
+    if shown.log_err().is_none() {
+        return;
+    }
+    if let Some(subagent) = ctx.subagents.borrow_mut().get_mut(subagent_id) {
+        subagent.synthesized_tool_calls.insert(tool_call_id);
+    }
+}
+
+/// Shows the reply of the subagent of `subagent_id` in the tool call that Zed
+/// shows for its work.
+fn show_subagent_reply(
+    ctx: &ClientContext,
+    subagent_id: &acp_v2::SessionId,
+    reply: String,
+    cx: &mut AsyncApp,
+) {
+    let tool_call_id = ctx
+        .subagents
+        .borrow()
+        .get(subagent_id)
+        .and_then(|subagent| {
+            subagent
+                .tool_call_id
+                .clone()
+                .filter(|tool_call_id| subagent.synthesized_tool_calls.contains(tool_call_id))
+        });
+    let (Some(tool_call_id), Ok(thread)) = (tool_call_id, session_thread(ctx, subagent_id)) else {
+        return;
+    };
+    let update = acp_v2::ToolCallUpdate::new(tool_call_id).content(vec![reply.into()]);
+    thread
+        .update(cx, |thread, cx| thread.upsert_local_tool_call(update, cx))
+        .and_then(|result| result)
+        .log_err();
+}
+
+fn subagent_tool_call_status(running: bool) -> acp_v2::ToolCallStatus {
+    if running {
+        acp_v2::ToolCallStatus::InProgress
+    } else {
+        acp_v2::ToolCallStatus::Completed
+    }
+}
+
+/// The text of a message's text blocks.
+fn message_text<'a>(texts: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let text = texts.into_iter().collect::<Vec<_>>().join("\n\n");
+    (!text.is_empty()).then_some(text)
 }
 
 /// Makes `tool_call_id` the tool call whose work the subagent of
@@ -850,8 +1014,18 @@ fn set_subagent_running(
     let Ok(thread) = session_thread(ctx, subagent_id) else {
         return;
     };
+    let synthesized = ctx
+        .subagents
+        .borrow()
+        .get(subagent_id)
+        .is_some_and(|subagent| subagent.synthesized_tool_calls.contains(&tool_call_id));
     thread
         .update(cx, |thread, cx| {
+            if synthesized {
+                let update = acp_v2::ToolCallUpdate::new(tool_call_id.clone())
+                    .status(subagent_tool_call_status(running));
+                thread.upsert_local_tool_call(update, cx).log_err();
+            }
             thread.set_subagent_running(tool_call_id, running, cx)
         })
         .ok();
@@ -1042,10 +1216,15 @@ fn handle_v2_session_notification(
                 MaybeUndefined::Null => Some(false),
                 MaybeUndefined::Value(capabilities) => Some(capabilities.cancel.is_some()),
             };
+            let display = SubagentDisplay {
+                title: update.title.clone(),
+                description: update.description.clone(),
+            };
             record_subagent_update(
                 context,
                 notification.session_id.clone(),
                 update.session_id.clone(),
+                display,
                 cancellable,
                 running,
                 cx,
@@ -1053,7 +1232,24 @@ fn handle_v2_session_notification(
             return;
         }
         InboundSessionUpdate::SessionMessage(message) => {
-            link_session_message(context, &notification.session_id, &message.message_id.0, cx);
+            let text = match &message.content {
+                MaybeUndefined::Value(content) => {
+                    message_text(content.iter().filter_map(|block| match block {
+                        acp_v2::ContentBlock::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    }))
+                }
+                _ => None,
+            };
+            handle_session_message(
+                context,
+                &notification.session_id,
+                &message.message_id.0,
+                message.sender_session_id.as_ref(),
+                message.recipient_session_id.as_ref(),
+                text,
+                cx,
+            );
             return;
         }
         InboundSessionUpdate::SessionMessageChunk => return,
