@@ -4143,6 +4143,7 @@ impl GitStore {
         let search_args = SearchCommitArgs {
             query: SharedString::from(envelope.payload.query),
             case_sensitive: envelope.payload.case_sensitive,
+            ignore_mailmap: false,
         };
 
         let (request_tx, request_rx) = async_channel::unbounded();
