@@ -4733,7 +4733,7 @@ impl ThreadView {
                 }
                 let terminal = tool_call
                     .terminals()
-                    .find(|terminal| terminal.read(cx).output().is_none())?;
+                    .find(|terminal| thread.is_terminal_running(terminal, cx))?;
                 let command = tool_call
                     .label
                     .read(cx)

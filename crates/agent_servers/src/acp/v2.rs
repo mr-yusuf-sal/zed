@@ -7694,4 +7694,67 @@ done
             assert!(!thread.can_cancel_terminal(&bash));
         });
     }
+
+    /// A session loaded again replays a command that went to the background
+    /// as it was when its tool call returned: exited. The agent then lists its
+    /// terminal as background work, and the thread counts it as running.
+    #[gpui::test]
+    async fn v2_replayed_background_terminal_counts_while_listed(cx: &mut TestAppContext) {
+        let harness = SessionHarness::new(session_capabilities(), vec![], vec![], cx).await;
+        let thread = harness.thread(cx).await;
+        for update in [
+            json!({ "sessionUpdate": "terminal_update", "terminalId": "bash", "command": "ping" }),
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "bash",
+                "name": "Bash",
+                "title": "ping",
+                "kind": "execute",
+                "status": "completed",
+                "content": [{ "type": "terminal", "terminalId": "bash" }],
+            }),
+            json!({
+                "sessionUpdate": "terminal_update",
+                "terminalId": "bash",
+                "exitStatus": { "exitCode": 0 },
+            }),
+        ] {
+            harness.send_raw_update("session", update);
+        }
+        harness.drain_updates(cx).await;
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert!(
+                !thread.has_background_work(cx),
+                "the replay shows it exited"
+            );
+        });
+
+        harness.send_raw_update(
+            "session",
+            json!({
+                "sessionUpdate": "state_update",
+                "state": "idle",
+                "background": [{ "type": "terminal", "terminalId": "bash" }],
+            }),
+        );
+        harness.drain_updates(cx).await;
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert!(
+                thread.has_background_work(cx),
+                "the agent lists the command as running"
+            );
+        });
+
+        harness.send_raw_update(
+            "session",
+            json!({ "sessionUpdate": "state_update", "state": "idle", "background": [] }),
+        );
+        harness.drain_updates(cx).await;
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert!(!thread.has_background_work(cx));
+        });
+    }
 }

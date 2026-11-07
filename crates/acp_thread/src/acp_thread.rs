@@ -4054,8 +4054,17 @@ impl AcpThread {
                 matches!(tool_call.status(), ToolCallStatus::Completed)
                     && tool_call
                         .terminals()
-                        .any(|terminal| terminal.read(cx).output().is_none())
+                        .any(|terminal| self.is_terminal_running(terminal, cx))
             })
+    }
+
+    /// Whether the command of `terminal` still runs: its terminal has not
+    /// exited, or the agent lists it as background work it can stop. A
+    /// session loaded again replays a command that went to the background as
+    /// it was when its tool call returned, exited, though it runs on.
+    pub fn is_terminal_running(&self, terminal: &Entity<Terminal>, cx: &App) -> bool {
+        let terminal = terminal.read(cx);
+        terminal.output().is_none() || self.can_cancel_terminal(terminal.id())
     }
 
     pub fn notices(&self) -> &[(usize, acp_v2::Notice)] {
