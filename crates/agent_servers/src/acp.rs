@@ -928,36 +928,56 @@ fn handle_session_message(
         })
     };
     let sent_here = sender_session_id.is_none_or(|sender| sender == session_id);
-    if ctx.subagents.borrow().contains_key(session_id) {
-        if sent_here {
-            // The subagent's own message to its parent; the parent's copy shows it.
-            return;
-        }
-        link_subagent_tool_call(ctx, session_id, acp_v2::ToolCallId::new(message_id), cx);
-    } else if sent_here && is_subagent_of_this_session(recipient_session_id) {
+    let received_here = recipient_session_id.is_none_or(|recipient| recipient == session_id);
+    // When this session is itself a subagent: its parent, and the tool call
+    // whose work it does, under which its own subagents show.
+    let (parent_session_id, launched_by) = ctx
+        .subagents
+        .borrow()
+        .get(session_id)
+        .map(|subagent| {
+            (
+                Some(subagent.parent_session_id.clone()),
+                subagent.tool_call_id.clone(),
+            )
+        })
+        .unwrap_or_default();
+    if sent_here && is_subagent_of_this_session(recipient_session_id) {
+        // This session launched or resumed a subagent of its own.
         if let Some(subagent_id) = recipient_session_id {
             show_subagent_launch(
                 ctx,
                 subagent_id,
                 acp_v2::ToolCallId::new(message_id),
+                launched_by,
                 text,
                 cx,
             );
         }
-    } else if recipient_session_id.is_none_or(|recipient| recipient == session_id)
-        && is_subagent_of_this_session(sender_session_id)
-        && let (Some(subagent_id), Some(text)) = (sender_session_id, text)
+    } else if received_here && is_subagent_of_this_session(sender_session_id) {
+        // A subagent of this session replied.
+        if let (Some(subagent_id), Some(text)) = (sender_session_id, text) {
+            show_subagent_reply(ctx, subagent_id, text, cx);
+        }
+    } else if let Some(parent_session_id) = parent_session_id
+        && sender_session_id.is_none_or(|sender| sender == &parent_session_id)
+        && !sent_here
     {
-        show_subagent_reply(ctx, subagent_id, text, cx);
+        // This subagent's parent launched or resumed it. Its own messages to
+        // its parent show from the parent's copy.
+        link_subagent_tool_call(ctx, session_id, acp_v2::ToolCallId::new(message_id), cx);
     }
 }
 
 /// Shows a tool call for the message `tool_call_id` that launched or resumed
-/// the subagent of `subagent_id`, unless the agent reported one.
+/// the subagent of `subagent_id`, unless the agent reported one. A subagent
+/// launched by another subagent shows under `launched_by`, the tool call
+/// whose work the launching subagent does.
 fn show_subagent_launch(
     ctx: &ClientContext,
     subagent_id: &acp_v2::SessionId,
     tool_call_id: acp_v2::ToolCallId,
+    launched_by: Option<acp_v2::ToolCallId>,
     prompt: Option<String>,
     cx: &mut AsyncApp,
 ) {
@@ -991,6 +1011,10 @@ fn show_subagent_launch(
     if let Some(prompt) = prompt {
         raw_input.insert("prompt".into(), prompt.into());
     }
+    let mut claude_code = serde_json::json!({ "toolName": "Agent" });
+    if let Some(launched_by) = launched_by {
+        claude_code["parentToolUseId"] = launched_by.0.to_string().into();
+    }
     let update = acp_v2::ToolCallUpdate::new(tool_call_id.clone())
         .name("Agent".to_owned())
         .title(title)
@@ -999,7 +1023,7 @@ fn show_subagent_launch(
         .raw_input(serde_json::Value::Object(raw_input))
         .meta(acp_v2::Meta::from_iter([(
             "claudeCode".to_owned(),
-            serde_json::json!({ "toolName": "Agent" }),
+            claude_code,
         )]));
     let shown = thread
         .update(cx, |thread, cx| thread.upsert_local_tool_call(update, cx))

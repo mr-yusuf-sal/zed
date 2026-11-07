@@ -348,6 +348,36 @@ fn subagent_parent_tool_call_id(tool_call: &ToolCall) -> Option<acp_v2::ToolCall
     Some(acp_v2::ToolCallId::new(parent_id))
 }
 
+/// The running work of a thread, for the running work menu.
+#[derive(Clone, Default)]
+struct RunningWork {
+    /// Each running subagent, followed by what it runs, depth first.
+    subagents: Vec<RunningWorkRow>,
+    /// The commands that run in the background for the thread itself.
+    processes: Vec<RunningWorkRow>,
+    subagent_count: usize,
+    process_count: usize,
+}
+
+#[derive(Clone)]
+struct RunningWorkRow {
+    entry_ix: usize,
+    /// How deep in the tree of subagents the row is: 0 at the top.
+    depth: usize,
+    label: SharedString,
+    kind: RunningWorkKind,
+}
+
+#[derive(Clone)]
+enum RunningWorkKind {
+    /// With the tool call to stop it by, when the agent can stop it alone.
+    Subagent { stop: Option<acp_v2::ToolCallId> },
+    /// With its terminal, when the agent can stop the command.
+    Process { stop: Option<acp_v2::TerminalId> },
+    /// A tool call of a subagent that still runs.
+    ToolCall,
+}
+
 /// Whether `tool_call` is Claude Code's Agent (formerly Task) tool, which
 /// runs a subagent.
 fn launches_claude_code_subagent(tool_call: &ToolCall) -> bool {
@@ -4710,70 +4740,35 @@ impl ThreadView {
             .into_any_element()
     }
 
-    /// Commands that outlived their tool call. An agent that backgrounds a
-    /// command (Claude Code's `run_in_background`) completes the tool call as
-    /// soon as the command detaches, but keeps its terminal open until the
-    /// command itself exits. Each comes with its terminal, when the agent can
-    /// stop the command.
-    fn background_processes(
-        &self,
-        cx: &App,
-    ) -> Vec<(usize, SharedString, Instant, Option<acp_v2::TerminalId>)> {
-        let thread = self.thread.read(cx);
-        thread
-            .entries()
-            .iter()
-            .enumerate()
-            .filter_map(|(entry_ix, entry)| {
-                let AgentThreadEntry::ToolCall(tool_call) = entry else {
-                    return None;
-                };
-                if !matches!(tool_call.status(), ToolCallStatus::Completed) {
-                    return None;
-                }
-                let terminal = tool_call
-                    .terminals()
-                    .find(|terminal| thread.is_terminal_running(terminal, cx))?;
-                let command = tool_call
-                    .label
-                    .read(cx)
-                    .source()
-                    .replace('`', "")
-                    .split_whitespace()
-                    .join(" ");
-                let terminal_id = terminal.read(cx).id().clone();
-                let stoppable_terminal_id = thread
-                    .can_cancel_terminal(&terminal_id)
-                    .then_some(terminal_id);
-                Some((
-                    entry_ix,
-                    command.into(),
-                    terminal.read(cx).started_at(),
-                    stoppable_terminal_id,
-                ))
-            })
-            .collect()
-    }
-
-    /// Subagent launches still running, with how many tool calls each has
-    /// made, and the tool call to stop each by when the agent can stop it alone.
-    fn running_subagents(
-        &self,
-        cx: &App,
-    ) -> Vec<(usize, SharedString, usize, Option<acp_v2::ToolCallId>)> {
+    /// The work going on in the thread beyond the turn's own tool calls, as
+    /// a tree: running subagents, each with what it runs now (its tool calls,
+    /// its commands in the background, the subagents it launched), then the
+    /// commands that run in the background for the thread itself.
+    ///
+    /// A subagent counts while the agent reports it working, whatever its
+    /// launch's status: one launched in the background completes its launch
+    /// at once, and one resumed by a message works for the tool call that sent
+    /// it. A command counts while its tool call completed and its terminal
+    /// runs on: an agent that backgrounds a command (Claude Code's
+    /// `run_in_background`) completes the tool call as soon as it detaches.
+    fn running_work(&self, cx: &App) -> RunningWork {
         let thread = self.thread.read(cx);
         let entries = thread.entries();
-        entries
+        let tool_calls = entries
             .iter()
             .enumerate()
-            .filter_map(|(entry_ix, entry)| {
-                let AgentThreadEntry::ToolCall(tool_call) = entry else {
-                    return None;
-                };
-                // A subagent the agent reports as working counts whatever its
-                // tool call's status: one launched in the background completes
-                // its tool call at launch, and one resumed by a message works
-                // for the tool call that sent the message.
+            .filter_map(|(entry_ix, entry)| match entry {
+                AgentThreadEntry::ToolCall(tool_call) => Some((entry_ix, tool_call)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let parents = tool_calls
+            .iter()
+            .map(|(_, tool_call)| self.subagent_parent_id(tool_call))
+            .collect::<Vec<_>>();
+        let running_subagents = tool_calls
+            .iter()
+            .filter(|(_, tool_call)| {
                 let launch_running = (tool_call.is_subagent()
                     || launches_claude_code_subagent(tool_call))
                     && matches!(
@@ -4782,50 +4777,135 @@ impl ThreadView {
                             | ToolCallStatus::InProgress
                             | ToolCallStatus::WaitingForConfirmation
                     );
-                if (!launch_running && !thread.is_subagent_running(&tool_call.id))
-                    || thread.is_subagent_stopping(&tool_call.id)
-                {
-                    return None;
-                }
-                let label = tool_call
-                    .label
-                    .read(cx)
-                    .source()
-                    .replace('`', "")
-                    .split_whitespace()
-                    .join(" ");
-                let tool_call_count = entries
-                    .iter()
-                    .filter(|entry| {
-                        matches!(entry, AgentThreadEntry::ToolCall(child)
-                            if self.subagent_parent_id(child).as_ref() == Some(&tool_call.id))
-                    })
-                    .count();
-                let stoppable_tool_call_id = thread
-                    .can_stop_subagent(&tool_call.id)
-                    .then(|| tool_call.id.clone());
-                Some((
-                    entry_ix,
-                    label.into(),
-                    tool_call_count,
-                    stoppable_tool_call_id,
-                ))
+                (launch_running || thread.is_subagent_running(&tool_call.id))
+                    && !thread.is_subagent_stopping(&tool_call.id)
             })
-            .collect()
+            .map(|(_, tool_call)| tool_call.id.clone())
+            .collect::<HashSet<_>>();
+
+        let label_of = |tool_call: &ToolCall| -> String {
+            tool_call
+                .label
+                .read(cx)
+                .source()
+                .replace('`', "")
+                .split_whitespace()
+                .join(" ")
+        };
+        let process_row = |entry_ix: usize, tool_call: &ToolCall, depth: usize| {
+            if !matches!(tool_call.status(), ToolCallStatus::Completed) {
+                return None;
+            }
+            let terminal = tool_call
+                .terminals()
+                .find(|terminal| thread.is_terminal_running(terminal, cx))?;
+            let terminal_id = terminal.read(cx).id().clone();
+            let label = format!(
+                "{} · {}",
+                label_of(tool_call),
+                util::time::duration_alt_display(terminal.read(cx).started_at().elapsed())
+            );
+            Some(RunningWorkRow {
+                entry_ix,
+                depth,
+                label: label.into(),
+                kind: RunningWorkKind::Process {
+                    stop: thread
+                        .can_cancel_terminal(&terminal_id)
+                        .then_some(terminal_id),
+                },
+            })
+        };
+
+        let mut work = RunningWork::default();
+        // Depth first from each subagent whose launcher is no running subagent.
+        let mut stack = tool_calls
+            .iter()
+            .zip(&parents)
+            .rev()
+            .filter(|((_, tool_call), parent)| {
+                running_subagents.contains(&tool_call.id)
+                    && !parent
+                        .as_ref()
+                        .is_some_and(|parent| running_subagents.contains(parent))
+            })
+            .map(|((entry_ix, tool_call), _)| (*entry_ix, *tool_call, 0))
+            .collect::<Vec<_>>();
+        while let Some((entry_ix, launch, depth)) = stack.pop() {
+            let children = tool_calls
+                .iter()
+                .zip(&parents)
+                .filter(|(_, parent)| parent.as_ref() == Some(&launch.id))
+                .map(|((entry_ix, tool_call), _)| (*entry_ix, *tool_call))
+                .collect::<Vec<_>>();
+            let label = format!(
+                "{} · {} {}",
+                label_of(launch),
+                children.len(),
+                pluralize("tool call", children.len())
+            );
+            work.subagents.push(RunningWorkRow {
+                entry_ix,
+                depth,
+                label: label.into(),
+                kind: RunningWorkKind::Subagent {
+                    stop: thread
+                        .can_stop_subagent(&launch.id)
+                        .then(|| launch.id.clone()),
+                },
+            });
+            work.subagent_count += 1;
+            let mut nested = Vec::new();
+            for (child_ix, child) in children {
+                if running_subagents.contains(&child.id) {
+                    nested.push((child_ix, child, depth + 1));
+                } else if let Some(row) = process_row(child_ix, child, depth + 1) {
+                    work.process_count += 1;
+                    work.subagents.push(row);
+                } else if matches!(
+                    child.status(),
+                    ToolCallStatus::Pending
+                        | ToolCallStatus::InProgress
+                        | ToolCallStatus::WaitingForConfirmation
+                ) {
+                    work.subagents.push(RunningWorkRow {
+                        entry_ix: child_ix,
+                        depth: depth + 1,
+                        label: label_of(child).into(),
+                        kind: RunningWorkKind::ToolCall,
+                    });
+                }
+            }
+            stack.extend(nested.into_iter().rev());
+        }
+
+        // The thread's own commands, and those of subagents no longer running.
+        for ((entry_ix, tool_call), parent) in tool_calls.iter().zip(&parents) {
+            if parent
+                .as_ref()
+                .is_some_and(|parent| running_subagents.contains(parent))
+            {
+                continue;
+            }
+            if let Some(row) = process_row(*entry_ix, tool_call, 0) {
+                work.process_count += 1;
+                work.processes.push(row);
+            }
+        }
+        work
     }
 
     /// A count of running subagents and background processes next to the
-    /// context usage ring, opening a list of them that scrolls to each.
+    /// context usage ring, opening a tree of them that scrolls to each.
     fn render_running_work(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let subagents = self.running_subagents(cx);
-        let processes = self.background_processes(cx);
-        if subagents.is_empty() && processes.is_empty() {
+        let work = self.running_work(cx);
+        if work.subagent_count == 0 && work.process_count == 0 {
             return None;
         }
 
         // Both full counts side by side are too wide for the toolbar and wrap
         // it, so they are abbreviated when both are shown.
-        let counts = match (subagents.len(), processes.len()) {
+        let counts = match (work.subagent_count, work.process_count) {
             (0, process_count) => format!("{process_count} background"),
             (subagent_count, 0) => {
                 format!("{subagent_count} {}", pluralize("subagent", subagent_count))
@@ -4834,7 +4914,7 @@ impl ThreadView {
                 format!("{subagent_count} sub · {process_count} bg")
             }
         };
-        let trigger_icon = if subagents.is_empty() {
+        let trigger_icon = if work.subagent_count == 0 {
             IconName::ToolTerminal
         } else {
             IconName::Thread
@@ -4857,91 +4937,83 @@ impl ThreadView {
                 )
                 .anchor(gpui::Anchor::BottomRight)
                 .menu(move |window, cx| {
-                    let subagents = subagents.clone();
-                    let processes = processes.clone();
+                    let work = work.clone();
                     let this = this.clone();
                     let thread = thread.clone();
                     Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                         // An entry's end slot is only shown when the menu has
                         // an end slot action.
                         menu = menu.end_slot_action(Box::new(menu::EndSlot));
-                        let scroll_to = |entry_ix: usize| {
+                        let entry = |row: &RunningWorkRow| {
                             let this = this.clone();
-                            move |_: &mut Window, cx: &mut App| {
-                                this.update(cx, |this, cx| {
-                                    this.list_state.scroll_to(ListOffset {
-                                        item_ix: entry_ix,
-                                        offset_in_item: px(0.),
-                                    });
-                                    cx.notify();
-                                })
-                                .log_err();
+                            let entry_ix = row.entry_ix;
+                            // The menu has no indentation of its own, so the
+                            // tree is drawn in the label.
+                            let label = match row.depth {
+                                0 => row.label.to_string(),
+                                depth => format!("{}└ {}", "    ".repeat(depth - 1), row.label),
+                            };
+                            let icon = match row.kind {
+                                RunningWorkKind::Subagent { .. } => IconName::Thread,
+                                RunningWorkKind::Process { .. } => IconName::ToolTerminal,
+                                RunningWorkKind::ToolCall => IconName::ToolHammer,
+                            };
+                            let entry = ContextMenuEntry::new(label)
+                                .icon(icon)
+                                .icon_color(Color::Muted)
+                                .handler(move |_, cx| {
+                                    this.update(cx, |this, cx| {
+                                        this.list_state.scroll_to(ListOffset {
+                                            item_ix: entry_ix,
+                                            offset_in_item: px(0.),
+                                        });
+                                        cx.notify();
+                                    })
+                                    .log_err();
+                                });
+                            match &row.kind {
+                                RunningWorkKind::Subagent {
+                                    stop: Some(tool_call_id),
+                                } => entry.end_slot(IconName::Stop, "Stop Subagent", {
+                                    let thread = thread.clone();
+                                    let tool_call_id = tool_call_id.clone();
+                                    move |window, cx| {
+                                        thread.update(cx, |thread, cx| {
+                                            thread.stop_subagent(&tool_call_id, cx)
+                                        });
+                                        // An end slot leaves the menu open,
+                                        // unlike picking the entry.
+                                        window.dispatch_action(Box::new(menu::Cancel), cx);
+                                    }
+                                }),
+                                RunningWorkKind::Process {
+                                    stop: Some(terminal_id),
+                                } => entry.end_slot(IconName::Stop, "Stop Process", {
+                                    let thread = thread.clone();
+                                    let terminal_id = terminal_id.clone();
+                                    move |window, cx| {
+                                        thread.update(cx, |thread, cx| {
+                                            thread.cancel_terminal(&terminal_id, cx)
+                                        });
+                                        window.dispatch_action(Box::new(menu::Cancel), cx);
+                                    }
+                                }),
+                                _ => entry,
                             }
                         };
-                        if !subagents.is_empty() {
+                        if !work.subagents.is_empty() {
                             menu = menu.header("Subagents");
-                            for (entry_ix, label, tool_call_count, stoppable_tool_call_id) in
-                                &subagents
-                            {
-                                let label = format!(
-                                    "{label} · {tool_call_count} {}",
-                                    pluralize("tool call", *tool_call_count)
-                                );
-                                let entry = ContextMenuEntry::new(label)
-                                    .icon(IconName::Thread)
-                                    .icon_color(Color::Muted)
-                                    .handler(scroll_to(*entry_ix));
-                                let entry = match stoppable_tool_call_id {
-                                    Some(tool_call_id) => {
-                                        entry.end_slot(IconName::Stop, "Stop Subagent", {
-                                            let thread = thread.clone();
-                                            let tool_call_id = tool_call_id.clone();
-                                            move |window, cx| {
-                                                thread.update(cx, |thread, cx| {
-                                                    thread.stop_subagent(&tool_call_id, cx)
-                                                });
-                                                // An end slot leaves the menu open,
-                                                // unlike picking the entry.
-                                                window.dispatch_action(Box::new(menu::Cancel), cx);
-                                            }
-                                        })
-                                    }
-                                    None => entry,
-                                };
-                                menu = menu.item(entry);
+                            for row in &work.subagents {
+                                menu = menu.item(entry(row));
                             }
                         }
-                        if !processes.is_empty() {
-                            if !subagents.is_empty() {
+                        if !work.processes.is_empty() {
+                            if !work.subagents.is_empty() {
                                 menu = menu.separator();
                             }
                             menu = menu.header("Background Processes");
-                            for (entry_ix, command, started_at, stoppable_terminal_id) in &processes
-                            {
-                                let label = format!(
-                                    "{command} · {}",
-                                    util::time::duration_alt_display(started_at.elapsed())
-                                );
-                                let entry = ContextMenuEntry::new(label)
-                                    .icon(IconName::ToolTerminal)
-                                    .icon_color(Color::Muted)
-                                    .handler(scroll_to(*entry_ix));
-                                let entry = match stoppable_terminal_id {
-                                    Some(terminal_id) => {
-                                        entry.end_slot(IconName::Stop, "Stop Process", {
-                                            let thread = thread.clone();
-                                            let terminal_id = terminal_id.clone();
-                                            move |window, cx| {
-                                                thread.update(cx, |thread, cx| {
-                                                    thread.cancel_terminal(&terminal_id, cx)
-                                                });
-                                                window.dispatch_action(Box::new(menu::Cancel), cx);
-                                            }
-                                        })
-                                    }
-                                    None => entry,
-                                };
-                                menu = menu.item(entry);
+                            for row in &work.processes {
+                                menu = menu.item(entry(row));
                             }
                         }
                         menu

@@ -9225,6 +9225,119 @@ exit 7
         });
     }
 
+    /// A subagent that launches a subagent of its own: Zed shows the inner
+    /// launch under the outer one, and the inner subagent's reply ends up in
+    /// its own launch, not as a new launch of the outer subagent.
+    #[gpui::test]
+    async fn test_nested_subagents_show_under_their_launcher(cx: &mut gpui::TestAppContext) {
+        let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
+        let (connection, project, _, _, _, _, _keep_agent_alive) =
+            connect_fake_agent_with_handle(None, Some(agent_sender), cx).await;
+        let agent = agent_receiver.await.expect("receive fake agent handle");
+        let thread = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    acp_v2::SessionId::new("parent"),
+                    project.clone(),
+                    PathList::new(&[std::path::Path::new("/a")]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("session should load");
+
+        let announce = |parent: &str, child: &str, title: &str| {
+            (
+                parent.to_owned(),
+                serde_json::json!({
+                    "sessionUpdate": "subagent_update",
+                    "sessionId": child,
+                    "title": title,
+                    "state": { "state": "running" },
+                }),
+            )
+        };
+        let message = |transcript: &str, id: &str, sender: &str, recipient: &str, text: &str| {
+            (
+                transcript.to_owned(),
+                serde_json::json!({
+                    "sessionUpdate": "session_message",
+                    "messageId": id,
+                    "senderSessionId": sender,
+                    "recipientSessionId": recipient,
+                    "content": [{ "type": "text", "text": text }],
+                }),
+            )
+        };
+        for (session_id, update) in [
+            announce("parent", "outer", "Outer"),
+            message("parent", "outer-launch", "parent", "outer", "Go"),
+            message("outer", "outer-launch", "parent", "outer", "Go"),
+            announce("outer", "inner", "Inner"),
+            message("outer", "inner-launch", "outer", "inner", "Go deeper"),
+            message("inner", "inner-launch", "outer", "inner", "Go deeper"),
+            (
+                "inner".to_owned(),
+                serde_json::json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "inner-read",
+                    "title": "Read",
+                    "status": "in_progress",
+                }),
+            ),
+            message("outer", "inner-reply", "inner", "outer", "found it"),
+        ] {
+            send_session_update(&agent, &session_id, update);
+        }
+        cx.run_until_parked();
+
+        let parent_of = |thread: &AcpThread, id: &str| {
+            thread
+                .tool_call(&acp_v2::ToolCallId::new(id))
+                .and_then(|(_, tool_call)| {
+                    tool_call
+                        .meta
+                        .as_ref()?
+                        .get("claudeCode")?
+                        .get("parentToolUseId")?
+                        .as_str()
+                        .map(ToOwned::to_owned)
+                })
+        };
+        thread.read_with(cx, |thread, cx| {
+            assert!(
+                thread
+                    .tool_call(&acp_v2::ToolCallId::new("outer-launch"))
+                    .is_some()
+            );
+            assert_eq!(parent_of(thread, "outer-launch"), None);
+            assert_eq!(
+                parent_of(thread, "inner-launch").as_deref(),
+                Some("outer-launch"),
+                "the inner launch shows under the outer subagent"
+            );
+            assert_eq!(
+                parent_of(thread, "inner-read").as_deref(),
+                Some("inner-launch")
+            );
+            assert!(
+                thread
+                    .tool_call(&acp_v2::ToolCallId::new("inner-reply"))
+                    .is_none(),
+                "a reply is no launch"
+            );
+            assert!(
+                thread.is_subagent_running(&acp_v2::ToolCallId::new("outer-launch")),
+                "the reply leaves the outer subagent on its launch"
+            );
+            let (_, inner) = thread
+                .tool_call(&acp_v2::ToolCallId::new("inner-launch"))
+                .expect("the inner launch");
+            assert!(inner.to_markdown(cx).contains("found it"));
+        });
+    }
+
     #[gpui::test]
     async fn test_stopping_a_subagent_cancels_only_its_session(cx: &mut gpui::TestAppContext) {
         let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
