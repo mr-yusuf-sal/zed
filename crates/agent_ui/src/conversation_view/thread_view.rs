@@ -4713,10 +4713,14 @@ impl ThreadView {
     /// Commands that outlived their tool call. An agent that backgrounds a
     /// command (Claude Code's `run_in_background`) completes the tool call as
     /// soon as the command detaches, but keeps its terminal open until the
-    /// command itself exits.
-    fn background_processes(&self, cx: &App) -> Vec<(usize, SharedString, Instant)> {
-        self.thread
-            .read(cx)
+    /// command itself exits. Each comes with its terminal, when the agent can
+    /// stop the command.
+    fn background_processes(
+        &self,
+        cx: &App,
+    ) -> Vec<(usize, SharedString, Instant, Option<acp_v2::TerminalId>)> {
+        let thread = self.thread.read(cx);
+        thread
             .entries()
             .iter()
             .enumerate()
@@ -4737,7 +4741,16 @@ impl ThreadView {
                     .replace('`', "")
                     .split_whitespace()
                     .join(" ");
-                Some((entry_ix, command.into(), terminal.read(cx).started_at()))
+                let terminal_id = terminal.read(cx).id().clone();
+                let stoppable_terminal_id = thread
+                    .can_cancel_terminal(&terminal_id)
+                    .then_some(terminal_id);
+                Some((
+                    entry_ix,
+                    command.into(),
+                    terminal.read(cx).started_at(),
+                    stoppable_terminal_id,
+                ))
             })
             .collect()
     }
@@ -4903,17 +4916,32 @@ impl ThreadView {
                                 menu = menu.separator();
                             }
                             menu = menu.header("Background Processes");
-                            for (entry_ix, command, started_at) in &processes {
+                            for (entry_ix, command, started_at, stoppable_terminal_id) in &processes
+                            {
                                 let label = format!(
                                     "{command} · {}",
                                     util::time::duration_alt_display(started_at.elapsed())
                                 );
-                                menu = menu.item(
-                                    ContextMenuEntry::new(label)
-                                        .icon(IconName::ToolTerminal)
-                                        .icon_color(Color::Muted)
-                                        .handler(scroll_to(*entry_ix)),
-                                );
+                                let entry = ContextMenuEntry::new(label)
+                                    .icon(IconName::ToolTerminal)
+                                    .icon_color(Color::Muted)
+                                    .handler(scroll_to(*entry_ix));
+                                let entry = match stoppable_terminal_id {
+                                    Some(terminal_id) => {
+                                        entry.end_slot(IconName::Stop, "Stop Process", {
+                                            let thread = thread.clone();
+                                            let terminal_id = terminal_id.clone();
+                                            move |window, cx| {
+                                                thread.update(cx, |thread, cx| {
+                                                    thread.cancel_terminal(&terminal_id, cx)
+                                                });
+                                                window.dispatch_action(Box::new(menu::Cancel), cx);
+                                            }
+                                        })
+                                    }
+                                    None => entry,
+                                };
+                                menu = menu.item(entry);
                             }
                         }
                         menu

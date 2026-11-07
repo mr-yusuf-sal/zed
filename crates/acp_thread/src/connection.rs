@@ -268,6 +268,26 @@ pub trait AgentConnection {
     ) {
     }
 
+    /// Whether the agent can stop the command of `terminal_id`, which runs in
+    /// the background of `session_id` or of one of its subagents.
+    fn can_cancel_terminal(
+        &self,
+        _session_id: &acp_v2::SessionId,
+        _terminal_id: &acp_v2::TerminalId,
+    ) -> bool {
+        false
+    }
+
+    /// Asks the agent to stop the background command of `terminal_id`, when
+    /// [`Self::can_cancel_terminal`]. Its terminal exits once it stopped.
+    fn cancel_terminal(
+        &self,
+        _session_id: &acp_v2::SessionId,
+        _terminal_id: &acp_v2::TerminalId,
+        _cx: &mut App,
+    ) {
+    }
+
     /// Request-scoped elicitations are connection-level because they can arrive before a session
     /// thread exists. Session-scoped elicitations stay in the thread timeline, but use
     /// `ElicitationStore` for shared processing.

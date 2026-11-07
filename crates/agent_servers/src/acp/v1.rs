@@ -656,6 +656,7 @@ impl AcpConnection {
             active_request_scopes: None,
             pending_session_updates: None,
             subagents: subagents.clone(),
+            background_terminals: Rc::default(),
         };
         let (mut runtime, shutdown) = runtime::ClientRuntime::new(dispatch_context, cx);
         let dispatch_tx = runtime.sender();
@@ -2359,6 +2360,7 @@ pub mod test_support {
             active_request_scopes: None,
             pending_session_updates: None,
             subagents: subagents.clone(),
+            background_terminals: Rc::default(),
         };
         let dispatch_task = cx.spawn({
             let mut dispatch_rx = dispatch_rx;
@@ -7668,6 +7670,7 @@ exit 7
             active_request_scopes: None,
             pending_session_updates: None,
             subagents: subagents.clone(),
+            background_terminals: Rc::default(),
         };
         // `TestAppContext::spawn` hands out an `AsyncApp` by value, whereas the
         // production path uses `Context::spawn` which hands out `&mut AsyncApp`.
@@ -8053,6 +8056,7 @@ exit 7
             active_request_scopes: None,
             pending_session_updates: None,
             subagents: Rc::default(),
+            background_terminals: Rc::default(),
         };
         let (dispatch_tx, mut dispatch_rx) = mpsc::unbounded::<ForegroundWork>();
         let dispatch_task = cx.spawn(move |mut cx| async move {
@@ -8177,6 +8181,7 @@ exit 7
             active_request_scopes: None,
             pending_session_updates: None,
             subagents: Rc::default(),
+            background_terminals: Rc::default(),
         };
         let (sender, mut receiver) = mpsc::unbounded::<ForegroundWork>();
         let cleanup = settle_after_disconnect(sender.clone()).boxed().shared();

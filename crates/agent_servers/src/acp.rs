@@ -129,7 +129,10 @@ pub async fn connect(
     default_config_options: HashMap<String, settings::AgentConfigOptionValue>,
     cx: &mut AsyncApp,
 ) -> Result<Rc<dyn acp_thread::AgentConnection>> {
-    let negotiation_error = if cx.update(|cx| cx.has_flag::<AcpBetaFeatureFlag>()) {
+    // Claude Code reports and stops background work only over v2.
+    let negotiation_error = if agent_id.as_ref() == crate::custom::CLAUDE_AGENT_ID
+        || cx.update(|cx| cx.has_flag::<AcpBetaFeatureFlag>())
+    {
         match AcpV2Connection::stdio(
             agent_id.clone(),
             project.clone(),
@@ -248,6 +251,9 @@ struct ClientContext {
     // Legacy and ingress-only contexts do not track caller ownership of outgoing RPCs.
     active_request_scopes: Option<RefCell<HashSet<acp_v2::RequestId>>>,
     subagents: Rc<RefCell<HashMap<acp_v2::SessionId, SubagentSession>>>,
+    /// The terminals that each session lists as its background work, in the
+    /// `background` of its `state_update`s (ACP v2).
+    background_terminals: Rc<RefCell<HashMap<acp_v2::SessionId, HashSet<acp_v2::TerminalId>>>>,
 }
 
 /// A session that the agent runs a subagent in, as its `subagent_update`s
@@ -595,6 +601,78 @@ fn with_v2_session_notifications<Handler: HandleDispatchFrom<Agent>>(
     )
 }
 
+/// Reads the `background` list of each `state_update`, and of each
+/// `subagent_update` that mirrors a subagent's state, which the protocol crate
+/// does not model yet, and passes the update on.
+fn with_v2_background_work<Handler: HandleDispatchFrom<Agent>>(
+    builder: V2Builder<Client, Handler>,
+    dispatch_sender: mpsc::UnboundedSender<ForegroundWork>,
+) -> V2Builder<Client, impl HandleDispatchFrom<Agent>> {
+    builder.on_receive_notification(
+        async move |message: UntypedMessage, connection: V2ConnectionTo<Agent>| {
+            if acp_v2::UpdateSessionNotification::matches_method(message.method())
+                && let Some(work) = background_work(message.params())
+            {
+                enqueue_notification(&dispatch_sender, work, record_background_work);
+            }
+            Ok(Handled::No {
+                message: (message, connection),
+                retry: false,
+            })
+        },
+        agent_client_protocol::on_receive_notification!(),
+    )
+}
+
+/// The session whose background work `params`, a `session/update`, lists, and
+/// the terminals in that list.
+fn background_work(params: &serde_json::Value) -> Option<(acp_v2::SessionId, Vec<String>)> {
+    let update = params.get("update")?;
+    let (session_id, background) = match update.get("sessionUpdate")?.as_str()? {
+        "state_update" => (params.get("sessionId")?, update.get("background")?),
+        "subagent_update" => (
+            update.get("sessionId")?,
+            update.get("state")?.get("background")?,
+        ),
+        _ => return None,
+    };
+    let terminals = background
+        .as_array()?
+        .iter()
+        .filter(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("terminal"))
+        .filter_map(|item| item.get("terminalId")?.as_str().map(ToOwned::to_owned))
+        .collect();
+    Some((acp_v2::SessionId::new(session_id.as_str()?), terminals))
+}
+
+fn record_background_work(
+    (session_id, terminals): (acp_v2::SessionId, Vec<String>),
+    cx: &mut AsyncApp,
+    ctx: &ClientContext,
+) {
+    let terminals = terminals
+        .into_iter()
+        .map(acp_v2::TerminalId::new)
+        .collect::<HashSet<_>>();
+    let changed = {
+        let mut background_terminals = ctx.background_terminals.borrow_mut();
+        let previous = if terminals.is_empty() {
+            background_terminals.remove(&session_id)
+        } else {
+            background_terminals.insert(session_id.clone(), terminals.clone())
+        };
+        previous.unwrap_or_default() != terminals
+    };
+    if changed && let Ok(thread) = session_thread(ctx, &session_id) {
+        thread
+            .update(cx, |_, cx| {
+                cx.emit(acp_thread::AcpThreadEvent::StatusChanged);
+                cx.notify();
+            })
+            .ok();
+    }
+}
+
 fn with_v2_client_ingress<Handler: HandleDispatchFrom<Agent>>(
     builder: V2Builder<Client, Handler>,
     dispatch_sender: mpsc::UnboundedSender<ForegroundWork>,
@@ -610,6 +688,7 @@ fn with_v2_client_ingress<Handler: HandleDispatchFrom<Agent>>(
             Ok(())
         }
     };
+    let builder = with_v2_background_work(builder, dispatch_sender.clone());
     let builder = with_v2_terminal_notifications(builder, true, {
         let dispatch = dispatch.clone();
         move |notification, encoded_bytes| dispatch(notification.into(), encoded_bytes)

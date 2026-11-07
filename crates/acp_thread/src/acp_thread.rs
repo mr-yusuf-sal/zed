@@ -3993,6 +3993,16 @@ impl AcpThread {
             .can_stop_subagent(self.session_id(), tool_call_id)
     }
 
+    pub fn can_cancel_terminal(&self, terminal_id: &acp_v2::TerminalId) -> bool {
+        self.connection
+            .can_cancel_terminal(self.session_id(), terminal_id)
+    }
+
+    pub fn cancel_terminal(&mut self, terminal_id: &acp_v2::TerminalId, cx: &mut Context<Self>) {
+        self.connection
+            .cancel_terminal(self.session_id(), terminal_id, cx);
+    }
+
     pub fn is_subagent_stopping(&self, tool_call_id: &acp_v2::ToolCallId) -> bool {
         self.stopping_subagent_tool_calls.contains(tool_call_id)
     }

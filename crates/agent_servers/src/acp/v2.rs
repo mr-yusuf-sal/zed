@@ -3,8 +3,8 @@ use super::{
     ContextServerConfiguration, ForegroundWork, PendingSessionUpdates, SubagentSession,
     UnsupportedVersion, apply_v2_session_notification, cancellable_subagent,
     close_undelivered_session, drain_foreground_queue, enqueue_notification,
-    first_class_terminal_auth_task, map_acp_error, mcp_configurations_for_project, runtime,
-    transport, with_v2_client_ingress, work_dirs_from_session_info,
+    first_class_terminal_auth_task, map_acp_error, mcp_configurations_for_project,
+    root_subagent_session, runtime, transport, with_v2_client_ingress, work_dirs_from_session_info,
 };
 use acp_thread::{
     AcpThread, AgentConnection, AgentSessionConfigOptions, AgentSessionInfo, AgentSessionList,
@@ -14,11 +14,11 @@ use acp_thread::{
 use action_log::ActionLog;
 use agent_client_protocol::{
     Agent, Client, ConnectTo, JsonRpcRequest, JsonRpcResponse, Lines, PreparedRequest,
-    RequestCancellationHandle, V2ConnectionTo,
+    RequestCancellationHandle, UntypedMessage, V2ConnectionTo,
     schema::{ProtocolVersion, v2 as acp},
 };
 use anyhow::{Context as _, Result, anyhow};
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use futures::{
     FutureExt as _,
     channel::mpsc,
@@ -198,6 +198,8 @@ pub struct AcpV2Connection {
     session_owners: Rc<RefCell<HashMap<acp::SessionId, SessionOwner>>>,
     /// The child sessions the agent announced, which run subagents.
     subagents: Rc<RefCell<HashMap<acp::SessionId, SubagentSession>>>,
+    /// The terminals that each session lists as its background work.
+    background_terminals: Rc<RefCell<HashMap<acp::SessionId, HashSet<acp::TerminalId>>>>,
     runtime: Rc<RefCell<Option<ConnectionRuntime>>>,
 }
 
@@ -216,7 +218,28 @@ struct StdioStartup {
     drain: Option<futures::channel::oneshot::Sender<LocalBoxFuture<'static, ()>>>,
 }
 
+/// Stops a command that runs in the background (ACP v2 `terminal/cancel`).
+const CANCEL_TERMINAL_METHOD: &str = "terminal/cancel";
+
 impl AcpV2Connection {
+    /// The session that lists `terminal_id` as its background work, when it
+    /// is `session_id` or one of its subagent sessions.
+    fn background_terminal_owner(
+        &self,
+        session_id: &acp::SessionId,
+        terminal_id: &acp::TerminalId,
+    ) -> Option<acp::SessionId> {
+        let subagents = self.subagents.borrow();
+        self.background_terminals
+            .borrow()
+            .iter()
+            .find(|(owner, terminals)| {
+                terminals.contains(terminal_id)
+                    && root_subagent_session(&subagents, owner) == *session_id
+            })
+            .map(|(owner, _)| owner.clone())
+    }
+
     pub async fn stdio(
         agent_id: AgentId,
         project: Entity<Project>,
@@ -336,6 +359,7 @@ impl AcpV2Connection {
         let sessions = Rc::new(RefCell::new(HashMap::default()));
         let pending_session_updates = Rc::new(RefCell::new(PendingSessionUpdates::default()));
         let subagents = Rc::new(RefCell::new(HashMap::default()));
+        let background_terminals = Rc::new(RefCell::new(HashMap::default()));
         let context = ClientContext {
             sessions: sessions.clone(),
             pending_session_updates: Some(pending_session_updates.clone()),
@@ -343,6 +367,7 @@ impl AcpV2Connection {
             request_elicitations: request_elicitations.clone(),
             active_request_scopes: Some(RefCell::new(Default::default())),
             subagents: subagents.clone(),
+            background_terminals: background_terminals.clone(),
         };
         let (mut client_runtime, shutdown) = runtime::ClientRuntime::new(context, cx);
         let dispatch_tx = client_runtime.sender();
@@ -440,6 +465,7 @@ impl AcpV2Connection {
             pending_session_updates,
             session_owners: Rc::new(RefCell::new(HashMap::default())),
             subagents,
+            background_terminals,
             runtime,
         })
     }
@@ -1627,6 +1653,43 @@ impl AgentConnection for AcpV2Connection {
         }
     }
 
+    fn can_cancel_terminal(
+        &self,
+        session_id: &acp::SessionId,
+        terminal_id: &acp::TerminalId,
+    ) -> bool {
+        self.background_terminal_owner(session_id, terminal_id)
+            .is_some()
+    }
+
+    fn cancel_terminal(
+        &self,
+        session_id: &acp::SessionId,
+        terminal_id: &acp::TerminalId,
+        cx: &mut App,
+    ) {
+        let Some(owner) = self.background_terminal_owner(session_id, terminal_id) else {
+            return;
+        };
+        let request = match UntypedMessage::new(
+            CANCEL_TERMINAL_METHOD,
+            serde_json::json!({ "sessionId": owner, "terminalId": terminal_id }),
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                log::error!("Failed to build an ACP terminal cancellation: {error}");
+                return;
+            }
+        };
+        let response = self.connection.send_request(request).block_task();
+        cx.background_spawn(async move {
+            if let Err(error) = response.await {
+                log::warn!("The agent did not cancel the background terminal: {error:?}");
+            }
+        })
+        .detach();
+    }
+
     fn request_elicitations(&self) -> Option<Entity<ElicitationStore>> {
         Some(self.request_elicitations.clone())
     }
@@ -1941,6 +2004,7 @@ mod tests {
         project: Entity<Project>,
         prompts: async_channel::Receiver<(acp::PromptRequest, Responder<acp::PromptResponse>)>,
         cancellations: async_channel::Receiver<acp::CancelSessionNotification>,
+        terminal_cancellations: async_channel::Receiver<serde_json::Value>,
         new_requests: async_channel::Receiver<(acp::NewSessionRequest, acp::RequestId)>,
         new_responses:
             async_channel::Sender<Result<acp::NewSessionResponse, agent_client_protocol::Error>>,
@@ -2014,6 +2078,7 @@ mod tests {
             let (resume_sender, resume_requests) = async_channel::unbounded();
             let (prompt_sender, prompts) = async_channel::unbounded();
             let (cancel_sender, cancellations) = async_channel::unbounded();
+            let (terminal_cancel_sender, terminal_cancellations) = async_channel::unbounded();
             let (sender, received) = futures::channel::oneshot::channel();
             let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
             let agent_task = cx.background_spawn(
@@ -2158,6 +2223,22 @@ mod tests {
                         },
                         agent_client_protocol::on_receive_notification!(),
                     )
+                    .on_receive_request(
+                        async move |request: UntypedMessage,
+                                    responder: Responder<serde_json::Value>,
+                                    _| {
+                            if request.method() != "terminal/cancel" {
+                                return responder.respond_with_error(
+                                    agent_client_protocol::Error::method_not_found(),
+                                );
+                            }
+                            terminal_cancel_sender
+                                .try_send(request.params().clone())
+                                .expect("terminal cancel receiver");
+                            responder.respond(json!({}))
+                        },
+                        agent_client_protocol::on_receive_request!(),
+                    )
                     .connect_with(agent_transport, async move |agent| {
                         assert!(sender.send(agent).is_ok());
                         futures::future::pending::<Result<(), agent_client_protocol::Error>>().await
@@ -2182,6 +2263,7 @@ mod tests {
                 project,
                 prompts,
                 cancellations,
+                terminal_cancellations,
                 new_requests,
                 new_responses,
                 new_replies,
@@ -2199,6 +2281,19 @@ mod tests {
                 agent: received.await.expect("agent"),
                 _agent_task: agent_task,
             }
+        }
+
+        /// Sends `update` as is, with fields that the protocol crate does not model.
+        fn send_raw_update(&self, session_id: &str, update: serde_json::Value) {
+            self.agent
+                .send_notification(
+                    UntypedMessage::new(
+                        "session/update",
+                        json!({ "sessionId": session_id, "update": update }),
+                    )
+                    .expect("session update"),
+                )
+                .expect("session update");
         }
 
         fn send_update(&self, session_id: &str, update: acp::SessionUpdate) {
@@ -7506,5 +7601,95 @@ done
             harness.cancellations.is_empty(),
             "stopping the subagent leaves the conversation running"
         );
+    }
+
+    #[gpui::test]
+    async fn v2_background_terminals_can_be_stopped(cx: &mut TestAppContext) {
+        let harness = SessionHarness::new(session_capabilities(), vec![], vec![], cx).await;
+        let thread = harness.thread(cx).await;
+        for (session_id, update) in [
+            (
+                "session",
+                json!({ "sessionUpdate": "terminal_update", "terminalId": "bash", "command": "ping" }),
+            ),
+            (
+                "session",
+                json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "bash",
+                    "name": "Bash",
+                    "title": "ping",
+                    "kind": "execute",
+                    "status": "completed",
+                    "content": [{ "type": "terminal", "terminalId": "bash" }],
+                }),
+            ),
+            (
+                "session",
+                json!({
+                    "sessionUpdate": "subagent_update",
+                    "sessionId": "child",
+                    "state": { "state": "running", "background": [] },
+                }),
+            ),
+            (
+                "child",
+                json!({ "sessionUpdate": "terminal_update", "terminalId": "child-bash", "command": "ping" }),
+            ),
+            (
+                "child",
+                json!({
+                    "sessionUpdate": "state_update",
+                    "state": "running",
+                    "background": [{ "type": "terminal", "terminalId": "child-bash" }],
+                }),
+            ),
+            (
+                "session",
+                json!({
+                    "sessionUpdate": "state_update",
+                    "state": "idle",
+                    "background": [
+                        { "type": "terminal", "terminalId": "bash" },
+                        { "type": "subagent", "sessionId": "child" },
+                    ],
+                }),
+            ),
+        ] {
+            harness.send_raw_update(session_id, update);
+        }
+        harness.drain_updates(cx).await;
+        cx.run_until_parked();
+
+        let bash = acp::TerminalId::new("bash");
+        let child_bash = acp::TerminalId::new("child-bash");
+        thread.read_with(cx, |thread, _| {
+            assert!(thread.can_cancel_terminal(&bash));
+            assert!(
+                thread.can_cancel_terminal(&child_bash),
+                "a subagent's background command is stopped from its parent"
+            );
+            assert!(!thread.can_cancel_terminal(&acp::TerminalId::new("other")));
+        });
+
+        thread.update(cx, |thread, cx| thread.cancel_terminal(&child_bash, cx));
+        let cancellation = bounded(harness.terminal_cancellations.recv(), cx)
+            .await
+            .expect("terminal cancellation");
+        assert_eq!(
+            cancellation,
+            json!({ "sessionId": "child", "terminalId": "child-bash" }),
+            "the cancellation names the session that runs the command"
+        );
+
+        harness.send_raw_update(
+            "session",
+            json!({ "sessionUpdate": "state_update", "state": "idle", "background": [] }),
+        );
+        harness.drain_updates(cx).await;
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, _| {
+            assert!(!thread.can_cancel_terminal(&bash));
+        });
     }
 }
