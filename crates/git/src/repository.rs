@@ -801,6 +801,10 @@ async fn branch_upstream(git: &GitBinary, log_source: &LogSource) -> Option<Stri
 pub struct SearchCommitArgs {
     pub query: SharedString,
     pub case_sensitive: bool,
+    /// Match `author:` against the identity recorded in each commit rather
+    /// than the one `.mailmap` maps it to, which is what `git log` matches by
+    /// default and which differs from the `%ae` the graph reads.
+    pub ignore_mailmap: bool,
 }
 
 /// A commit search query split into `git log` filters and the text matched
@@ -3655,6 +3659,10 @@ impl GitRepository for RealGitRepository {
                 .until
                 .as_ref()
                 .map(|until| format!("--until={until}"));
+
+            if search_args.ignore_mailmap {
+                args.push("--no-mailmap");
+            }
 
             if hash_query.is_none() {
                 // `--fixed-strings` and `--regexp-ignore-case` apply to `--author`

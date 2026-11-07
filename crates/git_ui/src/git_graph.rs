@@ -24,7 +24,7 @@ use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
     parse_git_remote_url,
     repository::{
-        CommitOptions, FetchOptions, InitialGraphCommitData, LogOrder, LogSource, RepoPath,
+        CommitData, CommitOptions, FetchOptions, InitialGraphCommitData, LogOrder, LogSource, RepoPath,
         ResetMode, SearchCommitArgs,
     },
     status::{FileStatus, StatusCode, TrackedStatus},
@@ -824,6 +824,32 @@ fn local_utc_offset() -> UtcOffset {
         cached.set(Some((Instant::now(), offset)));
         offset
     })
+}
+
+/// The details of `shas`, in order, loading the ones that aren't loaded yet
+/// in one go rather than one after another. `None` for a commit that failed
+/// to load.
+async fn load_commit_data(
+    repository: &Entity<Repository>,
+    shas: Vec<Oid>,
+    cx: &mut gpui::AsyncApp,
+) -> Vec<Option<Arc<CommitData>>> {
+    let pending: Vec<_> = repository.update(cx, |repository, cx| {
+        shas.into_iter()
+            .map(|sha| match repository.fetch_commit_data(sha, true, cx) {
+                CommitDataState::Loaded(data) => Ok(data.clone()),
+                CommitDataState::Loading(receiver) => Err(receiver.clone()),
+            })
+            .collect()
+    });
+    futures::future::join_all(pending.into_iter().map(|state| async move {
+        match state {
+            Ok(data) => Some(data),
+            Err(Some(receiver)) => receiver.await.ok(),
+            Err(None) => None,
+        }
+    }))
+    .await
 }
 
 fn format_timestamp(timestamp: i64) -> String {
@@ -2064,6 +2090,7 @@ pub struct GitGraph {
     auto_fetch_enabled: bool,
     _auto_fetch_task: Option<Task<()>>,
     autoscroll: Option<MiddleClickAutoscroll>,
+    _author_day_task: Option<Task<()>>,
     _operation_in_progress_task: Option<Task<()>>,
     changed_files_view_mode: ChangedFilesViewMode,
     commit_details_position: DetailPanelPosition,
@@ -2353,6 +2380,7 @@ impl GitGraph {
             auto_fetch_enabled: Self::restore_auto_fetch(cx),
             _auto_fetch_task: None,
             autoscroll: None,
+            _author_day_task: None,
             _operation_in_progress_task: None,
             changed_files_view_mode: ChangedFilesViewMode::default(),
             commit_details_position: Self::restore_detail_panel_position(cx),
@@ -3225,6 +3253,124 @@ Checked out in worktree {}",
         cx.notify();
     }
 
+    /// Selects every commit the author of the commit at `row` made on the same
+    /// local day, by author date, the one the Date column shows. git can only
+    /// limit by committer date, which is never before the author date, so it
+    /// narrows the search to commits committed since that day and the author
+    /// date is checked here; rebased commits keep their author date.
+    fn select_author_day(&mut self, row: usize, cx: &mut Context<Self>) {
+        if self.is_uncommitted_row(row) {
+            return;
+        }
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let Some(sha) = self.graph_data.commits.get(row).map(|commit| commit.data.sha) else {
+            return;
+        };
+        let log_source = self.log_source.clone();
+        self._author_day_task = Some(cx.spawn(async move |this, cx| {
+            let Some(clicked) = load_commit_data(&repository, vec![sha], cx)
+                .await
+                .into_iter()
+                .next()
+                .flatten()
+            else {
+                return;
+            };
+            let Ok(time) = OffsetDateTime::from_unix_timestamp(clicked.commit_timestamp) else {
+                return;
+            };
+            let day_start = time
+                .to_offset(local_utc_offset())
+                .replace_time(time::Time::MIDNIGHT)
+                .unix_timestamp();
+            let day_end = day_start + 24 * 60 * 60;
+
+            // People commit from more than one address, so a commit by the
+            // same name counts as well as one from the same email. git ORs
+            // nothing within one query, hence a search for each.
+            let author_name = clicked.author_name.replace('"', "");
+            let authors = [clicked.author_email.to_string(), author_name]
+                .into_iter()
+                .filter(|author| !author.trim().is_empty());
+            let (request_tx, request_rx) = async_channel::unbounded::<Oid>();
+            repository.update(cx, |repository, cx| {
+                for author in authors {
+                    repository.search_commits(
+                        log_source.clone(),
+                        SearchCommitArgs {
+                            query: format!("author:\"{author}\" since:@{day_start}").into(),
+                            case_sensitive: false,
+                            // The author is matched by the identity the commit
+                            // records, the one its details were loaded with.
+                            ignore_mailmap: true,
+                        },
+                        request_tx.clone(),
+                        cx,
+                    );
+                }
+            });
+            drop(request_tx);
+            let mut candidates = HashSet::default();
+            while let Ok(oid) = request_rx.recv().await {
+                candidates.insert(oid);
+            }
+            let candidates: Vec<Oid> = candidates.into_iter().collect();
+
+            let matches: Vec<Oid> = load_commit_data(&repository, candidates, cx)
+                .await
+                .into_iter()
+                .flatten()
+                .filter(|data| {
+                    (data.author_email == clicked.author_email
+                        || data.author_name == clicked.author_name)
+                        && (day_start..day_end).contains(&data.commit_timestamp)
+                })
+                .map(|data| data.sha)
+                .collect();
+
+            this.update(cx, |this, cx| this.select_commits(sha, &matches, cx))
+                .ok();
+        }));
+    }
+
+    /// Selects the loaded rows of `oids`, with the cursor on `cursor_sha`.
+    fn select_commits(&mut self, cursor_sha: Oid, oids: &[Oid], cx: &mut Context<Self>) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let offset = self.graph_data.repository_offset();
+        let rows: BTreeSet<usize> = {
+            let repository = repository.read(cx);
+            let Some(data) = repository.get_graph_data(self.log_source.clone(), self.log_order)
+            else {
+                return;
+            };
+            oids.iter()
+                .chain([&cursor_sha])
+                .filter_map(|oid| data.commit_oid_to_index.get(oid))
+                .map(|index| index + offset)
+                .filter(|row| *row < self.graph_data.commits.len())
+                .collect()
+        };
+        let Some(cursor) = rows
+            .iter()
+            .copied()
+            .find(|row| self.graph_data.commits[*row].data.sha == cursor_sha)
+        else {
+            return;
+        };
+        self.selection_anchor_idx = Some(cursor);
+        self.multi_selected_idxs = if rows.len() > 1 {
+            Rc::new(rows)
+        } else {
+            Rc::default()
+        };
+        self.move_selection_cursor(cursor, ScrollStrategy::Nearest, cx);
+        cx.notify();
+    }
+
     fn stop_autoscroll(&mut self, cx: &mut Context<Self>) {
         if self.autoscroll.take().is_some() {
             cx.notify();
@@ -3499,6 +3645,7 @@ Checked out in worktree {}",
                 SearchCommitArgs {
                     query: query.clone(),
                     case_sensitive: self.search_state.case_sensitive,
+                    ignore_mailmap: false,
                 },
                 request_tx,
                 cx,
@@ -7981,14 +8128,26 @@ Checked out in worktree {}",
                 window.set_window_cursor_style(CursorStyle::ResizeUpDown);
                 window.on_mouse_event({
                     let weak = weak.clone();
-                    move |_: &MouseDownEvent, phase, _, cx| {
+                    move |event: &MouseDownEvent, phase, window, cx| {
                         if phase != DispatchPhase::Capture {
                             return;
                         }
                         // The press only ends the autoscroll; it doesn't also
-                        // select a commit or open a menu.
+                        // select a commit or open a menu. A middle double-click,
+                        // whose first press started the autoscroll, selects the
+                        // author's commits from that day.
                         cx.stop_propagation();
-                        weak.update(cx, |this, cx| this.stop_autoscroll(cx)).ok();
+                        weak.update(cx, |this, cx| {
+                            this.stop_autoscroll(cx);
+                            if event.button == MouseButton::Middle
+                                && event.click_count >= 2
+                                && let Some(row) =
+                                    this.row_at_position(event.position.y, window, cx)
+                            {
+                                this.select_author_day(row, cx);
+                            }
+                        })
+                        .ok();
                     }
                 });
                 window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
