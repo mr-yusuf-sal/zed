@@ -1,5 +1,8 @@
 # Starts the installed Zed after build.ps1 -Install or install-detached.ps1 replaced it.
-param([Parameter(Mandatory)][string]$Target)
+# `-Elevated`: the Zed that the install stopped ran elevated, so this one does too. Agent hosts
+# are separate for elevated and unelevated Zed, and a Zed of the other elevation would not find
+# the Claude Code turns, subagents and background commands that kept running.
+param([Parameter(Mandatory)][string]$Target, [switch]$Elevated)
 
 # Explorer runs Zed.exe for every file it opens, only to hand the path to the running Zed, so
 # the "run as administrator" compatibility flag turns each double-click into a UAC prompt.
@@ -29,13 +32,19 @@ function Start-Unelevated {
     if ($elevated) { Start-Process explorer.exe -ArgumentList "`"$Target`"" } else { Start-Process $Target }
 }
 
-# The login task runs Zed elevated without a UAC prompt. Without it, Zed is started
-# unelevated: an elevated Zed sees an empty Windows Credential Manager, so git fetch/pull/push
-# fall through to Zed's username prompt.
+function Start-Elevated {
+    # A Zed started by an elevated script inherits its token; otherwise Windows asks once.
+    $current = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if ($current) { Start-Process $Target } else { Start-Process $Target -Verb RunAs }
+}
+
+# The login task runs Zed elevated without a UAC prompt. Without it, Zed is started with the
+# elevation of the Zed the install stopped. (An elevated Zed once saw an empty Windows
+# Credential Manager; git's credential store now uses DPAPI, which works either way.)
 $task = Get-ScheduledTask -TaskPath '\' -TaskName 'Zed' -ErrorAction SilentlyContinue |
     Where-Object { $_.Principal.RunLevel -eq 'Highest' }
 if (-not $task) {
-    Start-Unelevated
+    if ($Elevated) { Start-Elevated } else { Start-Unelevated }
     return
 }
 
