@@ -17,6 +17,7 @@ pub use v2::AcpV2Connection;
 
 use acp_thread::{AcpThread, AuthRequired, ElicitationStore, LoadError};
 use agent_client_protocol::schema::{
+    MaybeUndefined,
     v1::{self as acp, ErrorCode},
     v2 as acp_v2,
 };
@@ -741,6 +742,218 @@ fn root_subagent_session(
     session_id.clone()
 }
 
+/// The session of the running subagent that does the work of `tool_call_id`
+/// in `session_id`, when the agent stops it on its own.
+fn cancellable_subagent(
+    subagents: &HashMap<acp_v2::SessionId, SubagentSession>,
+    session_id: &acp_v2::SessionId,
+    tool_call_id: &acp_v2::ToolCallId,
+) -> Option<acp_v2::SessionId> {
+    subagents
+        .iter()
+        .find(|(subagent_id, subagent)| {
+            subagent.running
+                && subagent.cancellable
+                && subagent.tool_call_id.as_ref() == Some(tool_call_id)
+                && root_subagent_session(subagents, subagent_id) == *session_id
+        })
+        .map(|(subagent_id, _)| subagent_id.clone())
+}
+
+/// Records a `subagent_update` that `parent_session_id` sent about
+/// `subagent_id`. `None` leaves what is known unchanged.
+fn record_subagent_update(
+    ctx: &ClientContext,
+    parent_session_id: acp_v2::SessionId,
+    subagent_id: acp_v2::SessionId,
+    cancellable: Option<bool>,
+    running: Option<bool>,
+    cx: &mut AsyncApp,
+) {
+    if subagent_id == parent_session_id {
+        return;
+    }
+    let tool_call_id = {
+        let mut subagents = ctx.subagents.borrow_mut();
+        let subagent = subagents
+            .entry(subagent_id.clone())
+            .or_insert_with(|| SubagentSession {
+                parent_session_id,
+                tool_call_id: None,
+                running: false,
+                cancellable: false,
+            });
+        if let Some(cancellable) = cancellable {
+            subagent.cancellable = cancellable;
+        }
+        if let Some(running) = running {
+            subagent.running = running;
+        }
+        subagent.tool_call_id.clone()
+    };
+    if let (Some(tool_call_id), Some(running)) = (tool_call_id, running) {
+        set_subagent_running(ctx, &subagent_id, tool_call_id, running, cx);
+    }
+}
+
+/// A `session_message` in `session_id`'s transcript. In a subagent's
+/// transcript, the message that launched or resumed it, whose id is the tool
+/// call that sent it, unless the agent did not know that call.
+fn link_session_message(
+    ctx: &ClientContext,
+    session_id: &acp_v2::SessionId,
+    message_id: &str,
+    cx: &mut AsyncApp,
+) {
+    if message_id.starts_with(&format!("{session_id}:")) {
+        return;
+    }
+    link_subagent_tool_call(ctx, session_id, acp_v2::ToolCallId::new(message_id), cx);
+}
+
+/// Makes `tool_call_id` the tool call whose work the subagent of
+/// `subagent_id` does, in place of the one it did before.
+fn link_subagent_tool_call(
+    ctx: &ClientContext,
+    subagent_id: &acp_v2::SessionId,
+    tool_call_id: acp_v2::ToolCallId,
+    cx: &mut AsyncApp,
+) {
+    let (previous_tool_call_id, running) = {
+        let mut subagents = ctx.subagents.borrow_mut();
+        let Some(subagent) = subagents.get_mut(subagent_id) else {
+            return;
+        };
+        if subagent.tool_call_id.as_ref() == Some(&tool_call_id) {
+            return;
+        }
+        (
+            subagent.tool_call_id.replace(tool_call_id.clone()),
+            subagent.running,
+        )
+    };
+    if let Some(previous_tool_call_id) = previous_tool_call_id {
+        set_subagent_running(ctx, subagent_id, previous_tool_call_id, false, cx);
+    }
+    if running {
+        set_subagent_running(ctx, subagent_id, tool_call_id, true, cx);
+    }
+}
+
+fn set_subagent_running(
+    ctx: &ClientContext,
+    subagent_id: &acp_v2::SessionId,
+    tool_call_id: acp_v2::ToolCallId,
+    running: bool,
+    cx: &mut AsyncApp,
+) {
+    let Ok(thread) = session_thread(ctx, subagent_id) else {
+        return;
+    };
+    thread
+        .update(cx, |thread, cx| {
+            thread.set_subagent_running(tool_call_id, running, cx)
+        })
+        .ok();
+}
+
+fn subagent_parent_tool_use_id(meta: &acp_v2::Meta) -> Option<&str> {
+    meta.get("claudeCode")?.get("parentToolUseId")?.as_str()
+}
+
+/// Shows an update of a v2 subagent session in the session it runs under.
+/// Only its tool calls are shown, under the tool call that delegated to it, as
+/// Claude Code tags them in `_meta.claudeCode.parentToolUseId`; the subagent's
+/// own messages are not the conversation's.
+fn handle_v2_subagent_session_notification(
+    mut notification: InboundSessionNotification,
+    subagent_id: acp_v2::SessionId,
+    cx: &mut AsyncApp,
+    context: &ClientContext,
+) {
+    let thread = match session_thread(context, &subagent_id) {
+        Ok(thread) => thread,
+        Err(error) => {
+            log::warn!("Received ACP v2 subagent update for an unknown session: {error}");
+            return;
+        }
+    };
+    match &mut notification.update {
+        InboundSessionUpdate::ToolCallUpdate(update) => {
+            let reported_parent = update
+                .meta
+                .value()
+                .and_then(subagent_parent_tool_use_id)
+                .map(acp_v2::ToolCallId::new);
+            if let Some(reported_parent) = reported_parent {
+                let unlinked = context
+                    .subagents
+                    .borrow()
+                    .get(&subagent_id)
+                    .is_some_and(|subagent| subagent.tool_call_id.is_none());
+                if unlinked {
+                    link_subagent_tool_call(context, &subagent_id, reported_parent, cx);
+                }
+            } else {
+                let parent = context
+                    .subagents
+                    .borrow()
+                    .get(&subagent_id)
+                    .and_then(|subagent| subagent.tool_call_id.clone());
+                if let Some(parent) = parent {
+                    tag_subagent_tool_call(update, parent, &thread, cx);
+                }
+            }
+        }
+        InboundSessionUpdate::ToolCallContentChunk(_) | InboundSessionUpdate::Terminal(_) => {}
+        _ => return,
+    }
+    notification.session_id = root_session_id(context, &subagent_id);
+    apply_v2_session_notification(notification, &thread, &context.sessions, cx).log_err();
+}
+
+/// Tags `update` with the tool call whose subagent made it. Metadata patches
+/// replace a top-level key whole, so the tag joins the `claudeCode` object the
+/// update sends, or else the one the tool call already has.
+fn tag_subagent_tool_call(
+    update: &mut acp_v2::ToolCallUpdate,
+    parent: acp_v2::ToolCallId,
+    thread: &WeakEntity<AcpThread>,
+    cx: &mut AsyncApp,
+) {
+    let claude_code = match update.meta.value() {
+        Some(meta) if meta.contains_key("claudeCode") => meta.get("claudeCode").cloned(),
+        // `null` clears the metadata, and a tag would keep the rest of it.
+        _ if update.meta.is_null() => return,
+        _ => {
+            let stored = thread
+                .read_with(cx, |thread, _| {
+                    thread
+                        .tool_call(&update.tool_call_id)
+                        .and_then(|(_, call)| call.meta.as_ref()?.get("claudeCode").cloned())
+                })
+                .ok()
+                .flatten();
+            if stored
+                .as_ref()
+                .and_then(|claude_code| claude_code.get("parentToolUseId"))
+                .is_some()
+            {
+                return;
+            }
+            stored
+        }
+    };
+    let mut claude_code = match claude_code {
+        Some(serde_json::Value::Object(claude_code)) => claude_code,
+        _ => serde_json::Map::new(),
+    };
+    claude_code.insert("parentToolUseId".into(), parent.0.to_string().into());
+    let mut meta = update.meta.value().cloned().unwrap_or_default();
+    meta.insert("claudeCode".into(), claude_code.into());
+    update.meta = MaybeUndefined::Value(meta);
+}
+
 fn route_v2_session_notification(
     (notification, encoded_bytes): (InboundSessionNotification, usize),
     cx: &mut AsyncApp,
@@ -749,7 +962,11 @@ fn route_v2_session_notification(
     let registered = context
         .sessions
         .borrow()
-        .contains_key(&notification.session_id);
+        .contains_key(&notification.session_id)
+        || context
+            .subagents
+            .borrow()
+            .contains_key(&notification.session_id);
     let notification = if !registered && let Some(pending) = &context.pending_session_updates {
         match pending.borrow_mut().stage(notification, encoded_bytes) {
             None => return,
@@ -810,6 +1027,47 @@ fn handle_v2_session_notification(
     cx: &mut AsyncApp,
     context: &ClientContext,
 ) {
+    match &notification.update {
+        InboundSessionUpdate::SubagentUpdate(update) => {
+            // A state of `null` restores an ancestor of a resumed subagent,
+            // which says nothing about whether it works.
+            let running = update.state.value().map(|state| {
+                matches!(
+                    state,
+                    acp_v2::StateUpdate::Running(_) | acp_v2::StateUpdate::RequiresAction(_)
+                )
+            });
+            let cancellable = match &update.capabilities {
+                MaybeUndefined::Undefined => None,
+                MaybeUndefined::Null => Some(false),
+                MaybeUndefined::Value(capabilities) => Some(capabilities.cancel.is_some()),
+            };
+            record_subagent_update(
+                context,
+                notification.session_id.clone(),
+                update.session_id.clone(),
+                cancellable,
+                running,
+                cx,
+            );
+            return;
+        }
+        InboundSessionUpdate::SessionMessage(message) => {
+            link_session_message(context, &notification.session_id, &message.message_id.0, cx);
+            return;
+        }
+        InboundSessionUpdate::SessionMessageChunk => return,
+        _ => {}
+    }
+    if context
+        .subagents
+        .borrow()
+        .contains_key(&notification.session_id)
+    {
+        let subagent_id = notification.session_id.clone();
+        handle_v2_subagent_session_notification(notification, subagent_id, cx, context);
+        return;
+    }
     let thread = match session_thread(context, &notification.session_id) {
         Ok(thread) => thread,
         Err(error) => {
@@ -851,7 +1109,7 @@ fn respond_result<T: JsonRpcResponse>(responder: Responder<T>, result: Result<T,
 }
 
 fn handle_v2_request_permission(
-    request: acp_v2::RequestPermissionRequest,
+    mut request: acp_v2::RequestPermissionRequest,
     responder: Responder<acp_v2::RequestPermissionResponse>,
     cx: &mut AsyncApp,
     context: &ClientContext,
@@ -860,6 +1118,8 @@ fn handle_v2_request_permission(
     if cancellation.is_cancelled() {
         return respond_err(responder, acp::Error::request_cancelled());
     }
+    // A subagent asks in the session it runs under, where its tool calls show.
+    request.session_id = root_session_id(context, &request.session_id);
     let thread = match session_thread(context, &request.session_id) {
         Ok(thread) => thread,
         Err(error) => return respond_err(responder, error),

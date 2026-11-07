@@ -1,11 +1,11 @@
 use super::{
     AcpDebugLog, AcpDebugMessage, AcpSession, ClientContext, ConfigOptions, FlattenAcpResult as _,
-    ForegroundWork, SubagentSession, UnsupportedVersion, drain_foreground_queue,
-    enqueue_notification, enqueue_request, first_class_terminal_auth_task,
-    handle_v2_complete_elicitation, handle_v2_create_elicitation, map_acp_error,
-    mcp_configurations_for_project, respond_err, respond_result, root_session_id,
-    root_subagent_session, runtime, session_thread, terminal_auth_task_id, transport,
-    with_v2_client_ingress, work_dirs_from_session_info,
+    ForegroundWork, SubagentSession, UnsupportedVersion, cancellable_subagent,
+    drain_foreground_queue, enqueue_notification, enqueue_request, first_class_terminal_auth_task,
+    handle_v2_complete_elicitation, handle_v2_create_elicitation, link_session_message,
+    link_subagent_tool_call, map_acp_error, mcp_configurations_for_project, record_subagent_update,
+    respond_err, respond_result, root_session_id, runtime, session_thread, terminal_auth_task_id,
+    transport, with_v2_client_ingress, work_dirs_from_session_info,
 };
 use acp_thread::{
     AgentConnection, AgentSessionInfo, AgentSessionList, AgentSessionListRequest,
@@ -590,16 +590,7 @@ impl AcpConnection {
         session_id: &acp_v2::SessionId,
         tool_call_id: &acp_v2::ToolCallId,
     ) -> Option<acp_v2::SessionId> {
-        let subagents = self.subagents.borrow();
-        subagents
-            .iter()
-            .find(|(subagent_id, subagent)| {
-                subagent.running
-                    && subagent.cancellable
-                    && subagent.tool_call_id.as_ref() == Some(tool_call_id)
-                    && root_subagent_session(&subagents, subagent_id) == *session_id
-            })
-            .map(|(subagent_id, _)| subagent_id.clone())
+        cancellable_subagent(&self.subagents.borrow(), session_id, tool_call_id)
     }
 
     /// Binds supported v2 client handlers to the existing foreground owners.
@@ -10058,29 +10049,10 @@ fn handle_subagent_notification(message: UntypedMessage, cx: &mut AsyncApp, ctx:
                 .and_then(|state| state.get("state"))
                 .and_then(serde_json::Value::as_str)
                 .map(|state| matches!(state, "running" | "requires_action"));
-            let tool_call_id = {
-                let mut subagents = ctx.subagents.borrow_mut();
-                let subagent =
-                    subagents
-                        .entry(subagent_id.clone())
-                        .or_insert_with(|| SubagentSession {
-                            parent_session_id: session_id,
-                            tool_call_id: None,
-                            running: false,
-                            cancellable: false,
-                        });
-                // Only the announcement lists the capabilities.
-                if let Some(capabilities) = update.get("capabilities") {
-                    subagent.cancellable = capabilities.get("cancel").is_some();
-                }
-                if let Some(running) = running {
-                    subagent.running = running;
-                }
-                subagent.tool_call_id.clone()
-            };
-            if let (Some(tool_call_id), Some(running)) = (tool_call_id, running) {
-                set_subagent_running(ctx, &subagent_id, tool_call_id, running, cx);
-            }
+            let cancellable = update
+                .get("capabilities")
+                .map(|capabilities| capabilities.get("cancel").is_some());
+            record_subagent_update(ctx, session_id, subagent_id, cancellable, running, cx);
         }
         // The message that launched or resumed a subagent. Its id is the tool
         // call that sent it, unless the agent did not know that call.
@@ -10089,59 +10061,10 @@ fn handle_subagent_notification(message: UntypedMessage, cx: &mut AsyncApp, ctx:
             else {
                 return;
             };
-            if message_id.starts_with(&format!("{session_id}:")) {
-                return;
-            }
-            link_subagent_tool_call(ctx, &session_id, acp_v2::ToolCallId::new(message_id), cx);
+            link_session_message(ctx, &session_id, message_id, cx);
         }
         _ => {}
     }
-}
-
-/// Makes `tool_call_id` the tool call whose work the subagent of
-/// `subagent_id` does, in place of the one it did before.
-fn link_subagent_tool_call(
-    ctx: &ClientContext,
-    subagent_id: &acp_v2::SessionId,
-    tool_call_id: acp_v2::ToolCallId,
-    cx: &mut AsyncApp,
-) {
-    let (previous_tool_call_id, running) = {
-        let mut subagents = ctx.subagents.borrow_mut();
-        let Some(subagent) = subagents.get_mut(subagent_id) else {
-            return;
-        };
-        if subagent.tool_call_id.as_ref() == Some(&tool_call_id) {
-            return;
-        }
-        (
-            subagent.tool_call_id.replace(tool_call_id.clone()),
-            subagent.running,
-        )
-    };
-    if let Some(previous_tool_call_id) = previous_tool_call_id {
-        set_subagent_running(ctx, subagent_id, previous_tool_call_id, false, cx);
-    }
-    if running {
-        set_subagent_running(ctx, subagent_id, tool_call_id, true, cx);
-    }
-}
-
-fn set_subagent_running(
-    ctx: &ClientContext,
-    subagent_id: &acp_v2::SessionId,
-    tool_call_id: acp_v2::ToolCallId,
-    running: bool,
-    cx: &mut AsyncApp,
-) {
-    let Ok(thread) = session_thread(ctx, subagent_id) else {
-        return;
-    };
-    thread
-        .update(cx, |thread, cx| {
-            thread.set_subagent_running(tool_call_id, running, cx)
-        })
-        .ok();
 }
 
 /// Shows an update of a subagent session in the session it runs under. Only

@@ -1,10 +1,10 @@
 use super::{
     AcpDebugLog, AcpDebugMessage, AcpSession, ClientContext, ConfigOptions,
-    ContextServerConfiguration, ForegroundWork, PendingSessionUpdates, UnsupportedVersion,
-    apply_v2_session_notification, close_undelivered_session, drain_foreground_queue,
-    enqueue_notification, first_class_terminal_auth_task, map_acp_error,
-    mcp_configurations_for_project, runtime, transport, with_v2_client_ingress,
-    work_dirs_from_session_info,
+    ContextServerConfiguration, ForegroundWork, PendingSessionUpdates, SubagentSession,
+    UnsupportedVersion, apply_v2_session_notification, cancellable_subagent,
+    close_undelivered_session, drain_foreground_queue, enqueue_notification,
+    first_class_terminal_auth_task, map_acp_error, mcp_configurations_for_project, runtime,
+    transport, with_v2_client_ingress, work_dirs_from_session_info,
 };
 use acp_thread::{
     AcpThread, AgentConnection, AgentSessionConfigOptions, AgentSessionInfo, AgentSessionList,
@@ -196,6 +196,8 @@ pub struct AcpV2Connection {
     sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
     pending_session_updates: Rc<RefCell<PendingSessionUpdates>>,
     session_owners: Rc<RefCell<HashMap<acp::SessionId, SessionOwner>>>,
+    /// The child sessions the agent announced, which run subagents.
+    subagents: Rc<RefCell<HashMap<acp::SessionId, SubagentSession>>>,
     runtime: Rc<RefCell<Option<ConnectionRuntime>>>,
 }
 
@@ -333,13 +335,14 @@ impl AcpV2Connection {
         let request_elicitations = cx.new(|_| ElicitationStore::default());
         let sessions = Rc::new(RefCell::new(HashMap::default()));
         let pending_session_updates = Rc::new(RefCell::new(PendingSessionUpdates::default()));
+        let subagents = Rc::new(RefCell::new(HashMap::default()));
         let context = ClientContext {
             sessions: sessions.clone(),
             pending_session_updates: Some(pending_session_updates.clone()),
             session_list: Rc::new(RefCell::new(None)),
             request_elicitations: request_elicitations.clone(),
             active_request_scopes: Some(RefCell::new(Default::default())),
-            subagents: Rc::default(),
+            subagents: subagents.clone(),
         };
         let (mut client_runtime, shutdown) = runtime::ClientRuntime::new(context, cx);
         let dispatch_tx = client_runtime.sender();
@@ -436,6 +439,7 @@ impl AcpV2Connection {
             sessions,
             pending_session_updates,
             session_owners: Rc::new(RefCell::new(HashMap::default())),
+            subagents,
             runtime,
         })
     }
@@ -1598,6 +1602,29 @@ impl AgentConnection for AcpV2Connection {
         self.connection
             .send_notification(acp::CancelSessionNotification::new(session_id.clone()))
             .map_err(map_acp_error)
+    }
+
+    fn can_stop_subagent(
+        &self,
+        session_id: &acp::SessionId,
+        tool_call_id: &acp::ToolCallId,
+    ) -> bool {
+        cancellable_subagent(&self.subagents.borrow(), session_id, tool_call_id).is_some()
+    }
+
+    fn stop_subagent(
+        &self,
+        session_id: &acp::SessionId,
+        tool_call_id: &acp::ToolCallId,
+        _cx: &mut App,
+    ) {
+        let subagent_id = cancellable_subagent(&self.subagents.borrow(), session_id, tool_call_id);
+        if let Some(subagent_id) = subagent_id {
+            self.connection
+                .send_notification(acp::CancelSessionNotification::new(subagent_id))
+                .map_err(map_acp_error)
+                .log_err();
+        }
     }
 
     fn request_elicitations(&self) -> Option<Entity<ElicitationStore>> {
@@ -7304,5 +7331,180 @@ done
         };
         assert_eq!(status.code(), Some(7));
         assert_eq!(stderr.as_deref(), Some("initialize exit stderr"));
+    }
+
+    fn wire_update(update: serde_json::Value) -> acp::SessionUpdate {
+        serde_json::from_value(update).expect("session update")
+    }
+
+    fn parent_tool_use_ids(thread: &AcpThread) -> Vec<Option<String>> {
+        thread
+            .entries()
+            .iter()
+            .map(|entry| match entry {
+                acp_thread::AgentThreadEntry::ToolCall(tool_call) => tool_call
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.get("claudeCode")?.get("parentToolUseId")?.as_str())
+                    .map(ToOwned::to_owned),
+                _ => panic!("the subagent's messages are not the conversation's"),
+            })
+            .collect()
+    }
+
+    #[gpui::test]
+    async fn v2_subagent_sessions_show_in_their_parent_session(cx: &mut TestAppContext) {
+        let harness = SessionHarness::new(session_capabilities(), vec![], vec![], cx).await;
+        let thread = harness.thread(cx).await;
+        let launch_id = acp::ToolCallId::new("launch");
+        harness.send_update(
+            "session",
+            wire_update(json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "launch",
+                "title": "Agent",
+                "status": "completed",
+                "_meta": { "claudeCode": { "toolName": "Agent" } },
+            })),
+        );
+        harness.send_update(
+            "session",
+            wire_update(json!({
+                "sessionUpdate": "subagent_update",
+                "sessionId": "child",
+                "title": "general-purpose",
+                "state": { "state": "running" },
+            })),
+        );
+        harness.send_update(
+            "child",
+            wire_update(json!({
+                "sessionUpdate": "session_message",
+                "messageId": "launch",
+                "senderSessionId": "session",
+                "recipientSessionId": "child",
+                "content": [{ "type": "text", "text": "Look around" }],
+            })),
+        );
+        for update in [
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "child-message",
+                "content": { "type": "text", "text": "Looking around" },
+            }),
+            json!({ "sessionUpdate": "state_update", "state": "running" }),
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "read",
+                "title": "Read",
+                "status": "in_progress",
+                "_meta": { "claudeCode": { "toolName": "Read" } },
+            }),
+            // An update that leaves the metadata alone keeps the tag.
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "read",
+                "status": "completed",
+            }),
+        ] {
+            harness.send_update("child", wire_update(update));
+        }
+        harness.drain_updates(cx).await;
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _| {
+            assert!(
+                thread.is_subagent_running(&launch_id),
+                "the subagent outlives its completed launch"
+            );
+            assert!(
+                !thread.can_stop_subagent(&launch_id),
+                "the announcement did not offer to cancel the subagent"
+            );
+            assert_eq!(
+                parent_tool_use_ids(thread),
+                vec![None, Some("launch".to_owned())]
+            );
+            let (_, read) = thread
+                .tool_call(&acp::ToolCallId::new("read"))
+                .expect("the subagent's tool call");
+            assert_eq!(
+                read.meta
+                    .as_ref()
+                    .and_then(|meta| meta.get("claudeCode")?.get("toolName")?.as_str()),
+                Some("Read"),
+                "the tag joins the tool call's own Claude Code metadata"
+            );
+        });
+
+        harness.send_update(
+            "session",
+            wire_update(json!({
+                "sessionUpdate": "subagent_update",
+                "sessionId": "child",
+                "state": { "state": "idle", "stopReason": "end_turn" },
+            })),
+        );
+        harness.drain_updates(cx).await;
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, _| {
+            assert!(!thread.is_subagent_running(&launch_id));
+        });
+    }
+
+    #[gpui::test]
+    async fn v2_stopping_a_subagent_cancels_only_its_session(cx: &mut TestAppContext) {
+        let harness = SessionHarness::new(session_capabilities(), vec![], vec![], cx).await;
+        let thread = harness.thread(cx).await;
+        let launch_id = acp::ToolCallId::new("launch");
+        harness.send_update(
+            "session",
+            wire_update(json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "launch",
+                "title": "Agent",
+                "status": "completed",
+                "_meta": { "claudeCode": { "toolName": "Agent" } },
+            })),
+        );
+        harness.send_update(
+            "session",
+            wire_update(json!({
+                "sessionUpdate": "subagent_update",
+                "sessionId": "child",
+                "capabilities": { "cancel": {} },
+                "state": { "state": "running" },
+            })),
+        );
+        harness.send_update(
+            "child",
+            wire_update(json!({
+                "sessionUpdate": "session_message",
+                "messageId": "launch",
+                "senderSessionId": "session",
+                "recipientSessionId": "child",
+            })),
+        );
+        harness.drain_updates(cx).await;
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _| {
+            assert!(thread.is_subagent_running(&launch_id));
+            assert!(
+                thread.can_stop_subagent(&launch_id),
+                "the announcement offered to cancel the subagent"
+            );
+            assert!(!thread.can_stop_subagent(&acp::ToolCallId::new("other")));
+        });
+        thread.update(cx, |thread, cx| thread.stop_subagent(&launch_id, cx));
+        let cancellation = bounded(harness.cancellations.recv(), cx)
+            .await
+            .expect("subagent cancellation");
+        assert_eq!(cancellation.session_id, acp::SessionId::new("child"));
+        cx.run_until_parked();
+        assert!(
+            harness.cancellations.is_empty(),
+            "stopping the subagent leaves the conversation running"
+        );
     }
 }

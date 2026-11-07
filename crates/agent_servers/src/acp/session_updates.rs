@@ -172,6 +172,13 @@ pub enum InboundSessionUpdate {
     Notice(acp_v2::Notice),
     Compaction(acp_v2::CompactionUpdate),
     CompactionSummary(acp_v2::CompactionSummaryChunk),
+    /// Announces or updates a child session this session owns. The connection
+    /// records it; it changes nothing in the thread itself.
+    SubagentUpdate(acp_v2::SubagentUpdate),
+    /// A message sent to or received from another session.
+    SessionMessage(acp_v2::SessionMessage),
+    /// A content block of a [`Self::SessionMessage`], which Zed does not show.
+    SessionMessageChunk,
 }
 
 impl From<DecodedTerminalNotification> for InboundSessionNotification {
@@ -244,6 +251,15 @@ impl TryFrom<acp_v2::UpdateSessionNotification> for InboundSessionNotification {
             }
             acp_v2::SessionUpdate::CompactionSummaryChunk(chunk) => {
                 InboundSessionUpdate::CompactionSummary(chunk)
+            }
+            acp_v2::SessionUpdate::SubagentUpdate(update) => {
+                InboundSessionUpdate::SubagentUpdate(update)
+            }
+            acp_v2::SessionUpdate::SessionMessage(message) => {
+                InboundSessionUpdate::SessionMessage(message)
+            }
+            acp_v2::SessionUpdate::SessionMessageChunk(_) => {
+                InboundSessionUpdate::SessionMessageChunk
             }
             update => {
                 notification.update = update;
@@ -332,6 +348,9 @@ impl InboundSessionNotification {
                 thread.append_context_compaction_summary(chunk, cx);
                 Ok(())
             }
+            InboundSessionUpdate::SubagentUpdate(_)
+            | InboundSessionUpdate::SessionMessage(_)
+            | InboundSessionUpdate::SessionMessageChunk => Ok(()),
         }
     }
 }
