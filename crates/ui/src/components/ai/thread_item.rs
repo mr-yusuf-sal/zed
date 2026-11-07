@@ -54,6 +54,7 @@ pub struct ThreadItem {
     hovered: bool,
     rounded: bool,
     is_truncated: bool,
+    single_line: bool,
     added: Option<usize>,
     removed: Option<usize>,
     project_paths: Option<Arc<[PathBuf]>>,
@@ -89,6 +90,7 @@ impl ThreadItem {
             hovered: false,
             rounded: false,
             is_truncated: true,
+            single_line: false,
             added: None,
             removed: None,
             project_paths: None,
@@ -225,6 +227,14 @@ impl ThreadItem {
         self
     }
 
+    /// Renders the row on a single line: the timestamp sits to the right of the
+    /// title (hidden while the action slot is shown on hover) and the metadata
+    /// line is dropped.
+    pub fn single_line(mut self, single_line: bool) -> Self {
+        self.single_line = single_line;
+        self
+    }
+
     pub fn on_click(
         mut self,
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -356,13 +366,17 @@ impl RenderOnce for ThreadItem {
 
         let title = self.title;
         let highlight_positions = self.highlight_positions;
+        let single_line = self.single_line;
+        // A single-line row ends the title with an ellipsis rather than fading it,
+        // since a fade would also paint over the timestamp on its right.
+        let truncate_title = !opaque_window || single_line;
 
         let title_label = if let Some(title_slot) = self.title_slot {
             title_slot
         } else if self.title_generating {
             Label::new(title)
                 .color(Color::Muted)
-                .when(!opaque_window, |label| label.truncate())
+                .when(truncate_title, |label| label.truncate())
                 .with_animation(
                     "generating-title",
                     Animation::new(Duration::from_secs(2))
@@ -374,12 +388,12 @@ impl RenderOnce for ThreadItem {
         } else if highlight_positions.is_empty() {
             Label::new(title)
                 .when_some(self.title_label_color, |label, color| label.color(color))
-                .when(!opaque_window, |label| label.truncate())
+                .when(truncate_title, |label| label.truncate())
                 .into_any_element()
         } else {
             HighlightedLabel::new(title, highlight_positions)
                 .when_some(self.title_label_color, |label, color| label.color(color))
-                .when(!opaque_window, |label| label.truncate())
+                .when(truncate_title, |label| label.truncate())
                 .into_any_element()
         };
 
@@ -421,11 +435,20 @@ impl RenderOnce for ThreadItem {
 
         let has_worktree = !linked_worktrees.is_empty();
 
-        let has_metadata = has_project_name
+        let show_action_slot = self.hovered && self.action_slot.is_some();
+        let inline_timestamp = (single_line && has_timestamp && !show_action_slot).then(|| {
+            Label::new(timestamp.clone())
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .flex_none()
+        });
+
+        let has_metadata = !single_line
+            && (has_project_name
             || has_project_paths
             || has_worktree
             || has_diff_stats
-            || has_timestamp;
+            || has_timestamp);
 
         v_flex()
             .id(self.id.clone())
@@ -462,9 +485,10 @@ impl RenderOnce for ThreadItem {
                             .child(icon)
                             .child(title_label),
                     )
-                    .when(self.is_truncated && opaque_window, |this| {
+                    .when(self.is_truncated && opaque_window && !single_line, |this| {
                         this.child(gradient_overlay)
                     })
+                    .children(inline_timestamp)
                     .when(self.hovered, |this| {
                         this.when_some(self.action_slot, |this, slot| {
                             this.child(
