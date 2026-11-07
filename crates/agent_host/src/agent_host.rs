@@ -57,6 +57,7 @@ const SESSION_SETUP_METHODS: [&str; 4] = [
     "session/resume",
     "session/fork",
 ];
+const INITIALIZE_METHOD: &str = "initialize";
 const PROMPT_METHOD: &str = "session/prompt";
 const CLOSE_METHOD: &str = "session/close";
 const CANCEL_REQUEST_METHOD: &str = "$/cancel_request";
@@ -425,6 +426,16 @@ struct Host {
     /// `session/prompt` is answered as soon as the agent accepts it, so a
     /// running turn, subagent or background command shows only here.
     busy_sessions: std::collections::HashSet<String>,
+    /// What the agent answered the `initialize` of the Zed that started it,
+    /// replayed to every Zed that connects later. The agent outlives the Zed
+    /// that initialized it, and over ACP v2 Claude Code refuses an
+    /// `initialize` that comes after other requests ("ACP v2 initialize must
+    /// not be repeated after other requests"), which left a reopened Zed
+    /// unable to start the agent panel.
+    initialize_result: Option<Value>,
+    /// The Zeds whose `initialize` arrived while the agent had not answered
+    /// the first one yet, by the generation and the id each sent.
+    initialize_waiters: Vec<(u64, Value)>,
     turn_waiters: Vec<TurnWaiter>,
     next_generation: u64,
     next_request_id: u64,
@@ -645,6 +656,8 @@ impl Host {
         });
         self.turn_waiters
             .retain(|waiter| waiter.generation != generation);
+        self.initialize_waiters
+            .retain(|(waiter, _)| *waiter != generation);
 
         let mut answered_locally = Vec::new();
         self.agent_requests.retain_mut(|request| {
@@ -833,6 +846,19 @@ impl Host {
 
         match (method, id) {
             (Some(method), Some(id)) => {
+                if method == INITIALIZE_METHOD {
+                    if let Some(result) = &self.initialize_result {
+                        let response = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+                        self.send_to(generation, STDOUT_TAG, &response.to_string());
+                        return;
+                    }
+                    // Answered for this Zed too once the agent answers the
+                    // `initialize` already on its way.
+                    if self.is_initializing() {
+                        self.initialize_waiters.push((generation, id));
+                        return;
+                    }
+                }
                 if method == CLOSE_METHOD
                     && let Some(session_id) = params_session_id(&message)
                 {
@@ -981,6 +1007,19 @@ impl Host {
                 {
                     self.answer_turn_waiters(session_id, &message);
                 }
+                if request.method == INITIALIZE_METHOD {
+                    if let Some(result) = message.get("result") {
+                        self.initialize_result = Some(result.clone());
+                    }
+                    // An error is passed on as it is, so that a Zed held here
+                    // is not left waiting for an agent that cannot start.
+                    let answer = message.clone();
+                    for (generation, id) in std::mem::take(&mut self.initialize_waiters) {
+                        let mut response = answer.clone();
+                        response["id"] = id;
+                        self.send_to(generation, STDOUT_TAG, &response.to_string());
+                    }
+                }
                 if !self.clients.contains_key(&request.generation) {
                     return;
                 }
@@ -1032,6 +1071,13 @@ impl Host {
                 self.record_session_state(&message);
             }
         }
+    }
+
+    /// Whether the agent has been sent an `initialize` it has not answered.
+    fn is_initializing(&self) -> bool {
+        self.client_requests
+            .values()
+            .any(|request| request.method == INITIALIZE_METHOD)
     }
 
     fn is_turn_running(&self, session_id: &str) -> bool {
@@ -1208,6 +1254,45 @@ mod tests {
         let line = next_line(receiver);
         let line = line.strip_prefix(STDOUT_TAG).unwrap_or(&line);
         serde_json::from_str(line).unwrap_or(Value::Null)
+    }
+
+    /// Over ACP v2 Claude Code refuses an `initialize` once other requests
+    /// came, so the host answers every Zed but the one that started the agent
+    /// from what the agent answered then.
+    #[test]
+    fn a_later_zed_is_answered_the_first_initialize() {
+        let (mut host, mut agent) = test_host();
+        let initialize = |id: i32| {
+            json!({"jsonrpc": "2.0", "id": id, "method": INITIALIZE_METHOD, "params": {
+                "protocolVersion": 2,
+            }})
+            .to_string()
+        };
+        let (first, mut first_client) = attach(&mut host);
+        host.handle_client_line(first, initialize(0));
+        assert_eq!(
+            next_message(&mut agent)["method"],
+            json!(INITIALIZE_METHOD),
+            "the first Zed's initialize reaches the agent"
+        );
+
+        // A second Zed, while the agent has not answered yet.
+        let (second, mut second_client) = attach(&mut host);
+        host.handle_client_line(second, initialize(0));
+        assert_eq!(next_line(&mut agent), "", "and no second initialize does");
+
+        let result = json!({"protocolVersion": 2, "agentCapabilities": {}});
+        host.handle_agent_line(json!({"jsonrpc": "2.0", "id": 0, "result": result}).to_string());
+        let answer =
+            |client: &mut mpsc::UnboundedReceiver<String>| next_message(client)["result"].clone();
+        assert_eq!(answer(&mut first_client), result);
+        assert_eq!(answer(&mut second_client), result, "both Zeds are answered");
+
+        // A third Zed, long after.
+        let (third, mut third_client) = attach(&mut host);
+        host.handle_client_line(third, initialize(0));
+        assert_eq!(next_line(&mut agent), "");
+        assert_eq!(answer(&mut third_client), result);
     }
 
     /// Over ACP v2 the agent answers `session/prompt` once it accepts the
