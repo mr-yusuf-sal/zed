@@ -212,7 +212,8 @@ struct ConnectionRuntime {
 }
 
 struct StdioStartup {
-    child: transport::OwnedChild,
+    /// `None` when the agent runs in an agent host, which outlives Zed.
+    child: Option<transport::OwnedChild>,
     stderr_task: Shared<Task<()>>,
     runtime: Rc<RefCell<Option<ConnectionRuntime>>>,
     drain: Option<futures::channel::oneshot::Sender<LocalBoxFuture<'static, ()>>>,
@@ -247,6 +248,10 @@ impl AcpV2Connection {
         agent_server_store: WeakEntity<AgentServerStore>,
         cx: &mut AsyncApp,
     ) -> Result<Self> {
+        // Claude Code's turns, subagents and background commands can run for a
+        // long time, so its sessions are kept going in an agent host when Zed
+        // quits, and a reopened Zed resumes them where they are.
+        let hosted = agent_id.as_ref() == crate::CLAUDE_AGENT_ID;
         let transport::StdioProcess {
             child,
             status,
@@ -254,11 +259,8 @@ impl AcpV2Connection {
             outgoing,
             stderr,
             debug_log,
-        } = transport::spawn_stdio(&project, command, false, cx).await?;
-        // Without an agent host the agent always runs as Zed's own child.
-        let child = transport::OwnedChild(
-            child.context("ACP v2 agent was not spawned as a child process")?,
-        );
+        } = transport::spawn_stdio(&project, command, hosted, cx).await?;
+        let child = child.map(transport::OwnedChild);
         let status = status
             .map(|result| {
                 result.map_err(|error| anyhow!("failed to wait for agent server exit: {error}"))
@@ -344,7 +346,7 @@ impl AcpV2Connection {
         let (runtime, child, stderr_task, drain_sender) = match startup {
             Some(startup) => (
                 startup.runtime,
-                Some(startup.child),
+                startup.child,
                 startup.stderr_task,
                 startup.drain,
             ),

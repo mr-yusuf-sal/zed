@@ -420,6 +420,11 @@ struct Host {
     /// `subagent_update`s. Zed never sets a subagent session up itself, so its
     /// messages go to the owner of the session at the root of this chain.
     subagent_parents: HashMap<String, String>,
+    /// The sessions whose latest ACP v2 `state_update` reports work going on:
+    /// a state other than `idle`, or work in its `background` list. Over v2 a
+    /// `session/prompt` is answered as soon as the agent accepts it, so a
+    /// running turn, subagent or background command shows only here.
+    busy_sessions: std::collections::HashSet<String>,
     turn_waiters: Vec<TurnWaiter>,
     next_generation: u64,
     next_request_id: u64,
@@ -733,10 +738,38 @@ impl Host {
 
     fn is_idle(&self) -> bool {
         self.clients.is_empty()
+            && self.busy_sessions.is_empty()
             && !self
                 .client_requests
                 .values()
                 .any(|request| request.method == PROMPT_METHOD)
+    }
+
+    /// Records whether the session of `message`, a `state_update`, still has
+    /// work going on.
+    fn record_session_state(&mut self, message: &Value) {
+        let Some(update) = message
+            .get("params")
+            .and_then(|params| params.get("update"))
+        else {
+            return;
+        };
+        if update.get("sessionUpdate").and_then(Value::as_str) != Some("state_update") {
+            return;
+        }
+        let Some(session_id) = params_session_id(message) else {
+            return;
+        };
+        let idle = update.get("state").and_then(Value::as_str) == Some("idle");
+        let background = update
+            .get("background")
+            .and_then(Value::as_array)
+            .is_some_and(|background| !background.is_empty());
+        if idle && !background {
+            self.busy_sessions.remove(&session_id);
+        } else {
+            self.busy_sessions.insert(session_id);
+        }
     }
 
     fn request_exit(&mut self) {
@@ -996,6 +1029,7 @@ impl Host {
                 // After the update, so that Zed knows the subagent by the
                 // time its held requests arrive.
                 self.record_subagent_parent(&message);
+                self.record_session_state(&message);
             }
         }
     }
@@ -1174,6 +1208,49 @@ mod tests {
         let line = next_line(receiver);
         let line = line.strip_prefix(STDOUT_TAG).unwrap_or(&line);
         serde_json::from_str(line).unwrap_or(Value::Null)
+    }
+
+    /// Over ACP v2 the agent answers `session/prompt` once it accepts the
+    /// prompt, so the host keeps the agent going on what the session's
+    /// `state_update`s report: a running turn, or background work after it.
+    #[test]
+    fn v2_work_keeps_the_host_from_stopping_the_agent() {
+        let (mut host, _agent) = test_host();
+        let (generation, _client) = attach(&mut host);
+        host.handle_client_line(
+            generation,
+            json!({"jsonrpc": "2.0", "id": 0, "method": PROMPT_METHOD, "params": {"sessionId": "s"}})
+                .to_string(),
+        );
+        host.handle_agent_line(
+            json!({"jsonrpc": "2.0", "id": 0, "result": {"messageId": "m"}}).to_string(),
+        );
+        let state = |session_id: &str, state: &str, background: Value| {
+            json!({"jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": session_id,
+                "update": {"sessionUpdate": "state_update", "state": state, "background": background},
+            }})
+            .to_string()
+        };
+        host.handle_agent_line(state("s", "running", json!([])));
+        host.detach(generation);
+        assert!(!host.is_idle(), "the turn runs on with Zed closed");
+
+        host.handle_agent_line(state(
+            "s",
+            "idle",
+            json!([{"type": "terminal", "terminalId": "t"}, {"type": "subagent", "sessionId": "c"}]),
+        ));
+        host.handle_agent_line(state("c", "running", json!([])));
+        assert!(
+            !host.is_idle(),
+            "a background command and subagent outlive the turn"
+        );
+
+        host.handle_agent_line(state("s", "idle", json!([])));
+        assert!(!host.is_idle(), "the subagent still works");
+        host.handle_agent_line(state("c", "idle", json!([])));
+        assert!(host.is_idle());
     }
 
     #[test]
