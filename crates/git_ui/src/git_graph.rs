@@ -30,12 +30,12 @@ use git::{
     status::{FileStatus, StatusCode, TrackedStatus},
 };
 use gpui::{
-    Action, Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, DefiniteLength,
-    DismissEvent, Div, DragMoveEvent, ElementId, Empty, Entity, EventEmitter, FocusHandle,
-    Focusable, Hsla, MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, PromptLevel,
-    ScrollEvent, ScrollHandle, ScrollStrategy, SharedString, Subscription, Task, TextRun,
-    TextStyleRefinement, UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred,
-    point, prelude::*, px, uniform_list,
+    Action, Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, CursorStyle,
+    DefiniteLength, DismissEvent, DispatchPhase, Div, DragMoveEvent, ElementId, Empty, Entity,
+    EventEmitter, FocusHandle, Focusable, Hsla, MouseButton, MouseDownEvent, MouseUpEvent,
+    PathBuilder, Pixels, Point, PromptLevel, ScrollEvent, ScrollHandle, ScrollStrategy,
+    SharedString, Subscription, Task, TextRun, TextStyleRefinement, UniformListScrollHandle,
+    WeakEntity, Window, actions, anchored, canvas, deferred, point, prelude::*, px, uniform_list,
 };
 use language::line_diff;
 use markdown::{Markdown, MarkdownElement};
@@ -128,6 +128,24 @@ const HIDDEN_COLUMNS_PATH_HISTORY_KEY: &str = "git_graph_path_history_hidden_col
 const DETAIL_PANEL_POSITION_KEY: &str = "git_graph_detail_panel_position";
 const AUTO_FETCH_KEY: &str = "git_graph_auto_fetch";
 const AUTO_FETCH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// How far the pointer can move from where the middle button was pressed
+/// before autoscroll starts moving the graph.
+const AUTOSCROLL_DEAD_ZONE: Pixels = px(8.);
+const AUTOSCROLL_FRAME: Duration = Duration::from_millis(16);
+/// Pixels scrolled per frame for every pixel the pointer is beyond the dead zone.
+const AUTOSCROLL_SPEED: f32 = 0.12;
+const AUTOSCROLL_MAX_STEP: Pixels = px(160.);
+
+/// Middle-click autoscroll: the graph scrolls towards the pointer, faster the
+/// farther it is from `anchor`, until any button is pressed or Escape. Holding
+/// the middle button and dragging ends it on release instead.
+struct MiddleClickAutoscroll {
+    anchor: Point<Pixels>,
+    /// The pointer has left the dead zone since the press, so releasing the
+    /// middle button ends the autoscroll.
+    moved: bool,
+    _task: Task<()>,
+}
 const DETAIL_PANEL_RATIOS_KEY: &str = "git_graph_detail_panel_ratios";
 const LAST_SELECTION_KEY: &str = "git_graph_last_selection";
 /// One entry per repository ever shown, so the store is bounded; repositories of projects not
@@ -2045,6 +2063,7 @@ pub struct GitGraph {
     operation_in_progress: Option<OperationInProgress>,
     auto_fetch_enabled: bool,
     _auto_fetch_task: Option<Task<()>>,
+    autoscroll: Option<MiddleClickAutoscroll>,
     _operation_in_progress_task: Option<Task<()>>,
     changed_files_view_mode: ChangedFilesViewMode,
     commit_details_position: DetailPanelPosition,
@@ -2333,6 +2352,7 @@ impl GitGraph {
             operation_in_progress: None,
             auto_fetch_enabled: Self::restore_auto_fetch(cx),
             _auto_fetch_task: None,
+            autoscroll: None,
             _operation_in_progress_task: None,
             changed_files_view_mode: ChangedFilesViewMode::default(),
             commit_details_position: Self::restore_detail_panel_position(cx),
@@ -3174,7 +3194,60 @@ Checked out in worktree {}",
     }
 
     fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.autoscroll.is_some() {
+            self.stop_autoscroll(cx);
+            return;
+        }
         self.clear_selection(cx);
+    }
+
+    fn start_autoscroll(
+        &mut self,
+        anchor: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let task = cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(AUTOSCROLL_FRAME).await;
+                let Ok(true) =
+                    this.update_in(cx, |this, window, cx| this.step_autoscroll(window, cx))
+                else {
+                    break;
+                };
+            }
+        });
+        self.autoscroll = Some(MiddleClickAutoscroll {
+            anchor,
+            moved: false,
+            _task: task,
+        });
+        cx.notify();
+    }
+
+    fn stop_autoscroll(&mut self, cx: &mut Context<Self>) {
+        if self.autoscroll.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Scrolls one frame's worth towards the pointer. Returns whether the
+    /// autoscroll is still running.
+    fn step_autoscroll(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(autoscroll) = self.autoscroll.as_mut() else {
+            return false;
+        };
+        let offset = window.mouse_position().y - autoscroll.anchor.y;
+        let beyond = offset.abs() - AUTOSCROLL_DEAD_ZONE;
+        if beyond > px(0.) {
+            autoscroll.moved = true;
+            let step = (beyond * AUTOSCROLL_SPEED).min(AUTOSCROLL_MAX_STEP);
+            // A pointer below the anchor moves further down the history,
+            // which is a more negative scroll offset.
+            let delta = if offset > px(0.) { -step } else { step };
+            self.scroll_graph_by(delta, window, cx);
+        }
+        true
     }
 
     fn clear_selection(&mut self, cx: &mut Context<Self>) {
@@ -4613,6 +4686,30 @@ Checked out in worktree {}",
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.toggle_auto_fetch(cx);
                     })),
+            )
+            .child(
+                IconButton::new("git-graph-remotes", IconName::Server)
+                    .icon_size(IconSize::Small)
+                    .disabled(repository.is_none())
+                    .tooltip(Tooltip::text("Manage remotes: add, rename, remove or change a URL"))
+                    .on_click({
+                        let repository = repository.clone();
+                        let workspace = self.workspace.clone();
+                        move |_, window, cx| {
+                            let Some(repository) = repository.clone() else {
+                                return;
+                            };
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    workspace.toggle_modal(window, cx, |window, cx| {
+                                        crate::remotes_modal::RemotesModal::new(
+                                            repository, window, cx,
+                                        )
+                                    });
+                                })
+                                .log_err();
+                        }
+                    }),
             )
             .child(remote_button(
                 "git-graph-fetch",
@@ -7870,6 +7967,74 @@ Checked out in worktree {}",
             .into_any_element()
     }
 
+    /// The marker at the autoscroll anchor, plus the window-wide mouse
+    /// listeners that end the autoscroll, wherever the pointer has gone.
+    fn render_autoscroll_overlay(
+        &self,
+        anchor: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let weak = cx.weak_entity();
+        let listeners = canvas(
+            |_, _, _| {},
+            move |_, _, window, _| {
+                window.set_window_cursor_style(CursorStyle::ResizeUpDown);
+                window.on_mouse_event({
+                    let weak = weak.clone();
+                    move |_: &MouseDownEvent, phase, _, cx| {
+                        if phase != DispatchPhase::Capture {
+                            return;
+                        }
+                        // The press only ends the autoscroll; it doesn't also
+                        // select a commit or open a menu.
+                        cx.stop_propagation();
+                        weak.update(cx, |this, cx| this.stop_autoscroll(cx)).ok();
+                    }
+                });
+                window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                    if phase != DispatchPhase::Capture || event.button != MouseButton::Middle {
+                        return;
+                    }
+                    weak.update(cx, |this, cx| {
+                        if this
+                            .autoscroll
+                            .as_ref()
+                            .is_some_and(|autoscroll| autoscroll.moved)
+                        {
+                            this.stop_autoscroll(cx);
+                        }
+                    })
+                    .ok();
+                });
+            },
+        )
+        .absolute()
+        .size_full();
+
+        let size = px(24.);
+        let marker = div()
+            .size(size)
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().elevated_surface_background)
+            .shadow_sm()
+            .child(
+                Icon::new(IconName::ChevronUpDown)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            );
+
+        div().absolute().child(listeners).child(deferred(
+            anchored()
+                .position(anchor - point(size / 2., size / 2.))
+                .child(marker),
+        ))
+    }
+
     fn render_graph_canvas(&self, window: &Window, cx: &mut Context<GitGraph>) -> impl IntoElement {
         let row_height = Self::row_height(window, cx);
         let visible_row_count = self.visible_row_count(window, cx);
@@ -8490,7 +8655,12 @@ Checked out in worktree {}",
     ) {
         let line_height = window.line_height();
         let delta = event.delta.pixel_delta(line_height);
+        self.scroll_graph_by(delta.y, window, cx);
+    }
 
+    /// Moves the graph and the table together; a positive `delta_y` scrolls
+    /// towards the newest commits.
+    fn scroll_graph_by(&mut self, delta_y: Pixels, window: &mut Window, cx: &mut Context<Self>) {
         let table_state = self.table_interaction_state.read(cx);
         let current_offset = table_state.scroll_offset();
 
@@ -8504,7 +8674,7 @@ Checked out in worktree {}",
         let content_height = Self::row_height(window, cx) * commit_count;
         let max_vertical_scroll = (viewport_height - content_height).min(px(0.));
 
-        let new_y = (current_offset.y + delta.y).clamp(max_vertical_scroll, px(0.));
+        let new_y = (current_offset.y + delta_y).clamp(max_vertical_scroll, px(0.));
         let new_offset = Point::new(current_offset.x, new_y);
 
         if new_offset != current_offset {
@@ -8977,12 +9147,26 @@ impl Render for GitGraph {
                                     cx.processor(Self::render_table_rows),
                                 );
 
+                            let autoscroll_anchor =
+                                self.autoscroll.as_ref().map(|autoscroll| autoscroll.anchor);
                             bind_redistributable_columns(
                                 div()
                                     .relative()
                                     .flex_1()
                                     .w_full()
                                     .overflow_hidden()
+                                    .on_mouse_down(
+                                        MouseButton::Middle,
+                                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                            if this.autoscroll.is_none() {
+                                                this.start_autoscroll(event.position, window, cx);
+                                            }
+                                            cx.stop_propagation();
+                                        }),
+                                    )
+                                    .when_some(autoscroll_anchor, |this, anchor| {
+                                        this.child(self.render_autoscroll_overlay(anchor, cx))
+                                    })
                                     .child(
                                         h_flex()
                                             .size_full()

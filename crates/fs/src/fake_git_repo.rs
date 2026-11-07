@@ -1673,6 +1673,35 @@ impl GitRepository for FakeGitRepository {
         })
     }
 
+    fn rename_remote(&self, old_name: String, new_name: String) -> BoxFuture<'_, Result<()>> {
+        self.with_state_async(true, move |state| {
+            let url = state
+                .remotes
+                .remove(&old_name)
+                .with_context(|| format!("no such remote: {old_name}"))?;
+            state.remotes.insert(new_name.clone(), url);
+            state.branches = std::mem::take(&mut state.branches)
+                .into_iter()
+                .map(|branch| match branch.split_once('/') {
+                    Some((remote, rest)) if remote == old_name => format!("{new_name}/{rest}"),
+                    _ => branch,
+                })
+                .collect();
+            Ok(())
+        })
+    }
+
+    fn set_remote_url(&self, name: String, url: String) -> BoxFuture<'_, Result<()>> {
+        self.with_state_async(true, move |state| {
+            let existing = state
+                .remotes
+                .get_mut(&name)
+                .with_context(|| format!("no such remote: {name}"))?;
+            *existing = url;
+            Ok(())
+        })
+    }
+
     fn remove_remote(&self, name: String) -> BoxFuture<'_, Result<()>> {
         self.with_state_async(true, move |state| {
             state.branches.retain(|branch| {

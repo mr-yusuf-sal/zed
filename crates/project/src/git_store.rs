@@ -9145,6 +9145,48 @@ impl Repository {
         )
     }
 
+    pub fn rename_remote(
+        &mut self,
+        old_name: String,
+        new_name: String,
+    ) -> oneshot::Receiver<Result<()>> {
+        self.send_job(
+            "rename_remote",
+            Some(format!("git remote rename {old_name} {new_name}").into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend.rename_remote(old_name, new_name).await
+                    }
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("Renaming a remote is not supported in remote projects")
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn set_remote_url(
+        &mut self,
+        remote_name: String,
+        remote_url: String,
+    ) -> oneshot::Receiver<Result<()>> {
+        self.send_job(
+            "set_remote_url",
+            Some(format!("git remote set-url {remote_name} {remote_url}").into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend.set_remote_url(remote_name, remote_url).await
+                    }
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("Changing a remote's URL is not supported in remote projects")
+                    }
+                }
+            },
+        )
+    }
+
     pub fn remove_remote(&mut self, remote_name: String) -> oneshot::Receiver<Result<()>> {
         let id = self.id;
         self.send_job(

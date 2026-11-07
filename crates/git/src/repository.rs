@@ -774,6 +774,30 @@ impl LogSource {
     }
 }
 
+/// The upstream of the branch a `LogSource::Branch` names, as a full ref name.
+/// A branch's graph also walks its upstream, so commits that were fetched but
+/// not pulled yet show up in it rather than only in the pull count.
+async fn branch_upstream(git: &GitBinary, log_source: &LogSource) -> Option<String> {
+    let LogSource::Branch(branch) = log_source else {
+        return None;
+    };
+    let branch = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+    let output = git
+        .build_command(&[
+            "rev-parse",
+            "--symbolic-full-name",
+            &format!("{branch}@{{upstream}}"),
+        ])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let upstream = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (!upstream.is_empty()).then_some(upstream)
+}
+
 pub struct SearchCommitArgs {
     pub query: SharedString,
     pub case_sensitive: bool,
@@ -1136,6 +1160,10 @@ pub trait GitRepository: Send + Sync {
     fn remove_remote(&self, name: String) -> BoxFuture<'_, Result<()>>;
 
     fn create_remote(&self, name: String, url: String) -> BoxFuture<'_, Result<()>>;
+
+    fn rename_remote(&self, old_name: String, new_name: String) -> BoxFuture<'_, Result<()>>;
+
+    fn set_remote_url(&self, name: String, url: String) -> BoxFuture<'_, Result<()>>;
 
     /// returns a list of remote branches that contain HEAD
     fn check_for_pushed_commit(&self) -> BoxFuture<'_, Result<Vec<SharedString>>>;
@@ -3152,6 +3180,28 @@ impl GitRepository for RealGitRepository {
             .boxed()
     }
 
+    fn rename_remote(&self, old_name: String, new_name: String) -> BoxFuture<'_, Result<()>> {
+        let git_binary = self.git_binary();
+        self.executor
+            .spawn(async move {
+                git_binary
+                    .run(&["remote", "rename", &old_name, &new_name])
+                    .await?;
+                Ok(())
+            })
+            .boxed()
+    }
+
+    fn set_remote_url(&self, name: String, url: String) -> BoxFuture<'_, Result<()>> {
+        let git_binary = self.git_binary();
+        self.executor
+            .spawn(async move {
+                git_binary.run(&["remote", "set-url", &name, &url]).await?;
+                Ok(())
+            })
+            .boxed()
+    }
+
     fn check_for_pushed_commit(&self) -> BoxFuture<'_, Result<Vec<SharedString>>> {
         let git = self.git_binary_in_worktree();
         self.executor
@@ -3504,7 +3554,12 @@ impl GitRepository for RealGitRepository {
         let git = self.git_binary();
 
         async move {
-            let log_source_args = log_source.get_args();
+            let mut log_source_args = log_source.get_args();
+            if let Some(upstream) = branch_upstream(&git, &log_source).await {
+                // The revisions end with the `--` terminator.
+                let terminator = log_source_args.len().saturating_sub(1);
+                log_source_args.insert(terminator, Cow::Owned(upstream));
+            }
             let mut git_log_command = vec!["log", GRAPH_COMMIT_FORMAT, log_order.as_arg()];
             git_log_command.extend(log_source_args.iter().map(|arg| arg.as_ref()));
             let mut command = git.build_command(&git_log_command);
@@ -3576,7 +3631,12 @@ impl GitRepository for RealGitRepository {
         let git = self.git_binary();
 
         async move {
-            let log_source_args = log_source.get_args();
+            let mut log_source_args = log_source.get_args();
+            if let Some(upstream) = branch_upstream(&git, &log_source).await {
+                // The revisions end with the `--` terminator.
+                let terminator = log_source_args.len().saturating_sub(1);
+                log_source_args.insert(terminator, Cow::Owned(upstream));
+            }
             let filters = CommitSearchFilters::parse(search_args.query.as_str());
             let mut args = vec!["log", SEARCH_COMMIT_FORMAT];
             let hash_query = (!filters.has_qualifiers())
