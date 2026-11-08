@@ -1,7 +1,8 @@
 # Starts the installed Zed after build.ps1 -Install or install-detached.ps1 replaced it.
-# `-Elevated`: the Zed that the install stopped ran elevated, so this one does too. Agent hosts
-# are separate for elevated and unelevated Zed, and a Zed of the other elevation would not find
-# the Claude Code turns, subagents and background commands that kept running.
+# `-Elevated` starts Zed elevated: build.ps1 always asks for it, install-detached.ps1 when the
+# Zed it stopped ran elevated. Agent hosts are separate for elevated and unelevated Zed, and a
+# Zed of the other elevation would not find the Claude Code turns, subagents and background
+# commands that kept running.
 param([Parameter(Mandatory)][string]$Target, [switch]$Elevated)
 
 # Explorer runs Zed.exe for every file it opens, only to hand the path to the running Zed, so
@@ -32,19 +33,23 @@ function Start-Unelevated {
     if ($elevated) { Start-Process explorer.exe -ArgumentList "`"$Target`"" } else { Start-Process $Target }
 }
 
-function Start-Elevated {
-    # A Zed started by an elevated script inherits its token; otherwise Windows asks once.
-    $current = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    if ($current) { Start-Process $Target } else { Start-Process $Target -Verb RunAs }
+$scriptElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+# An elevated script starts an elevated Zed directly: it inherits the script's token, and its
+# window shows as soon as the session is restored.
+if ($Elevated -and $scriptElevated) {
+    Start-Process $Target
+    return
 }
 
 # The login task runs Zed elevated without a UAC prompt. Without it, Zed is started with the
-# elevation of the Zed the install stopped. (An elevated Zed once saw an empty Windows
-# Credential Manager; git's credential store now uses DPAPI, which works either way.)
+# requested elevation, and Windows asks once for an elevated one. (An elevated Zed once saw an
+# empty Windows Credential Manager; git's credential store now uses DPAPI, which works either
+# way.)
 $task = Get-ScheduledTask -TaskPath '\' -TaskName 'Zed' -ErrorAction SilentlyContinue |
     Where-Object { $_.Principal.RunLevel -eq 'Highest' }
 if (-not $task) {
-    if ($Elevated) { Start-Elevated } else { Start-Unelevated }
+    if ($Elevated) { Start-Process $Target -Verb RunAs } else { Start-Unelevated }
     return
 }
 
@@ -56,8 +61,18 @@ $pipe = '\\.\pipe\Zed-Editor-Stable-Named-Pipe'
 for ($i = 0; $i -lt 60 -and -not ([IO.Directory]::GetFiles('\\.\pipe\') -contains $pipe); $i++) {
     Start-Sleep -Milliseconds 500
 }
-if ([IO.Directory]::GetFiles('\\.\pipe\') -contains $pipe) {
-    Start-Unelevated
-} else {
+if (-not ([IO.Directory]::GetFiles('\\.\pipe\') -contains $pipe)) {
     Write-Warning "The elevated Zed from the 'Zed' task did not come up within 30 s; run 'schtasks /run /tn Zed' to start it."
+    return
 }
+# A hidden Zed ignores the launch that would show it until it has restored the session, which
+# can take longer than the pipe does to appear, and it then stays in the tray. The launch is
+# repeated until a Zed window shows.
+for ($i = 0; $i -lt 20; $i++) {
+    Start-Unelevated
+    Start-Sleep -Seconds 3
+    if (Get-Process -Name Zed -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 }) {
+        return
+    }
+}
+Write-Warning "Zed is running in the tray, but its window did not show within 60 s."
