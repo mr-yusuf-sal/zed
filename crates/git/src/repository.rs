@@ -3564,6 +3564,16 @@ impl GitRepository for RealGitRepository {
                 let terminator = log_source_args.len().saturating_sub(1);
                 log_source_args.insert(terminator, Cow::Owned(upstream));
             }
+            let stashes = if log_source == LogSource::All {
+                GraphStashes::load(&git).await
+            } else {
+                GraphStashes::default()
+            };
+            let terminator = log_source_args.len().saturating_sub(1);
+            log_source_args.splice(
+                terminator..terminator,
+                stashes.shas.iter().map(|sha| Cow::Owned(sha.to_string())),
+            );
             let mut git_log_command = vec!["log", GRAPH_COMMIT_FORMAT, log_order.as_arg()];
             git_log_command.extend(log_source_args.iter().map(|arg| arg.as_ref()));
             let mut command = git.build_command(&git_log_command);
@@ -3584,7 +3594,8 @@ impl GitRepository for RealGitRepository {
 
                 if bytes_read == 0 {
                     if !lines.is_empty() {
-                        let commits = parse_initial_graph_output(lines.iter().map(|s| s.as_str()));
+                        let commits =
+                            parse_initial_graph_output(lines.iter().map(|s| s.as_str()), &stashes);
                         if request_tx.send(commits).await.is_err() {
                             log::warn!(
                                 "initial_graph_data: receiver dropped while sending commits"
@@ -3598,7 +3609,8 @@ impl GitRepository for RealGitRepository {
                 lines.push(line);
 
                 if lines.len() >= GRAPH_CHUNK_SIZE {
-                    let commits = parse_initial_graph_output(lines.iter().map(|s| s.as_str()));
+                    let commits =
+                        parse_initial_graph_output(lines.iter().map(|s| s.as_str()), &stashes);
                     if request_tx.send(commits).await.is_err() {
                         log::warn!("initial_graph_data: receiver dropped while streaming commits");
                         break;
@@ -3930,8 +3942,56 @@ fn parse_file_history_changed_files_output(
     histories
 }
 
+/// The stashes the graph of every ref shows. A stash is a merge of the commit
+/// it was made on with helper commits holding the index and the untracked
+/// files, so the graph walks it as a commit off its first parent and leaves
+/// the helpers out.
+#[derive(Default)]
+struct GraphStashes {
+    shas: Vec<Oid>,
+    stashes: HashSet<Oid>,
+    helpers: HashSet<Oid>,
+}
+
+impl GraphStashes {
+    async fn load(git: &GitBinary) -> Self {
+        let output = git
+            .build_command(&["stash", "list", "--format=%H%x00%P"])
+            .output()
+            .await;
+        match output {
+            Ok(output) if output.status.success() => {
+                Self::parse(&String::from_utf8_lossy(&output.stdout))
+            }
+            _ => Self::default(),
+        }
+    }
+
+    fn parse(output: &str) -> Self {
+        let mut stashes = Self::default();
+        for line in output.lines() {
+            let mut parts = line.split('\x00');
+            let Some(sha) = parts.next().and_then(|sha| Oid::from_str(sha.trim()).ok()) else {
+                continue;
+            };
+            let parents = parts.next().unwrap_or_default();
+            stashes.helpers.extend(
+                parents
+                    .split_whitespace()
+                    .skip(1)
+                    .filter_map(|parent| Oid::from_str(parent).ok()),
+            );
+            if stashes.stashes.insert(sha) {
+                stashes.shas.push(sha);
+            }
+        }
+        stashes
+    }
+}
+
 fn parse_initial_graph_output<'a>(
     lines: impl Iterator<Item = &'a str>,
+    stashes: &GraphStashes,
 ) -> Vec<Arc<InitialGraphCommitData>> {
     lines
         .filter(|line| !line.is_empty())
@@ -3940,10 +4000,15 @@ fn parse_initial_graph_output<'a>(
             let mut parts = line.split('\x00');
 
             let sha = Oid::from_str(parts.next()?).ok()?;
+            if stashes.helpers.contains(&sha) {
+                return None;
+            }
+            let is_stash = stashes.stashes.contains(&sha);
             let parents_str = parts.next()?;
             let parents = parents_str
                 .split_whitespace()
                 .filter_map(|p| Oid::from_str(p).ok())
+                .take(if is_stash { 1 } else { usize::MAX })
                 .collect();
 
             let ref_names_str = parts.next().unwrap_or("");
@@ -3952,7 +4017,9 @@ fn parse_initial_graph_output<'a>(
             } else {
                 ref_names_str
                     .split(", ")
-                    .filter(|decoration| *decoration != "grafted" && *decoration != "replaced")
+                    .filter(|decoration| {
+                        !matches!(*decoration, "grafted" | "replaced" | "refs/stash")
+                    })
                     .map(|s| SharedString::from(s.to_string()))
                     .collect()
             };
@@ -5722,7 +5789,7 @@ mod tests {
     #[test]
     fn test_parse_initial_graph_output_filters_graft_decorations() {
         let line = "0f36a166633a057bf7dd660508d237cad2606cab\x00\x00grafted, HEAD -> refs/heads/main, refs/remotes/origin/main";
-        let commits = parse_initial_graph_output([line].into_iter());
+        let commits = parse_initial_graph_output([line].into_iter(), &GraphStashes::default());
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0].parents.len(), 0);
         assert_eq!(
@@ -7186,6 +7253,65 @@ mod tests {
         let graph = graph_commits().await;
         assert!(graph.contains(&branch_sha));
         assert!(graph.contains(&hidden_sha));
+    }
+
+    #[gpui::test]
+    async fn test_initial_graph_data_shows_stashes_without_their_helpers(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let path = repo_dir.path();
+        git_init_repo(path);
+        fs::write(path.join("file"), "1").unwrap();
+        git_command(path, ["add", "file"]);
+        git_command(path, ["commit", "-m", "base"]);
+        let base_sha = Oid::from_str(&git_command_output(path, ["rev-parse", "HEAD"])).unwrap();
+
+        fs::write(path.join("file"), "2").unwrap();
+        fs::write(path.join("untracked"), "u").unwrap();
+        git_command(
+            path,
+            ["stash", "push", "--include-untracked", "-m", "older"],
+        );
+        fs::write(path.join("file"), "3").unwrap();
+        git_command(path, ["stash", "push", "-m", "newer"]);
+        let stash_list = git_command_output(path, ["stash", "list", "--format=%H %P"]);
+        let stashes = stash_list
+            .lines()
+            .map(|line| {
+                let mut shas = line
+                    .split_whitespace()
+                    .map(|sha| Oid::from_str(sha).unwrap());
+                (shas.next().unwrap(), shas.collect::<Vec<_>>())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(stashes.len(), 2);
+
+        let repo =
+            RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
+                .unwrap();
+        let (tx, rx) = smol::channel::unbounded();
+        repo.initial_graph_data(LogSource::All, LogOrder::DateOrder, tx)
+            .await
+            .unwrap();
+        let mut commits = HashMap::default();
+        while let Ok(chunk) = rx.try_recv() {
+            for commit in chunk {
+                commits.insert(commit.sha, commit);
+            }
+        }
+
+        assert!(commits.contains_key(&base_sha));
+        for (stash_sha, parents) in &stashes {
+            let stash = commits.get(stash_sha).expect("stash is in the graph");
+            assert_eq!(stash.parents.as_slice(), &[base_sha]);
+            assert!(stash.ref_names.is_empty(), "{:?}", stash.ref_names);
+            for helper in &parents[1..] {
+                assert!(!commits.contains_key(helper), "helper {helper} is shown");
+            }
+        }
+        assert_eq!(commits.len(), 3);
     }
 
     #[gpui::test]

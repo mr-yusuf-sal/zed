@@ -24,9 +24,10 @@ use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
     parse_git_remote_url,
     repository::{
-        CommitData, CommitOptions, FetchOptions, InitialGraphCommitData, LogOrder, LogSource, RepoPath,
-        ResetMode, SearchCommitArgs,
+        CommitData, CommitOptions, FetchOptions, InitialGraphCommitData, LogOrder, LogSource,
+        RepoPath, ResetMode, SearchCommitArgs,
     },
+    stash::StashEntry,
     status::{FileStatus, StatusCode, TrackedStatus},
 };
 use gpui::{
@@ -2009,6 +2010,13 @@ impl Render for DraggedRef {
     }
 }
 
+#[derive(Clone, Copy)]
+enum StashAction {
+    Apply,
+    Pop,
+    Drop,
+}
+
 enum RefKind {
     Tag(String),
     LocalBranch {
@@ -2714,7 +2722,9 @@ impl GitGraph {
             RepositoryEvent::TagsChanged => {
                 self.reload_after_ref_change(cx);
             }
-            RepositoryEvent::HeadChanged | RepositoryEvent::BranchListChanged => {
+            RepositoryEvent::HeadChanged
+            | RepositoryEvent::BranchListChanged
+            | RepositoryEvent::StashEntriesChanged => {
                 // Only invalidate if we scanned atleast once,
                 // meaning we are not inside the initial repo loading state
                 // NOTE: this fixes an loading performance regression
@@ -2938,6 +2948,48 @@ Checked out in worktree {}",
                             cx,
                         );
                     }
+                }),
+            )
+            .tooltip(move |_window, cx| Tooltip::simple(tooltip_text.clone(), cx))
+            .into_any_element()
+    }
+
+    fn render_stash_chip(
+        &self,
+        stash: StashEntry,
+        accent_color: gpui::Hsla,
+        background: gpui::Hsla,
+        commit_idx: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let name = SharedString::from(format!("stash@{{{}}}", stash.index));
+        let tooltip_text = SharedString::from(format!("{name}\n{}", stash.message));
+        div()
+            .id(SharedString::from(format!(
+                "git-graph-stash-chip-{commit_idx}"
+            )))
+            .min_w_0()
+            .overflow_hidden()
+            .child(
+                Chip::new(name)
+                    .label_size(LabelSize::Small)
+                    .truncate()
+                    .icon(IconName::Archive)
+                    .icon_color(Color::Custom(accent_color))
+                    .bg_color(background.blend(accent_color.opacity(0.08)))
+                    .border_color(accent_color.opacity(0.25)),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.deploy_stash_context_menu(
+                        event.position,
+                        commit_idx,
+                        stash.clone(),
+                        window,
+                        cx,
+                    );
                 }),
             )
             .tooltip(move |_window, cx| Tooltip::simple(tooltip_text.clone(), cx))
@@ -3265,7 +3317,12 @@ Checked out in worktree {}",
         let Some(repository) = self.get_repository(cx) else {
             return;
         };
-        let Some(sha) = self.graph_data.commits.get(row).map(|commit| commit.data.sha) else {
+        let Some(sha) = self
+            .graph_data
+            .commits
+            .get(row)
+            .map(|commit| commit.data.sha)
+        else {
             return;
         };
         let log_source = self.log_source.clone();
@@ -3980,15 +4037,136 @@ Checked out in worktree {}",
             return;
         };
 
+        let stash = self.stash_at(entry_index, cx).map(|stash| stash.index);
         CommitView::open(
             commit_entry.data.sha.to_string(),
             repository.downgrade(),
             self.workspace.clone(),
-            None,
+            stash,
             None,
             window,
             cx,
         );
+    }
+
+    /// The stash the row at `index` shows, if it is one.
+    fn stash_at(&self, index: usize, cx: &App) -> Option<StashEntry> {
+        let sha = self.graph_data.commits.get(index)?.data.sha;
+        self.get_repository(cx)?
+            .read(cx)
+            .cached_stash()
+            .entries
+            .iter()
+            .find(|stash| stash.oid == sha)
+            .cloned()
+    }
+
+    fn stashes_by_commit(&self, cx: &App) -> HashMap<Oid, StashEntry> {
+        let Some(repository) = self.get_repository(cx) else {
+            return HashMap::default();
+        };
+        repository
+            .read(cx)
+            .cached_stash()
+            .entries
+            .iter()
+            .map(|stash| (stash.oid, stash.clone()))
+            .collect()
+    }
+
+    fn deploy_stash_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        index: usize,
+        stash: StashEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let git_graph = cx.entity();
+        let stash_index = stash.index;
+        let context_menu = ContextMenu::build(window, cx, move |menu, window, _| {
+            menu.header(format!("stash@{{{stash_index}}}"))
+                .entry(
+                    "Open Stash",
+                    None,
+                    window.handler_for(&git_graph, move |this, window, cx| {
+                        this.open_commit_view(index, window, cx);
+                    }),
+                )
+                .separator()
+                .entry(
+                    "Apply Stash",
+                    None,
+                    window.handler_for(&git_graph, move |this, window, cx| {
+                        this.run_stash_action(stash_index, StashAction::Apply, window, cx);
+                    }),
+                )
+                .entry(
+                    "Pop Stash",
+                    None,
+                    window.handler_for(&git_graph, move |this, window, cx| {
+                        this.run_stash_action(stash_index, StashAction::Pop, window, cx);
+                    }),
+                )
+                .entry(
+                    "Drop Stash",
+                    None,
+                    window.handler_for(&git_graph, move |this, window, cx| {
+                        this.confirm_then(
+                            format!("Drop stash@{{{stash_index}}}?"),
+                            "The stashed changes are deleted.",
+                            "Drop",
+                            window,
+                            cx,
+                            move |this, window, cx| {
+                                this.run_stash_action(stash_index, StashAction::Drop, window, cx);
+                            },
+                        );
+                    }),
+                )
+                .separator()
+                .entry(
+                    "Copy SHA",
+                    None,
+                    window.handler_for(&git_graph, move |this, _window, cx| {
+                        this.copy_commit_sha(index, cx);
+                    }),
+                )
+        });
+        self.set_context_menu(context_menu, position, Some(index), window, cx);
+    }
+
+    fn run_stash_action(
+        &mut self,
+        stash_index: usize,
+        action: StashAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let (task, error_title) = match action {
+            StashAction::Apply => (
+                repository.update(cx, |repo, cx| repo.stash_apply(Some(stash_index), cx)),
+                "Failed to apply stash",
+            ),
+            StashAction::Pop => (
+                repository.update(cx, |repo, cx| repo.stash_pop(Some(stash_index), cx)),
+                "Failed to pop stash",
+            ),
+            StashAction::Drop => {
+                let receiver =
+                    repository.update(cx, |repo, cx| repo.stash_drop(Some(stash_index), cx));
+                (
+                    cx.background_spawn(async move { receiver.await? }),
+                    "Failed to drop stash",
+                )
+            }
+        };
+        task.detach_and_prompt_err(error_title, window, cx, |error, _, _| {
+            Some(error.to_string())
+        });
     }
 
     fn copy_commit_sha(&mut self, entry_index: usize, cx: &mut Context<Self>) {
@@ -4167,6 +4345,10 @@ Checked out in worktree {}",
         let right_clicked_inside_selection = self.selected_rows().contains(index);
         if right_clicked_inside_selection && self.selected_commit_count() > 1 {
             self.deploy_multi_selection_context_menu(position, index, window, cx);
+            return;
+        }
+        if let Some(stash) = self.stash_at(index, cx) {
+            self.deploy_stash_context_menu(position, index, stash, window, cx);
             return;
         }
 
@@ -4838,7 +5020,9 @@ Checked out in worktree {}",
                 IconButton::new("git-graph-remotes", IconName::Server)
                     .icon_size(IconSize::Small)
                     .disabled(repository.is_none())
-                    .tooltip(Tooltip::text("Manage remotes: add, rename, remove or change a URL"))
+                    .tooltip(Tooltip::text(
+                        "Manage remotes: add, rename, remove or change a URL",
+                    ))
                     .on_click({
                         let repository = repository.clone();
                         let workspace = self.workspace.clone();
@@ -8585,6 +8769,7 @@ Checked out in worktree {}",
         }
 
         let mut worktrees_by_commit = self.worktrees_by_commit(cx);
+        let mut stashes_by_commit = self.stashes_by_commit(cx);
         for absolute_idx in viewport_range {
             let Some(commit) = self.graph_data.commits.get(absolute_idx) else {
                 continue;
@@ -8592,7 +8777,8 @@ Checked out in worktree {}",
             let worktrees = worktrees_by_commit
                 .remove(&commit.data.sha)
                 .unwrap_or_default();
-            if commit.data.ref_names.is_empty() && worktrees.is_empty() {
+            let stash = stashes_by_commit.remove(&commit.data.sha);
+            if commit.data.ref_names.is_empty() && worktrees.is_empty() && stash.is_none() {
                 continue;
             }
 
@@ -8652,6 +8838,9 @@ Checked out in worktree {}",
                 absolute_idx,
                 cx,
             );
+            let stash_chip = stash.map(|stash| {
+                self.render_stash_chip(stash, accent_color, background, absolute_idx, cx)
+            });
 
             elements.push(
                 div()
@@ -8669,6 +8858,7 @@ Checked out in worktree {}",
                             .justify_start()
                             .gap_1()
                             .pl_1p5()
+                            .children(stash_chip)
                             .children(primary_chip)
                             .children(count_chip)
                             .children(worktree_chip)

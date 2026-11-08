@@ -6718,7 +6718,9 @@ impl Repository {
         // scan id greater than 2 means the initial snapshot was calculated,
         // otherwise we don't need to refresh the graph state
         match event {
-            RepositoryEvent::HeadChanged | RepositoryEvent::BranchListChanged => {
+            RepositoryEvent::HeadChanged
+            | RepositoryEvent::BranchListChanged
+            | RepositoryEvent::StashEntriesChanged => {
                 if self.scan_id > 2 {
                     self.initial_graph_data.clear();
                 }
