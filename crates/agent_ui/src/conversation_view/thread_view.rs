@@ -4895,6 +4895,40 @@ impl ThreadView {
         work
     }
 
+    /// Scrolls to the entry `entry_ix` from the running work menu. A
+    /// subagent's tool calls, and the subagents it launched, render inside the
+    /// card of the subagent's launch and leave an empty entry of their own, so
+    /// the list scrolls to the outermost launch instead, with the activity of
+    /// each launch on the way down expanded to show the entry.
+    fn scroll_to_subagent_entry(&mut self, entry_ix: usize, cx: &mut Context<Self>) {
+        let mut target_ix = entry_ix;
+        let mut seen = HashSet::default();
+        loop {
+            let thread = self.thread.read(cx);
+            let Some(AgentThreadEntry::ToolCall(tool_call)) = thread.entries().get(target_ix)
+            else {
+                break;
+            };
+            let Some(parent_id) = self.subagent_parent_id(tool_call) else {
+                break;
+            };
+            let Some((parent_ix, _)) = thread.tool_call(&parent_id) else {
+                break;
+            };
+            // Bounded by the entries, so that a parent cycle cannot hang Zed.
+            if !seen.insert(parent_id.clone()) {
+                break;
+            }
+            self.expanded_subagent_activity.insert(parent_id);
+            target_ix = parent_ix;
+        }
+        self.list_state.scroll_to(ListOffset {
+            item_ix: target_ix,
+            offset_in_item: px(0.),
+        });
+        cx.notify();
+    }
+
     /// A count of running subagents and background processes next to the
     /// context usage ring, opening a tree of them that scrolls to each.
     fn render_running_work(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -4963,11 +4997,7 @@ impl ThreadView {
                                 .icon_color(Color::Muted)
                                 .handler(move |_, cx| {
                                     this.update(cx, |this, cx| {
-                                        this.list_state.scroll_to(ListOffset {
-                                            item_ix: entry_ix,
-                                            offset_in_item: px(0.),
-                                        });
-                                        cx.notify();
+                                        this.scroll_to_subagent_entry(entry_ix, cx);
                                     })
                                     .log_err();
                                 });
