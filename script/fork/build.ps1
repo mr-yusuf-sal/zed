@@ -176,10 +176,11 @@ if ($Install) {
     Write-Host "Installed the fork to $target"
 
     # Agent hosts and terminal hosts keep running from the exe moved aside above, and the
-    # new Zed reconnects to them, as long as it runs with the same elevation as before.
+    # new Zed reconnects to them. Zed always comes back elevated: agent hosts are separate for
+    # elevated and unelevated Zed, and the fork is run elevated, so those of an unelevated Zed
+    # the install stopped are not picked up.
     . (Join-Path $PSScriptRoot "zed-processes.ps1")
-    $elevated = Test-ZedUiElevated
     Get-ZedUi | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     for ($i = 0; $i -lt 30 -and (Get-ZedUi); $i++) { Start-Sleep -Milliseconds 500 }
-    & (Join-Path $PSScriptRoot "start-zed.ps1") $target -Elevated:$elevated
+    & (Join-Path $PSScriptRoot "start-zed.ps1") $target -Elevated
 }
