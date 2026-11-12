@@ -482,6 +482,9 @@ actions!(
         ToggleRightDock,
         /// Toggles zoom on the active pane.
         ToggleZoom,
+        /// Toggles zoom on the active center pane, moving focus to it when
+        /// focus is in a dock panel.
+        ToggleCenterZoom,
         /// Toggles maximizing the active editor pane within the center area,
         /// hiding other split panes but leaving docks/panels unaffected.
         ToggleEditorZoom,
@@ -8704,6 +8707,11 @@ impl Workspace {
             )
             .on_action(cx.listener(|workspace, _: &FocusCenterPane, window, cx| {
                 workspace.focus_center_pane(window, cx);
+            }))
+            .on_action(cx.listener(|workspace, _: &ToggleCenterZoom, window, cx| {
+                workspace.active_pane().clone().update(cx, |pane, cx| {
+                    pane.toggle_zoom(&ToggleZoom, window, cx);
+                });
             }))
             .on_action(cx.listener(Workspace::clear_bookmarks))
             .on_action(cx.listener(Workspace::cancel))
