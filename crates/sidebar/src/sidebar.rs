@@ -158,6 +158,13 @@ enum DraggedRegionResize {
     Databases,
 }
 
+/// The button a region's header uses to hide or show its body.
+#[derive(Clone, Copy)]
+enum RegionToggle {
+    Visibility,
+    Disclosure,
+}
+
 impl Render for DraggedRegionResize {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         gpui::Empty
@@ -3311,6 +3318,7 @@ impl Sidebar {
                 "Databases",
                 Some(databases.header_buttons),
                 self.databases_hidden,
+                RegionToggle::Visibility,
                 DraggedRegionResize::Threads,
                 cx.listener(|this, _: &ClickEvent, _window, cx| {
                     this.databases_hidden = !this.databases_hidden;
@@ -3357,6 +3365,7 @@ impl Sidebar {
             "Files",
             None,
             self.files_hidden,
+            RegionToggle::Disclosure,
             if databases_shown {
                 DraggedRegionResize::Databases
             } else {
@@ -3424,7 +3433,8 @@ impl Sidebar {
     }
 
     /// The header above the Databases or Files region: its name, a button that hides or shows
-    /// it, and along its top edge a handle that resizes the region above.
+    /// (or collapses or expands) it, and along its top edge a handle that resizes the region
+    /// above.
     fn render_region_header(
         &self,
         id: &'static str,
@@ -3432,14 +3442,20 @@ impl Sidebar {
         label: &'static str,
         buttons: Option<AnyView>,
         hidden: bool,
+        toggle: RegionToggle,
         resizes: DraggedRegionResize,
         on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (visibility_icon, tooltip) = if hidden {
-            (IconName::Eye, format!("Show {label}"))
-        } else {
-            (IconName::EyeOff, format!("Hide {label}"))
+        let (visibility_icon, tooltip) = match (toggle, hidden) {
+            (RegionToggle::Visibility, true) => (IconName::Eye, format!("Show {label}")),
+            (RegionToggle::Visibility, false) => (IconName::EyeOff, format!("Hide {label}")),
+            (RegionToggle::Disclosure, true) => {
+                (IconName::ChevronRight, format!("Expand {label}"))
+            }
+            (RegionToggle::Disclosure, false) => {
+                (IconName::ChevronDown, format!("Collapse {label}"))
+            }
         };
         h_flex()
             .id(SharedString::from(format!("{id}-region-header")))
