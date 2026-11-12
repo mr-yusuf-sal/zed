@@ -3251,7 +3251,26 @@ impl Sidebar {
                 Label::new("Threads")
                     .size(LabelSize::Small)
                     .color(Color::Muted),
-            );
+            )
+            .child(div().flex_1())
+            .child({
+                let focus_handle = self.focus_handle.clone();
+                let key = group.key.clone();
+                IconButton::new("threads-region-new-thread", IconName::Plus)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(move |_, cx| {
+                        Tooltip::for_action_in(
+                            "Start New Agent Thread",
+                            &NewThread,
+                            &focus_handle,
+                            cx,
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.selection = None;
+                        this.create_new_entry_in_main_worktree(&key, window, cx);
+                    }))
+            });
 
         let threads = if group.rows.is_empty() {
             h_flex()
