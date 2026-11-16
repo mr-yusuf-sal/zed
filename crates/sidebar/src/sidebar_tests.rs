@@ -1223,7 +1223,6 @@ async fn test_restore_serialized_archive_view_does_not_panic(cx: &mut TestAppCon
         threads_max_height: None,
         databases_height: None,
         databases_hidden: false,
-        files_hidden: false,
         pinned_workspaces: Vec::new(),
     })
     .expect("serialization should succeed");
@@ -1539,8 +1538,8 @@ async fn test_neighboring_activatable_entry_stays_within_project(cx: &mut TestAp
         );
         assert_eq!(
             neighbor_session(4),
-            Some(acp::SessionId::new(Arc::from("a-oldest"))),
-            "an empty project should fall back to another project"
+            None,
+            "the last entry of a project must not fall back to another project's thread"
         );
     });
 }

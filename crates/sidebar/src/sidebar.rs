@@ -139,8 +139,6 @@ struct SerializedSidebar {
     #[serde(default)]
     databases_hidden: bool,
     #[serde(default)]
-    files_hidden: bool,
-    #[serde(default)]
     pinned_workspaces: Vec<SerializedProjectGroup>,
 }
 
@@ -156,11 +154,13 @@ enum DraggedRegionResize {
     Databases,
 }
 
-/// The button a region's header uses to hide or show its body.
+/// The button at the end of a region's header.
 #[derive(Clone, Copy)]
 enum RegionToggle {
-    Visibility,
-    Disclosure,
+    /// Hides or shows the region's body.
+    Visibility { hidden: bool },
+    /// Collapses every open folder in the file tree, or expands them all when none is open.
+    Folders { any_expanded: bool },
 }
 
 impl Render for DraggedRegionResize {
@@ -1139,7 +1139,6 @@ pub struct Sidebar {
     databases: Option<DatabasesView>,
     databases_height: Pixels,
     databases_hidden: bool,
-    files_hidden: bool,
     /// Groups the user pinned, from the Workspaces menu or by dragging them onto the inactive
     /// workspaces on top, which keep them in sight there. Saved with the panel's state and
     /// forgotten once a group is removed from the window.
@@ -1311,7 +1310,6 @@ impl Sidebar {
             databases: None,
             databases_height: DEFAULT_DATABASES_HEIGHT,
             databases_hidden: false,
-            files_hidden: false,
             pinned: HashSet::new(),
             dragging_project_group: false,
             searched_project_panel: None,
@@ -3347,8 +3345,9 @@ impl Sidebar {
                 IconName::DatabaseZap,
                 "Databases",
                 Some(databases.header_buttons),
-                self.databases_hidden,
-                RegionToggle::Visibility,
+                RegionToggle::Visibility {
+                    hidden: self.databases_hidden,
+                },
                 DraggedRegionResize::Threads,
                 cx.listener(|this, _: &ClickEvent, _window, cx| {
                     this.databases_hidden = !this.databases_hidden;
@@ -3394,21 +3393,29 @@ impl Sidebar {
             IconName::FileTree,
             "Files",
             None,
-            self.files_hidden,
-            RegionToggle::Disclosure,
+            RegionToggle::Folders {
+                any_expanded: project_panel.as_ref().is_some_and(|project_panel| {
+                    project_panel.read(cx).has_expanded_directories(cx)
+                }),
+            },
             if databases_shown {
                 DraggedRegionResize::Databases
             } else {
                 DraggedRegionResize::Threads
             },
-            cx.listener(|this, _: &ClickEvent, _window, cx| {
-                this.files_hidden = !this.files_hidden;
-                this.serialize(cx);
-                cx.notify();
+            cx.listener(|this, _: &ClickEvent, window, cx| {
+                if let Some(project_panel) = this
+                    .active_workspace(cx)
+                    .and_then(|workspace| workspace.read(cx).panel::<ProjectPanel>(cx))
+                {
+                    project_panel.update(cx, |project_panel, cx| {
+                        project_panel.toggle_all_directories(window, cx);
+                    });
+                }
             }),
             cx,
         );
-        let files_body = (!self.files_hidden).then(|| {
+        let files_body = {
             let content = match project_panel {
                 Some(project_panel) => project_panel.into_any_element(),
                 None => h_flex()
@@ -3427,12 +3434,13 @@ impl Sidebar {
                 .w_full()
                 .overflow_hidden()
                 .child(content)
-        });
+        };
         let files = v_flex()
             .w_full()
-            .when(!self.files_hidden, |this| this.flex_1().min_h_0())
+            .flex_1()
+            .min_h_0()
             .child(files_header)
-            .children(files_body);
+            .child(files_body);
 
         v_flex()
             .flex_1()
@@ -3463,29 +3471,31 @@ impl Sidebar {
     }
 
     /// The header above the Databases or Files region: its name, a button that hides or shows
-    /// (or collapses or expands) it, and along its top edge a handle that resizes the region
-    /// above.
+    /// it (or, for Files, collapses or expands its folders), and along its top edge a handle that
+    /// resizes the region above.
     fn render_region_header(
         &self,
         id: &'static str,
         icon: IconName,
         label: &'static str,
         buttons: Option<AnyView>,
-        hidden: bool,
         toggle: RegionToggle,
         resizes: DraggedRegionResize,
         on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (visibility_icon, tooltip) = match (toggle, hidden) {
-            (RegionToggle::Visibility, true) => (IconName::Eye, format!("Show {label}")),
-            (RegionToggle::Visibility, false) => (IconName::EyeOff, format!("Hide {label}")),
-            (RegionToggle::Disclosure, true) => {
-                (IconName::ChevronRight, format!("Expand {label}"))
+        let hidden = matches!(toggle, RegionToggle::Visibility { hidden: true });
+        let (toggle_icon, tooltip) = match toggle {
+            RegionToggle::Visibility { hidden: true } => (IconName::Eye, format!("Show {label}")),
+            RegionToggle::Visibility { hidden: false } => {
+                (IconName::EyeOff, format!("Hide {label}"))
             }
-            (RegionToggle::Disclosure, false) => {
-                (IconName::ChevronDown, format!("Collapse {label}"))
+            RegionToggle::Folders { any_expanded: true } => {
+                (IconName::ChevronDownUp, "Collapse All Folders".to_string())
             }
+            RegionToggle::Folders {
+                any_expanded: false,
+            } => (IconName::ChevronUpDown, "Expand All Folders".to_string()),
         };
         h_flex()
             .id(SharedString::from(format!("{id}-region-header")))
@@ -3504,8 +3514,8 @@ impl Sidebar {
             .when(!hidden, |this| this.children(buttons))
             .child(
                 IconButton::new(
-                    SharedString::from(format!("{id}-region-visibility")),
-                    visibility_icon,
+                    SharedString::from(format!("{id}-region-toggle")),
+                    toggle_icon,
                 )
                 .icon_size(IconSize::XSmall)
                 .tooltip(Tooltip::text(tooltip))
@@ -3550,7 +3560,7 @@ impl Sidebar {
         cx.notify();
     }
 
-    /// Switches to `workspace` if it isn't active, shows its Files region and moves focus into
+    /// Switches to `workspace` if it isn't active, shows the thread list and moves focus into
     /// the tree, which has already selected whatever it was asked to reveal.
     fn reveal_files_impl(
         &mut self,
@@ -3562,10 +3572,6 @@ impl Sidebar {
             self.activate_workspace(workspace, window, cx);
         }
         self.show_thread_list_unfiltered(window, cx);
-        if self.files_hidden {
-            self.files_hidden = false;
-            self.serialize(cx);
-        }
         if let Some(project_panel) = workspace.read(cx).panel::<ProjectPanel>(cx) {
             let focus_handle = project_panel.read(cx).focus_handle(cx);
             window.focus(&focus_handle, cx);
@@ -5514,8 +5520,12 @@ impl Sidebar {
 
     /// Find the entry to select after the entry at `current_position` is
     /// removed: the nearest activatable entry in the same project section,
-    /// below first, then above. Only when that section has no other
-    /// activatable entry, the nearest one in the whole list.
+    /// below first, then above.
+    ///
+    /// This never crosses into another project's section: when the removed
+    /// entry was the section's last one, callers fall back to the agent
+    /// panel's draft in the same workspace (reusing an existing one, or
+    /// creating a new one) instead of switching the user to another project.
     fn neighboring_activatable_entry(&self, current_position: usize) -> Option<ActivatableEntry> {
         let entries = &self.contents.entries;
         let is_header = |entry: &ListEntry| matches!(entry, ListEntry::ProjectHeader { .. });
@@ -5531,24 +5541,12 @@ impl Sidebar {
             .position(is_header)
             .map_or(entries.len(), |offset| current_position + 1 + offset);
 
-        for (start, end) in [(section_start, section_end), (0, entries.len())] {
-            let Some(before) = entries.get(start..current_position) else {
-                continue;
-            };
-            let Some(after) = entries.get(current_position + 1..end) else {
-                continue;
-            };
-
-            let Some(entry) = after
-                .iter()
-                .chain(before.iter().rev())
-                .find_map(ActivatableEntry::from_list_entry)
-            else {
-                continue;
-            };
-            return Some(entry);
-        }
-        None
+        let before = entries.get(section_start..current_position)?;
+        let after = entries.get(current_position + 1..section_end)?;
+        after
+            .iter()
+            .chain(before.iter().rev())
+            .find_map(ActivatableEntry::from_list_entry)
     }
 
     fn activate_entry(
@@ -8984,7 +8982,6 @@ impl WorkspaceSidebar for Sidebar {
             databases_height: (self.databases_height != DEFAULT_DATABASES_HEIGHT)
                 .then(|| f32::from(self.databases_height)),
             databases_hidden: self.databases_hidden,
-            files_hidden: self.files_hidden,
             pinned_workspaces: self
                 .pinned
                 .iter()
@@ -9016,7 +9013,6 @@ impl WorkspaceSidebar for Sidebar {
                 self.databases_height = px(height).max(MIN_REGION_HEIGHT);
             }
             self.databases_hidden = serialized.databases_hidden;
-            self.files_hidden = serialized.files_hidden;
             self.pinned = serialized
                 .pinned_workspaces
                 .into_iter()

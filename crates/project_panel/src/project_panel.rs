@@ -1735,6 +1735,37 @@ impl ProjectPanel {
         self.expand_worktree_roots(roots, window, cx);
     }
 
+    /// Whether any folder shown in the tree is open. A lone worktree's root doesn't count,
+    /// since collapsing everything leaves it open.
+    pub fn has_expanded_directories(&self, cx: &App) -> bool {
+        let project = self.project.read(cx);
+        let single_worktree = project.visible_worktrees(cx).count() == 1;
+        self.state.visible_entries.iter().any(|visible| {
+            let Some(expanded_dir_ids) = self.state.expanded_dir_ids.get(&visible.worktree_id)
+            else {
+                return false;
+            };
+            let root_id = project
+                .worktree_for_id(visible.worktree_id, cx)
+                .and_then(|worktree| worktree.read(cx).root_entry().map(|root| root.id));
+            visible.entries.iter().any(|entry| {
+                entry.is_dir()
+                    && !(single_worktree && Some(entry.id) == root_id)
+                    && expanded_dir_ids.binary_search(&entry.id).is_ok()
+            })
+        })
+    }
+
+    /// Collapses every folder if any is open, and otherwise expands them all.
+    pub fn toggle_all_directories(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let roots = self.all_worktree_roots(cx);
+        if self.has_expanded_directories(cx) {
+            self.collapse_worktree_roots(roots, window, cx);
+        } else {
+            self.expand_worktree_roots(roots, window, cx);
+        }
+    }
+
     fn expand_all_for_entry_and_refresh(
         &mut self,
         worktree_id: WorktreeId,
