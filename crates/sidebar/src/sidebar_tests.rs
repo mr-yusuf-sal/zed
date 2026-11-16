@@ -1487,6 +1487,7 @@ async fn test_neighboring_activatable_entry_stays_within_project(cx: &mut TestAp
         has_notifications: false,
         is_active: false,
         has_threads: true,
+        open_thread_count: 0,
     };
     let thread = |name: &str| {
         ListEntry::Thread(Arc::new(ThreadEntry {
@@ -1580,6 +1581,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 has_notifications: false,
                 is_active: true,
                 has_threads: true,
+                open_thread_count: 0,
             },
             ListEntry::Thread(Arc::new(ThreadEntry {
                 metadata: ThreadMetadata {
@@ -1727,6 +1729,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 has_notifications: false,
                 is_active: false,
                 has_threads: false,
+                open_thread_count: 0,
             },
         ];
 

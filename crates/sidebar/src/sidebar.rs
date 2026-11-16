@@ -192,6 +192,7 @@ struct WorkspaceMenuRow {
     has_running_threads: bool,
     waiting_thread_count: usize,
     has_notifications: bool,
+    open_thread_count: usize,
 }
 
 /// Quarry's views, handed in by the zed crate, which keeps this crate from depending on Quarry
@@ -487,6 +488,8 @@ enum ListEntry {
         has_notifications: bool,
         is_active: bool,
         has_threads: bool,
+        /// The group's threads and terminals, not counting drafts.
+        open_thread_count: usize,
     },
     Thread(Arc<ThreadEntry>),
     Terminal(TerminalEntry),
@@ -1992,6 +1995,7 @@ impl Sidebar {
             let mut threads: Vec<Arc<ThreadEntry>> = Vec::new();
             let mut has_running_threads = false;
             let mut waiting_thread_count: usize = 0;
+            let open_thread_count: usize;
             let group_host = group_key.host();
 
             if should_load_threads {
@@ -2192,7 +2196,35 @@ impl Sidebar {
                     let b_time = Self::thread_display_time(&b.metadata);
                     b_time.cmp(&a_time)
                 });
+                open_thread_count = threads
+                    .iter()
+                    .filter(|thread| thread.draft.is_none())
+                    .count();
             } else {
+                // A folded group's threads aren't loaded, so count them from the
+                // store with the same lookups the loading above uses.
+                let store = ThreadMetadataStore::global(cx).read(cx);
+                let mut path_lists = vec![group_key.path_list().clone()];
+                path_lists.extend(
+                    group_workspaces
+                        .iter()
+                        .map(|workspace| workspace_path_list(workspace, cx))
+                        .filter(|path_list| !path_list.paths().is_empty()),
+                );
+                path_lists.extend(linked_worktree_path_lists.iter().cloned());
+                let mut counted_thread_ids = HashSet::new();
+                open_thread_count = store
+                    .entries_for_main_worktree_path(group_key.path_list(), group_host.as_ref())
+                    .chain(path_lists.iter().flat_map(|path_list| {
+                        store.entries_for_path(path_list, group_host.as_ref())
+                    }))
+                    .filter(|row| {
+                        !row.is_draft()
+                            && !seen_thread_ids.contains(&row.thread_id)
+                            && counted_thread_ids.insert(row.thread_id)
+                    })
+                    .count();
+
                 for info in live_infos {
                     if info.status == AgentThreadStatus::Running {
                         has_running_threads = true;
@@ -2248,6 +2280,7 @@ impl Sidebar {
                         })
             };
             let has_threads = has_visible_rows || has_stored_thread_rows;
+            let open_thread_count = open_thread_count + terminals.len();
 
             // The search only looks in the active workspace; the others stay as they are.
             if !query.is_empty() && is_active {
@@ -2324,6 +2357,7 @@ impl Sidebar {
                     has_notifications: has_thread_notifications || has_terminal_notifications,
                     is_active,
                     has_threads,
+                    open_thread_count,
                 });
 
                 Self::push_entries_by_display_time(
@@ -2370,6 +2404,7 @@ impl Sidebar {
                     has_notifications: has_thread_notifications || has_terminal_notifications,
                     is_active,
                     has_threads,
+                    open_thread_count,
                 });
 
                 if is_collapsed {
@@ -2670,6 +2705,7 @@ impl Sidebar {
                 has_notifications,
                 is_active: is_active_group,
                 has_threads,
+                open_thread_count,
             } => {
                 self.project_header_menu_handles.entry(ix).or_default();
 
@@ -2686,7 +2722,7 @@ impl Sidebar {
                     *is_active_group,
                     is_selected,
                     *has_threads,
-                    // has_active_draft,
+                    *open_thread_count,
                     cx,
                 )
             }
@@ -2746,6 +2782,7 @@ impl Sidebar {
         is_active: bool,
         is_focused: bool,
         has_threads: bool,
+        open_thread_count: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let host = key.host();
@@ -2914,6 +2951,9 @@ impl Sidebar {
                                 ))
                             }),
                     )
+                    .when(open_thread_count > 0, |this| {
+                        this.child(render_open_thread_count(open_thread_count))
+                    })
                     .when_some(self.render_remote_project_icon(ix, host), |this, icon| {
                         this.child(icon)
                     })
@@ -3074,6 +3114,7 @@ impl Sidebar {
             has_notifications,
             is_active,
             has_threads,
+            open_thread_count,
         } = self.contents.entries.get(ix)?
         else {
             return None;
@@ -3092,6 +3133,7 @@ impl Sidebar {
             *is_active,
             is_selected,
             *has_threads,
+            *open_thread_count,
             cx,
         ))
     }
@@ -8405,6 +8447,7 @@ impl Sidebar {
                     waiting_thread_count,
                     has_notifications,
                     is_active,
+                    open_thread_count,
                     ..
                 } => Some(WorkspaceMenuRow {
                     key: key.clone(),
@@ -8413,6 +8456,7 @@ impl Sidebar {
                     has_running_threads: *has_running_threads,
                     waiting_thread_count: *waiting_thread_count,
                     has_notifications: *has_notifications,
+                    open_thread_count: *open_thread_count,
                 }),
                 _ => None,
             })
@@ -9188,6 +9232,12 @@ fn build_workspaces_menu(
     })
 }
 
+fn render_open_thread_count(open_thread_count: usize) -> impl IntoElement {
+    Label::new(open_thread_count.to_string())
+        .size(LabelSize::XSmall)
+        .color(Color::Muted)
+}
+
 /// A row of the workspaces menu: the workspace's name and what its threads are doing, like its
 /// header in the panel, and a pin that keeps it in sight on top. The pin is read
 /// from the sidebar on every render, so it follows a click while the menu stays open.
@@ -9218,6 +9268,9 @@ fn render_workspace_menu_row(
                         .when(!row.is_active, |this| this.color(Color::Muted))
                         .truncate(),
                 )
+                .when(row.open_thread_count > 0, |this| {
+                    this.child(render_open_thread_count(row.open_thread_count))
+                })
                 .when(has_running_threads, |this| {
                     this.child(
                         Icon::new(IconName::LoadCircle)
