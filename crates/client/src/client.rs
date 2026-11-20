@@ -882,6 +882,15 @@ impl Client {
         try_provider: bool,
         cx: &AsyncApp,
     ) -> Result<Credentials> {
+        self.sign_in_internal(try_provider, true, cx).await
+    }
+
+    async fn sign_in_internal(
+        self: &Arc<Self>,
+        try_provider: bool,
+        open_browser: bool,
+        cx: &AsyncApp,
+    ) -> Result<Credentials> {
         let is_reauthenticating = if self.status().borrow().is_signed_out() {
             self.set_status(Status::Authenticating, cx);
             false
@@ -911,6 +920,13 @@ impl Client {
                     .await
                     .log_err();
             }
+        }
+
+        if credentials.is_none() && !open_browser {
+            self.state.write().credentials = None;
+            self.cloud_client.clear_credentials();
+            self.set_status(Status::SignedOut, cx);
+            return Err(anyhow!("no valid stored credentials to sign in with"));
         }
 
         if credentials.is_none() {
@@ -1044,6 +1060,24 @@ impl Client {
         try_provider: bool,
         cx: &AsyncApp,
     ) -> Result<()> {
+        self.sign_in_and_optionally_connect(try_provider, true, cx)
+            .await
+    }
+
+    /// Like [`Self::sign_in_with_optional_connect`], but only with the credentials
+    /// already stored in the keychain: when there are none, or the server rejects
+    /// them, the client is left signed out instead of opening the sign-in page in
+    /// the browser, since nobody asked to sign in.
+    pub async fn sign_in_with_stored_credentials(self: &Arc<Self>, cx: &AsyncApp) -> Result<()> {
+        self.sign_in_and_optionally_connect(true, false, cx).await
+    }
+
+    async fn sign_in_and_optionally_connect(
+        self: &Arc<Self>,
+        try_provider: bool,
+        open_browser: bool,
+        cx: &AsyncApp,
+    ) -> Result<()> {
         // Don't try to sign in again if we're already connected to Collab, as it will temporarily disconnect us.
         if self.status().borrow().is_connected() {
             return Ok(());
@@ -1062,7 +1096,9 @@ impl Client {
             .detach();
         });
 
-        let credentials = self.sign_in(try_provider, cx).await?;
+        let credentials = self
+            .sign_in_internal(try_provider, open_browser, cx)
+            .await?;
 
         self.connect_to_cloud(cx);
 
@@ -2232,6 +2268,52 @@ mod tests {
         let credentials = client.sign_in(false, &cx.to_async()).await.unwrap();
         assert_eq!(*auth_count.lock(), 2);
         assert_eq!(credentials.access_token, "2");
+    }
+
+    #[gpui::test]
+    async fn test_sign_in_without_browser_signs_out_on_rejected_credentials(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let auth_count = Arc::new(Mutex::new(0));
+        let http_client = FakeHttpClient::create(|_request| async move {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body("".into())
+                .unwrap())
+        });
+        let client =
+            cx.update(|cx| Client::new(Arc::new(FakeSystemClock::new()), http_client.clone(), cx));
+        client.override_authenticate({
+            let auth_count = auth_count.clone();
+            move |cx| {
+                let auth_count = auth_count.clone();
+                cx.background_spawn(async move {
+                    *auth_count.lock() += 1;
+                    Ok(Credentials {
+                        user_id: 1,
+                        access_token: "token".into(),
+                    })
+                })
+            }
+        });
+        client.sign_in(false, &cx.to_async()).await.unwrap();
+        assert_eq!(*auth_count.lock(), 1);
+
+        http_client
+            .as_fake()
+            .replace_handler(|_, _request| async move {
+                Ok(http_client::Response::builder()
+                    .status(401)
+                    .body("".into())
+                    .unwrap())
+            });
+        client
+            .sign_in_internal(false, false, &cx.to_async())
+            .await
+            .unwrap_err();
+        assert_eq!(*auth_count.lock(), 1);
+        assert!(matches!(*client.status().borrow(), Status::SignedOut));
     }
 
     #[gpui::test]

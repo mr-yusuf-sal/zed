@@ -1428,7 +1428,7 @@ async fn authenticate(client: Arc<Client>, cx: &AsyncApp) -> Result<()> {
 
     let mut delay = INITIAL_RECONNECTION_DELAY;
     loop {
-        let error = match client.sign_in_with_optional_connect(true, cx).await {
+        let error = match client.sign_in_with_stored_credentials(cx).await {
             Ok(()) => return Ok(()),
             Err(error) => error,
         };
