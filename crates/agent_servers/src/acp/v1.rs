@@ -49,7 +49,7 @@ use acp_thread::{AcpThread, LoadError, TerminalProviderEvent};
 use terminal::TerminalBuilder;
 use terminal::terminal_settings::{AlternateScroll, CursorShape};
 
-use crate::{CURSOR_ID, GEMINI_ID};
+use crate::{CLAUDE_AGENT_ID, CURSOR_ID, GEMINI_ID};
 
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
 const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
@@ -179,6 +179,53 @@ struct PendingAcpSession {
 struct SessionConfigResponse {
     modes: Option<acp::SessionModeState>,
     config_options: Option<Vec<acp::SessionConfigOption>>,
+    /// The session's agent host reported a turn that an earlier Zed started
+    /// and that is still running.
+    turn_running: bool,
+}
+
+/// Shows the turn the agent host reported as running, and asks the host to
+/// say when it ends.
+fn adopt_agent_host_turn(
+    connection: &ConnectionTo<Agent>,
+    session_id: &acp_v2::SessionId,
+    thread: &Entity<AcpThread>,
+    cx: &mut AsyncApp,
+) {
+    let request = match agent_client_protocol::UntypedMessage::new(
+        agent_host::AWAIT_TURN_METHOD,
+        serde_json::json!({ "sessionId": session_id.0 }),
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            log::error!("Failed to build the agent host turn request: {error:?}");
+            return;
+        }
+    };
+    let (stop_reason_sender, stop_reason_receiver) = futures::channel::oneshot::channel();
+    thread.update(cx, |thread, cx| {
+        thread.adopt_running_turn(stop_reason_receiver, cx)
+    });
+    let response = connection.send_request(request);
+    cx.spawn(async move |_| {
+        let stop_reason = match response.block_task().await {
+            Ok(response) => serde_json::from_value::<acp::PromptResponse>(response)
+                .map(|response| response.stop_reason)
+                .unwrap_or(acp::StopReason::EndTurn),
+            Err(error) => {
+                log::warn!("The agent host did not report the end of a running turn: {error:?}");
+                acp::StopReason::EndTurn
+            }
+        };
+        stop_reason_sender.send(stop_reason).ok();
+    })
+    .detach();
+}
+
+fn agent_host_turn_running(meta: Option<&acp::Meta>) -> bool {
+    meta.and_then(|meta| meta.get(agent_host::TURN_RUNNING_META_KEY))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// Sends `request` and returns its response. Once the response arrives, the agent's later
@@ -552,14 +599,18 @@ impl AcpConnection {
         cx: &mut AsyncApp,
     ) -> Result<Self> {
         let original_command = command.clone();
+        // Claude Code's turns can run for a long time, so its sessions are kept
+        // going in an agent host when Zed quits.
+        let hosted = agent_id.as_ref() == CLAUDE_AGENT_ID;
         let transport::StdioProcess {
             child,
+            status,
             incoming,
             outgoing,
             stderr,
             debug_log,
-        } = transport::spawn_stdio(&project, command, cx)?;
-        let mut child = transport::OwnedChild(child);
+        } = transport::spawn_stdio(&project, command, hosted, cx).await?;
+        let child = child.map(transport::OwnedChild);
         let sessions = Rc::new(RefCell::new(HashMap::default()));
 
         let (release_channel, version): (Option<&str>, String) = cx.update(|cx| {
@@ -611,9 +662,7 @@ impl AcpConnection {
                 .context("Failed to receive ACP connection handle")
         }
         .boxed_local();
-        let status_fut = child
-            .0
-            .status()
+        let status_fut = status
             .map(|status| {
                 status.map_err(|error| anyhow!("failed to wait for agent server exit: {error}"))
             })
@@ -744,7 +793,7 @@ impl AcpConnection {
             dispatch_tx,
             _wait_task: wait_task,
             _stderr_task: stderr_task,
-            _child: Some(child),
+            _child: child,
         })
     }
 
@@ -1037,6 +1086,9 @@ impl AcpConnection {
                     let Some(connection_state) = this.upgrade() else {
                         return Ok(());
                     };
+                    let turn_running = response
+                        .as_ref()
+                        .is_ok_and(|response| response.turn_running);
                     let (modes, config_options) = match response
                         .and_then(|response| config_state(response.modes, response.config_options))
                     {
@@ -1071,6 +1123,9 @@ impl AcpConnection {
                             });
                         }
                         connection_state.remove_pending_session(&session_id, thread.entity_id());
+                        if turn_running {
+                            adopt_agent_host_turn(&connection, &session_id, &loaded_thread, cx);
+                        }
                         return Ok(());
                     }
 
@@ -1529,6 +1584,7 @@ impl AgentConnection for AcpConnection {
                     .await?;
                     Ok(SessionConfigResponse {
                         modes: response.modes,
+                        turn_running: agent_host_turn_running(response.meta.as_ref()),
                         config_options: response.config_options,
                     })
                 })
@@ -1573,6 +1629,7 @@ impl AgentConnection for AcpConnection {
                     .await?;
                     Ok(SessionConfigResponse {
                         modes: response.modes,
+                        turn_running: agent_host_turn_running(response.meta.as_ref()),
                         config_options: response.config_options,
                     })
                 })
@@ -6521,6 +6578,7 @@ mod tests {
                             async move {
                                 Ok(SessionConfigResponse {
                                     modes: None,
+                                    turn_running: false,
                                     config_options: Some(returned),
                                 })
                             }
@@ -6872,6 +6930,7 @@ mod tests {
                         async move {
                             Ok(SessionConfigResponse {
                                 modes: None,
+                                turn_running: false,
                                 config_options: Some(initial_options),
                             })
                         }
@@ -6921,6 +6980,7 @@ mod tests {
                         async move {
                             Ok(SessionConfigResponse {
                                 modes: None,
+                                turn_running: false,
                                 config_options: Some(replacement_options),
                             })
                         }
@@ -9458,6 +9518,7 @@ exit 7
                                 );
                                 Ok(SessionConfigResponse {
                                     modes: None,
+                                    turn_running: false,
                                     config_options: Some(vec![acp::SessionConfigOption::boolean(
                                         "web_search",
                                         "Web Search",

@@ -130,7 +130,11 @@ pub async fn connect(
     default_config_options: HashMap<String, settings::AgentConfigOptionValue>,
     cx: &mut AsyncApp,
 ) -> Result<Rc<dyn acp_thread::AgentConnection>> {
-    let negotiation_error = if cx.update(|cx| cx.has_flag::<AcpBetaFeatureFlag>()) {
+    // Claude Code reports its background work and lets it be stopped only over v2, so it
+    // gets v2 without the `acp-beta` flag.
+    let negotiation_error = if agent_id.as_ref() == crate::CLAUDE_AGENT_ID
+        || cx.update(|cx| cx.has_flag::<AcpBetaFeatureFlag>())
+    {
         match AcpV2Connection::stdio(
             agent_id.clone(),
             project.clone(),
