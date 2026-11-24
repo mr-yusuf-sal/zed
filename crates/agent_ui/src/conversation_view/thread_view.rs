@@ -142,7 +142,7 @@ fn background_work_rows(
     let thread = thread_entity.read(cx);
     let mut rows = Vec::new();
     let mut listed_terminals = HashSet::default();
-    let terminal_row = |entry_ix: usize, tool_call: &ToolCall, terminal: &Entity<Terminal>| {
+    let terminal_row = |entry_ix: usize, tool_call: &ToolCall, terminal: &Entity<acp_thread::Terminal>| {
         let terminal = terminal.read(cx);
         RunningWorkRow {
             entry_ix: anchor.or(Some(entry_ix)),
@@ -3410,8 +3410,16 @@ impl ThreadView {
 
         let cancelled = self.thread.update(cx, |thread, cx| thread.cancel(cx));
 
-        let contents_task = cx.spawn_in(window, async move |_this, _cx| {
-            cancelled.await;
+        let contents_task = cx.spawn_in(window, async move |this, cx| {
+            if let Err(error) = cancelled.await {
+                this.update(cx, |this, cx| {
+                    this.message_queue.restore_after_failed_send(entry);
+                    this.sync_queue_flag_to_native_thread(cx);
+                    cx.notify();
+                })
+                .log_err();
+                return Err(error);
+            }
 
             Ok(Some((entry.content, entry.tracked_buffers)))
         });
@@ -3691,7 +3699,7 @@ impl ThreadView {
 
     pub fn authorize_pending_tool_call(
         &mut self,
-        kind: acp_v1::PermissionOptionKind,
+        kind: acp_v2::PermissionOptionKind,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<()> {
@@ -9966,7 +9974,7 @@ impl ThreadView {
     fn render_collapsible_command(
         &self,
         group: SharedString,
-        tool_call_id: &acp_v1::ToolCallId,
+        tool_call_id: &acp_v2::ToolCallId,
         is_preview: bool,
         command: Entity<Markdown>,
         window: &Window,
@@ -10261,7 +10269,10 @@ impl ThreadView {
                                     .child(div().flex_none().child(terminal_view))
                                     .into_any_element()
                             } else if is_scrollable {
-                                div().h_72().child(terminal_view).into_any_element()
+                                div()
+                                    .h(rems(18. + TERMINAL_CONTENT_TOP_PADDING))
+                                    .child(terminal_view)
+                                    .into_any_element()
                             } else {
                                 terminal_view.into_any_element()
                             };
@@ -12970,7 +12981,7 @@ impl ThreadView {
     /// with a button under it that switches between all of it and the preview.
     fn render_line_clamped_block(
         &self,
-        tool_call_id: &acp_v1::ToolCallId,
+        tool_call_id: &acp_v2::ToolCallId,
         block: ToolCallBlock,
         line_count: usize,
         line_height: Pixels,
@@ -13007,7 +13018,7 @@ impl ThreadView {
 
     fn render_block_toggle(
         &self,
-        tool_call_id: &acp_v1::ToolCallId,
+        tool_call_id: &acp_v2::ToolCallId,
         block: ToolCallBlock,
         is_fully_shown: bool,
         show_all_label: &'static str,

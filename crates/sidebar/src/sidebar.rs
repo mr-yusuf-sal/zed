@@ -1690,7 +1690,7 @@ impl Sidebar {
             return;
         };
         let folder_paths = PathList::new(std::slice::from_ref(&worktree_path));
-        let host = project_group_key.host();
+        let host = project_group_key.host().cloned();
         let provisional_key = Some(project_group_key.clone());
         let active_workspace = multi_workspace.read(cx).workspace().clone();
         let modal_workspace = active_workspace.clone();
@@ -2209,9 +2209,9 @@ impl Sidebar {
                 path_lists.extend(linked_worktree_path_lists.iter().cloned());
                 let mut counted_thread_ids = HashSet::new();
                 open_thread_count = store
-                    .entries_for_main_worktree_path(group_key.path_list(), group_host.as_ref())
+                    .entries_for_main_worktree_path(group_key.path_list(), group_host)
                     .chain(path_lists.iter().flat_map(|path_list| {
-                        store.entries_for_path(path_list, group_host.as_ref())
+                        store.entries_for_path(path_list, group_host)
                     }))
                     .filter(|row| {
                         !row.is_draft()
@@ -3783,7 +3783,7 @@ impl Sidebar {
         let main_workspace = self.multi_workspace.upgrade().and_then(|multi_workspace| {
             multi_workspace
                 .read(cx)
-                .workspace_for_paths(key.path_list(), key.host().as_ref(), cx)
+                .workspace_for_paths(key.path_list(), key.host(), cx)
         });
         if let Some(workspace) = main_workspace {
             self.create_new_entry(&workspace, window, cx);
@@ -3945,7 +3945,7 @@ impl Sidebar {
                     store.archived_entries().any(|thread| {
                         (thread.main_worktree_paths() == project_group_key.path_list()
                             || thread.folder_paths() == project_group_key.path_list())
-                            && thread.matches_remote_connection(host.as_ref())
+                            && thread.matches_remote_connection(host)
                     })
                 };
                 let project_label = project_label.clone();

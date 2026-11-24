@@ -62,7 +62,6 @@ fn start(port: u16, cx: &mut App) -> Option<String> {
         Some(token) => token,
         None => {
             let token = uuid::Uuid::new_v4().simple().to_string();
-            let kvp = kvp.clone();
             let saved = token.clone();
             cx.background_spawn(async move {
                 kvp.write_kvp(TOKEN_KEY.to_string(), saved).await.log_err()

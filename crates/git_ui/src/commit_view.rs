@@ -2049,8 +2049,7 @@ impl FileHistoryView {
                                     sha.to_string(),
                                     repository.clone(),
                                     workspace.clone(),
-                                    None,
-                                    None,
+                                    CommitViewOptions::default(),
                                     window,
                                     cx,
                                 );

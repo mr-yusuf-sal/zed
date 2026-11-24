@@ -301,7 +301,7 @@ fn hwnd_of(window: &Window) -> Result<HWND> {
 }
 
 fn register_hotkey(hwnd: HWND, id: i32, source: &str) -> Result<()> {
-    let keystroke = Keystroke::parse(source)?;
+    let keystroke = Keystroke::parse_with_os(source, gpui::OperatingSystem::Windows)?;
     let modifiers = keystroke.modifiers;
     if modifiers.function {
         return Err(anyhow!("the fn modifier cannot be used in a global hotkey"));

@@ -25,7 +25,7 @@ use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
     parse_git_remote_url,
     repository::{
-        CommitData, CommitOptions, FetchOptions, InitialGraphCommitData, LogOrder, LogSource,
+        CommitData, CommitOptions, InitialGraphCommitData, LogOrder, LogSource,
         RepoPath, ResetMode, SearchCommitArgs,
     },
     stash::StashEntry,
@@ -36,7 +36,7 @@ use gpui::{
     DefiniteLength, DismissEvent, DispatchPhase, Div, DragMoveEvent, ElementId, Empty, Entity,
     EventEmitter, FocusHandle, Focusable, Hsla, MouseButton, MouseDownEvent, MouseUpEvent,
     PathBuilder, Pixels, Point, PromptLevel, ScrollEvent, ScrollHandle, ScrollStrategy,
-    ScrollWheelEvent, SharedString, Stateful, Subscription, Task, TextRun, TextStyleRefinement,
+    SharedString, Stateful, Subscription, Task, TextStyleRefinement,
     UniformListScrollHandle, WeakEntity, Window, actions, anchored, canvas, deferred, point,
     prelude::*, px, uniform_list,
 };
@@ -2856,7 +2856,9 @@ impl GitGraph {
                 .entry(sha)
                 .or_default()
                 .push(GraphWorktree {
-                    name: worktree.directory_name(name_anchor_path).into(),
+                    name: worktree
+                        .directory_name(name_anchor_path, repository.path_style)
+                        .into(),
                     branch_name: worktree
                         .branch_name()
                         .map(|branch| SharedString::from(branch.to_string())),
@@ -7083,7 +7085,9 @@ Checked out in worktree {}",
             .iter()
             .find(|worktree| !worktree.is_main && worktree.branch_name() == Some(name))
             .map(|worktree| GraphWorktree {
-                name: worktree.directory_name(name_anchor_path).into(),
+                name: worktree
+                    .directory_name(name_anchor_path, snapshot.path_style)
+                    .into(),
                 branch_name: Some(SharedString::from(name.to_string())),
                 path: worktree.path.clone(),
             });
@@ -8959,7 +8963,7 @@ Checked out in worktree {}",
             self.extend_selection(entry_idx, scroll_strategy, cx);
             return;
         }
-        if event.modifiers().secondary() {
+        if event.modifiers().secondary(cx) {
             self.toggle_selection(entry_idx, scroll_strategy, cx);
             return;
         }
@@ -12944,8 +12948,7 @@ mod tests {
                 shas[0].to_string(),
                 repository.downgrade(),
                 workspace.weak_handle(),
-                None,
-                None,
+                CommitViewOptions::default(),
                 window,
                 cx,
             );

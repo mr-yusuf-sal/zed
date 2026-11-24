@@ -323,7 +323,7 @@ impl ThreadsArchiveView {
                     // worktree's workspace too, as in the sidebar's list.
                     (t.main_worktree_paths() == key.path_list()
                         || t.folder_paths() == key.path_list())
-                        && t.matches_remote_connection(key.host().as_ref())
+                        && t.matches_remote_connection(key.host())
                 })
             })
             .sorted_by_cached_key(|t| t.created_at.unwrap_or(t.updated_at))

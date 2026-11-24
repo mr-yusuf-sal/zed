@@ -16,7 +16,7 @@ use workspace::{ModalView, Workspace};
 /// offers its own roots, since its shell can't start on another host.
 pub(crate) fn working_directory_choices(workspace: &Workspace, cx: &App) -> Vec<PathBuf> {
     let current = workspace.project_group_key(cx);
-    let mut keys = vec![current.clone()];
+    let mut keys = vec![current];
     if workspace.project().read(cx).is_local()
         && let Some(multi_workspace) = workspace
             .multi_workspace()
