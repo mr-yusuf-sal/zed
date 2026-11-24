@@ -77,6 +77,216 @@ pub(super) fn subagent_label(thread: &AcpThread) -> SharedString {
         .unwrap_or_else(|| "Subagent".into())
 }
 
+/// The work going on in a thread beyond its turn, for the running work menu.
+#[derive(Clone, Default)]
+struct RunningWork {
+    /// Each running subagent, followed by what it runs, depth first.
+    subagents: Vec<RunningWorkRow>,
+    /// What runs in the background for the thread itself.
+    background: Vec<RunningWorkRow>,
+    subagent_count: usize,
+    background_count: usize,
+}
+
+#[derive(Clone)]
+struct RunningWorkRow {
+    /// The entry of the thread on screen that shows the row's work. A subagent's work
+    /// shows inside the card of the message that started the subagent.
+    entry_ix: Option<usize>,
+    /// How deep in the tree of subagents the row is: 0 at the top.
+    depth: usize,
+    label: SharedString,
+    kind: RunningWorkKind,
+}
+
+#[derive(Clone)]
+enum RunningWorkKind {
+    /// With its thread, when its parent lets it be stopped.
+    Subagent { stop: Option<Entity<AcpThread>> },
+    /// A command, with the thread that runs it when the agent can stop it.
+    Process {
+        stop: Option<(Entity<AcpThread>, acp_v2::TerminalId)>,
+    },
+    /// A tool call whose work goes on, with its thread when the agent can stop it.
+    ToolCall {
+        stop: Option<(Entity<AcpThread>, acp_v2::ToolCallId)>,
+    },
+}
+
+fn running_work_label(tool_call: &ToolCall, cx: &App) -> String {
+    tool_call
+        .label
+        .read(cx)
+        .source()
+        .replace('`', "")
+        .split_whitespace()
+        .join(" ")
+}
+
+fn is_tool_call_running(tool_call: &ToolCall) -> bool {
+    matches!(
+        tool_call.status(),
+        ToolCallStatus::Pending | ToolCallStatus::InProgress | ToolCallStatus::WaitingForConfirmation
+    )
+}
+
+/// What runs in the background for `thread` itself: the work its agent lists in the
+/// `background` of its latest state, and the commands that outlived their tool call
+/// (Claude Code's `run_in_background`), which an agent on ACP v1 doesn't list.
+fn background_work_rows(
+    thread_entity: &Entity<AcpThread>,
+    depth: usize,
+    anchor: Option<usize>,
+    cx: &App,
+) -> Vec<RunningWorkRow> {
+    let thread = thread_entity.read(cx);
+    let mut rows = Vec::new();
+    let mut listed_terminals = HashSet::default();
+    let terminal_row = |entry_ix: usize, tool_call: &ToolCall, terminal: &Entity<Terminal>| {
+        let terminal = terminal.read(cx);
+        RunningWorkRow {
+            entry_ix: anchor.or(Some(entry_ix)),
+            depth,
+            label: format!(
+                "{} · {}",
+                running_work_label(tool_call, cx),
+                util::time::duration_alt_display(terminal.started_at().elapsed())
+            )
+            .into(),
+            kind: RunningWorkKind::Process {
+                stop: terminal
+                    .can_cancel()
+                    .then(|| (thread_entity.clone(), terminal.id().clone())),
+            },
+        }
+    };
+    let terminal_owner = |terminal_id: &acp_v2::TerminalId| {
+        thread
+            .entries()
+            .iter()
+            .enumerate()
+            .find_map(|(entry_ix, entry)| {
+                let AgentThreadEntry::ToolCall(tool_call) = entry else {
+                    return None;
+                };
+                let terminal = tool_call
+                    .terminals()
+                    .find(|terminal| terminal.read(cx).id() == terminal_id)?;
+                Some((entry_ix, tool_call, terminal))
+            })
+    };
+
+    for work in thread.background_work().unwrap_or_default() {
+        match work {
+            acp_v2::BackgroundWork::Terminal(background) => {
+                listed_terminals.insert(background.terminal_id.clone());
+                if let Some((entry_ix, tool_call, terminal)) =
+                    terminal_owner(&background.terminal_id)
+                {
+                    rows.push(terminal_row(entry_ix, tool_call, terminal));
+                }
+            }
+            acp_v2::BackgroundWork::ToolCall(background) => {
+                let Some((entry_ix, tool_call)) = thread.tool_call(&background.tool_call_id)
+                else {
+                    continue;
+                };
+                rows.push(RunningWorkRow {
+                    entry_ix: anchor.or(Some(entry_ix)),
+                    depth,
+                    label: running_work_label(tool_call, cx).into(),
+                    kind: RunningWorkKind::ToolCall {
+                        stop: tool_call
+                            .can_cancel()
+                            .then(|| (thread_entity.clone(), tool_call.id.clone())),
+                    },
+                });
+            }
+            // Subagents are listed with their own work, and work Zed doesn't know
+            // can't be shown or stopped.
+            _ => {}
+        }
+    }
+
+    for (entry_ix, entry) in thread.entries().iter().enumerate() {
+        let AgentThreadEntry::ToolCall(tool_call) = entry else {
+            continue;
+        };
+        if !matches!(tool_call.status(), ToolCallStatus::Completed) {
+            continue;
+        }
+        for terminal in tool_call.terminals() {
+            let terminal_entity = terminal;
+            let terminal = terminal_entity.read(cx);
+            if terminal.output().is_none() && !listed_terminals.contains(terminal.id()) {
+                rows.push(terminal_row(entry_ix, tool_call, terminal_entity));
+            }
+        }
+    }
+    rows
+}
+
+/// Adds the subagents of `thread` that still work to `work.subagents`, each followed by
+/// what it runs: its tool calls in progress, its background work and the subagents it
+/// launched, depth first.
+fn collect_running_subagents(
+    thread: &Entity<AcpThread>,
+    depth: usize,
+    anchor: Option<usize>,
+    root: &AcpThread,
+    work: &mut RunningWork,
+    cx: &App,
+) {
+    for subagent_entity in thread.read(cx).subagents() {
+        let subagent = subagent_entity.read(cx);
+        let is_generating = subagent.status() == ThreadStatus::Generating;
+        if !is_generating && !subagent.has_background_work(cx) {
+            continue;
+        }
+        // A top-level subagent's work shows in the card of the message that started it,
+        // and everything below it inside that card.
+        let entry_ix = anchor.or_else(|| {
+            root.entries().iter().position(|entry| {
+                matches!(entry, AgentThreadEntry::SessionMessage(message)
+                    if message.recipient_session_id.as_ref() == Some(subagent.session_id()))
+            })
+        });
+        let can_stop = is_generating
+            && subagent
+                .subagent_association()
+                .is_some_and(|association| association.can_cancel);
+        work.subagent_count += 1;
+        work.subagents.push(RunningWorkRow {
+            entry_ix,
+            depth,
+            label: subagent_label(subagent),
+            kind: RunningWorkKind::Subagent {
+                stop: can_stop.then(|| subagent_entity.clone()),
+            },
+        });
+        for entry in subagent.entries() {
+            if let AgentThreadEntry::ToolCall(tool_call) = entry
+                && is_tool_call_running(tool_call)
+            {
+                work.subagents.push(RunningWorkRow {
+                    entry_ix,
+                    depth: depth + 1,
+                    label: running_work_label(tool_call, cx).into(),
+                    kind: RunningWorkKind::ToolCall {
+                        stop: tool_call
+                            .can_cancel()
+                            .then(|| (subagent_entity.clone(), tool_call.id.clone())),
+                    },
+                });
+            }
+        }
+        let background = background_work_rows(subagent_entity, depth + 1, entry_ix, cx);
+        work.background_count += background.len();
+        work.subagents.extend(background);
+        collect_running_subagents(subagent_entity, depth + 1, entry_ix, root, work, cx);
+    }
+}
+
 /// Most agents echo an accepted prompt almost immediately, so the in-flight status row
 /// only appears for submissions that stay unsettled long enough to be worth reporting.
 pub(crate) const UNSETTLED_SUBMISSION_REVEAL_DELAY: Duration = Duration::from_secs(1);
@@ -5736,6 +5946,7 @@ impl ThreadView {
                                     .gap_1()
                                     .children(self.render_activity_status_label(cx))
                                     .children(discard_draft_button)
+                                    .children(self.render_running_work(cx))
                                     .children(self.render_token_usage(cx))
                                     .children(self.profile_selector.clone())
                                     .map(|this| match self.config_options_view.clone() {
@@ -5749,6 +5960,165 @@ impl ThreadView {
                     ),
             )
             .into_any()
+    }
+
+    /// The work going on in the thread beyond its turn, as a tree: the subagents that
+    /// still work, each with what it runs, then what runs in the background for the
+    /// thread itself.
+    fn running_work(&self, cx: &App) -> RunningWork {
+        let mut work = RunningWork::default();
+        collect_running_subagents(&self.thread, 0, None, self.thread.read(cx), &mut work, cx);
+        work.background = background_work_rows(&self.thread, 0, None, cx);
+        work.background_count += work.background.len();
+        work
+    }
+
+    /// A count of the running subagents and background work next to the context usage
+    /// ring, opening a tree of them that scrolls to each and can stop them.
+    fn render_running_work(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let work = self.running_work(cx);
+        if work.subagent_count == 0 && work.background_count == 0 {
+            return None;
+        }
+
+        // Both full counts side by side are too wide for the toolbar and wrap it, so
+        // they are abbreviated when both are shown.
+        let counts = match (work.subagent_count, work.background_count) {
+            (0, background_count) => format!("{background_count} background"),
+            (subagent_count, 0) => {
+                format!("{subagent_count} {}", pluralize("subagent", subagent_count))
+            }
+            (subagent_count, background_count) => {
+                format!("{subagent_count} sub · {background_count} bg")
+            }
+        };
+        let trigger_icon = if work.subagent_count == 0 {
+            IconName::ToolTerminal
+        } else {
+            IconName::Thread
+        };
+        let this = cx.weak_entity();
+
+        Some(
+            PopoverMenu::new("running-work-menu")
+                .trigger_with_tooltip(
+                    Button::new("running-work", counts)
+                        .label_size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .start_icon(
+                            Icon::new(trigger_icon)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                    Tooltip::text("Running Subagents and Background Work"),
+                )
+                .anchor(gpui::Anchor::BottomRight)
+                .menu(move |window, cx| {
+                    let work = work.clone();
+                    let this = this.clone();
+                    Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                        // An entry's end slot is only shown when the menu has an end slot
+                        // action.
+                        menu = menu.end_slot_action(Box::new(menu::EndSlot));
+                        let entry = |row: &RunningWorkRow| {
+                            // The menu has no indentation of its own, so the tree is drawn
+                            // in the label.
+                            let label = match row.depth {
+                                0 => row.label.to_string(),
+                                depth => format!("{}└ {}", "    ".repeat(depth - 1), row.label),
+                            };
+                            let icon = match row.kind {
+                                RunningWorkKind::Subagent { .. } => IconName::Thread,
+                                RunningWorkKind::Process { .. } => IconName::ToolTerminal,
+                                RunningWorkKind::ToolCall { .. } => IconName::ToolHammer,
+                            };
+                            let entry_ix = row.entry_ix;
+                            let entry = ContextMenuEntry::new(label)
+                                .icon(icon)
+                                .icon_color(Color::Muted)
+                                .handler({
+                                    let this = this.clone();
+                                    move |_, cx| {
+                                        let Some(entry_ix) = entry_ix else {
+                                            return;
+                                        };
+                                        this.update(cx, |this, cx| {
+                                            this.list_state.scroll_to(ListOffset {
+                                                item_ix: entry_ix,
+                                                offset_in_item: px(0.),
+                                            });
+                                            cx.notify();
+                                        })
+                                        .log_err();
+                                    }
+                                });
+                            // An end slot leaves the menu open, unlike picking the entry, so
+                            // each Stop closes it.
+                            match &row.kind {
+                                RunningWorkKind::Subagent {
+                                    stop: Some(subagent),
+                                } => entry.end_slot(IconName::Stop, "Stop Subagent", {
+                                    let this = this.clone();
+                                    let subagent = subagent.clone();
+                                    move |window, cx| {
+                                        this.update(cx, |this, cx| {
+                                            this.cancel_thread(&subagent, cx).detach();
+                                        })
+                                        .log_err();
+                                        window.dispatch_action(Box::new(menu::Cancel), cx);
+                                    }
+                                }),
+                                RunningWorkKind::Process {
+                                    stop: Some((thread, terminal_id)),
+                                } => entry.end_slot(IconName::Stop, "Stop Process", {
+                                    let thread = thread.clone();
+                                    let terminal_id = terminal_id.clone();
+                                    move |window, cx| {
+                                        thread
+                                            .update(cx, |thread, cx| {
+                                                thread.cancel_terminal(&terminal_id, cx)
+                                            })
+                                            .detach_and_log_err(cx);
+                                        window.dispatch_action(Box::new(menu::Cancel), cx);
+                                    }
+                                }),
+                                RunningWorkKind::ToolCall {
+                                    stop: Some((thread, tool_call_id)),
+                                } => entry.end_slot(IconName::Stop, "Stop Tool Call", {
+                                    let thread = thread.clone();
+                                    let tool_call_id = tool_call_id.clone();
+                                    move |window, cx| {
+                                        thread
+                                            .update(cx, |thread, cx| {
+                                                thread.cancel_tool_call(&tool_call_id, cx)
+                                            })
+                                            .detach_and_log_err(cx);
+                                        window.dispatch_action(Box::new(menu::Cancel), cx);
+                                    }
+                                }),
+                                _ => entry,
+                            }
+                        };
+                        if !work.subagents.is_empty() {
+                            menu = menu.header("Subagents");
+                            for row in &work.subagents {
+                                menu = menu.item(entry(row));
+                            }
+                        }
+                        if !work.background.is_empty() {
+                            if !work.subagents.is_empty() {
+                                menu = menu.separator();
+                            }
+                            menu = menu.header("Background");
+                            for row in &work.background {
+                                menu = menu.item(entry(row));
+                            }
+                        }
+                        menu
+                    }))
+                })
+                .into_any_element(),
+        )
     }
 
     fn render_activity_status_label(&self, cx: &Context<Self>) -> Option<impl IntoElement> {

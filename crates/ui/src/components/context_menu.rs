@@ -178,6 +178,21 @@ impl ContextMenuEntry {
         self
     }
 
+    /// A button at the end of the entry that runs `handler` instead of the
+    /// entry's own handler. The menu shows it only when it has an
+    /// [`ContextMenu::end_slot_action`].
+    pub fn end_slot(
+        mut self,
+        icon: IconName,
+        title: impl Into<SharedString>,
+        handler: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.end_slot_icon = Some(icon);
+        self.end_slot_title = Some(title.into());
+        self.end_slot_handler = Some(Rc::new(move |_, window, cx| handler(window, cx)));
+        self
+    }
+
     pub fn secondary_handler(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
         self.secondary_handler = Some(Rc::new(move |_, window, cx| handler(window, cx)));
         self
