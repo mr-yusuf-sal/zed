@@ -445,10 +445,10 @@ impl RenderOnce for ThreadItem {
 
         let has_metadata = !single_line
             && (has_project_name
-            || has_project_paths
-            || has_worktree
-            || has_diff_stats
-            || has_timestamp);
+                || has_project_paths
+                || has_worktree
+                || has_diff_stats
+                || has_timestamp);
 
         v_flex()
             .id(self.id.clone())

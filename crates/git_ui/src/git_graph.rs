@@ -25,8 +25,8 @@ use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
     parse_git_remote_url,
     repository::{
-        CommitData, CommitOptions, InitialGraphCommitData, LogOrder, LogSource,
-        RepoPath, ResetMode, SearchCommitArgs,
+        CommitData, CommitOptions, InitialGraphCommitData, LogOrder, LogSource, RepoPath,
+        ResetMode, SearchCommitArgs,
     },
     stash::StashEntry,
     status::{FileStatus, StatusCode, TrackedStatus},
@@ -36,9 +36,8 @@ use gpui::{
     DefiniteLength, DismissEvent, DispatchPhase, Div, DragMoveEvent, ElementId, Empty, Entity,
     EventEmitter, FocusHandle, Focusable, Hsla, MouseButton, MouseDownEvent, MouseUpEvent,
     PathBuilder, Pixels, Point, PromptLevel, ScrollEvent, ScrollHandle, ScrollStrategy,
-    SharedString, Stateful, Subscription, Task, TextStyleRefinement,
-    UniformListScrollHandle, WeakEntity, Window, actions, anchored, canvas, deferred, point,
-    prelude::*, px, uniform_list,
+    SharedString, Stateful, Subscription, Task, TextStyleRefinement, UniformListScrollHandle,
+    WeakEntity, Window, actions, anchored, canvas, deferred, point, prelude::*, px, uniform_list,
 };
 use language::line_diff;
 use markdown::{Markdown, MarkdownElement};

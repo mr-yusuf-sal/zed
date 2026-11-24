@@ -104,7 +104,9 @@ impl RemotesModal {
     }
 
     fn has_remote(&self, name: &str) -> bool {
-        self.remotes.iter().any(|(remote, _)| remote.as_ref() == name)
+        self.remotes
+            .iter()
+            .any(|(remote, _)| remote.as_ref() == name)
     }
 
     fn edit(&mut self, name: SharedString, window: &mut Window, cx: &mut Context<Self>) {
@@ -179,7 +181,9 @@ impl RemotesModal {
                     operations
                 })
             }
-            None => vec![repository.update(cx, |repository, _| repository.create_remote(name, url))],
+            None => {
+                vec![repository.update(cx, |repository, _| repository.create_remote(name, url))]
+            }
         };
         self.run(operations, true, window, cx);
     }
@@ -219,9 +223,9 @@ impl RemotesModal {
                 return;
             }
             this.update_in(cx, |this, window, cx| {
-                let operation = this
-                    .repository
-                    .update(cx, |repository, _| repository.remove_remote(name.to_string()));
+                let operation = this.repository.update(cx, |repository, _| {
+                    repository.remove_remote(name.to_string())
+                });
                 let was_editing = this.editing.as_ref() == Some(&name);
                 this.run(vec![operation], was_editing, window, cx);
             })
@@ -414,11 +418,7 @@ impl Render for RemotesModal {
                     .child(self.render_field("Name", &self.name_editor, cx))
                     .child(self.render_field("URL", &self.url_editor, cx))
                     .when_some(self.error.clone(), |this, error| {
-                        this.child(
-                            Label::new(error)
-                                .size(LabelSize::Small)
-                                .color(Color::Error),
-                        )
+                        this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
                     })
                     .child(
                         h_flex()
@@ -451,9 +451,11 @@ impl Render for RemotesModal {
                                     &focus_handle,
                                     cx,
                                 ))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.save(window, cx);
-                                })),
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.save(window, cx);
+                                    },
+                                )),
                             ),
                     ),
             )

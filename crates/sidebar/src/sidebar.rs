@@ -2210,9 +2210,11 @@ impl Sidebar {
                 let mut counted_thread_ids = HashSet::new();
                 open_thread_count = store
                     .entries_for_main_worktree_path(group_key.path_list(), group_host)
-                    .chain(path_lists.iter().flat_map(|path_list| {
-                        store.entries_for_path(path_list, group_host)
-                    }))
+                    .chain(
+                        path_lists
+                            .iter()
+                            .flat_map(|path_list| store.entries_for_path(path_list, group_host)),
+                    )
                     .filter(|row| {
                         !row.is_draft()
                             && !seen_thread_ids.contains(&row.thread_id)

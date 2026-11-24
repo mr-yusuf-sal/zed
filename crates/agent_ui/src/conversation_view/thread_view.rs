@@ -126,7 +126,9 @@ fn running_work_label(tool_call: &ToolCall, cx: &App) -> String {
 fn is_tool_call_running(tool_call: &ToolCall) -> bool {
     matches!(
         tool_call.status(),
-        ToolCallStatus::Pending | ToolCallStatus::InProgress | ToolCallStatus::WaitingForConfirmation
+        ToolCallStatus::Pending
+            | ToolCallStatus::InProgress
+            | ToolCallStatus::WaitingForConfirmation
     )
 }
 
@@ -142,24 +144,25 @@ fn background_work_rows(
     let thread = thread_entity.read(cx);
     let mut rows = Vec::new();
     let mut listed_terminals = HashSet::default();
-    let terminal_row = |entry_ix: usize, tool_call: &ToolCall, terminal: &Entity<acp_thread::Terminal>| {
-        let terminal = terminal.read(cx);
-        RunningWorkRow {
-            entry_ix: anchor.or(Some(entry_ix)),
-            depth,
-            label: format!(
-                "{} · {}",
-                running_work_label(tool_call, cx),
-                util::time::duration_alt_display(terminal.started_at().elapsed())
-            )
-            .into(),
-            kind: RunningWorkKind::Process {
-                stop: terminal
-                    .can_cancel()
-                    .then(|| (thread_entity.clone(), terminal.id().clone())),
-            },
-        }
-    };
+    let terminal_row =
+        |entry_ix: usize, tool_call: &ToolCall, terminal: &Entity<acp_thread::Terminal>| {
+            let terminal = terminal.read(cx);
+            RunningWorkRow {
+                entry_ix: anchor.or(Some(entry_ix)),
+                depth,
+                label: format!(
+                    "{} · {}",
+                    running_work_label(tool_call, cx),
+                    util::time::duration_alt_display(terminal.started_at().elapsed())
+                )
+                .into(),
+                kind: RunningWorkKind::Process {
+                    stop: terminal
+                        .can_cancel()
+                        .then(|| (thread_entity.clone(), terminal.id().clone())),
+                },
+            }
+        };
     let terminal_owner = |terminal_id: &acp_v2::TerminalId| {
         thread
             .entries()
@@ -187,8 +190,7 @@ fn background_work_rows(
                 }
             }
             acp_v2::BackgroundWork::ToolCall(background) => {
-                let Some((entry_ix, tool_call)) = thread.tool_call(&background.tool_call_id)
-                else {
+                let Some((entry_ix, tool_call)) = thread.tool_call(&background.tool_call_id) else {
                     continue;
                 };
                 rows.push(RunningWorkRow {
