@@ -132,8 +132,6 @@ const COLUMN_WIDTHS_PATH_HISTORY_KEY: &str = "git_graph_path_history_column_widt
 const HIDDEN_COLUMNS_KEY: &str = "git_graph_hidden_columns";
 const HIDDEN_COLUMNS_PATH_HISTORY_KEY: &str = "git_graph_path_history_hidden_columns";
 const DETAIL_PANEL_POSITION_KEY: &str = "git_graph_detail_panel_position";
-const AUTO_FETCH_KEY: &str = "git_graph_auto_fetch";
-const AUTO_FETCH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// How far the pointer can move from where the middle button was pressed
 /// before autoscroll starts moving the graph.
 const AUTOSCROLL_DEAD_ZONE: Pixels = px(8.);
@@ -2106,8 +2104,6 @@ pub struct GitGraph {
     uncommitted_default_applied: bool,
     working_tree_changes: Entity<WorkingTreeChanges>,
     operation_in_progress: Option<OperationInProgress>,
-    auto_fetch_enabled: bool,
-    _auto_fetch_task: Option<Task<()>>,
     autoscroll: Option<MiddleClickAutoscroll>,
     _author_day_task: Option<Task<()>>,
     _operation_in_progress_task: Option<Task<()>>,
@@ -2343,13 +2339,20 @@ impl GitGraph {
         let mut row_height = Self::row_height(window, cx);
         let mut was_date_style = GitGraphSettings::get_global(cx).date_style;
         let mut was_date_format = ProjectSettings::get_global(cx).git.date_format.clone();
+        let mut was_auto_fetch = ProjectSettings::get_global(cx).git.auto_fetch.enabled;
 
         cx.observe_global_in::<settings::SettingsStore>(window, move |this, window, cx| {
             let date_style = GitGraphSettings::get_global(cx).date_style;
-            let date_format = &ProjectSettings::get_global(cx).git.date_format;
-            if date_style != was_date_style || *date_format != was_date_format {
+            let git_settings = &ProjectSettings::get_global(cx).git;
+            let date_format = &git_settings.date_format;
+            let auto_fetch = git_settings.auto_fetch.enabled;
+            if date_style != was_date_style
+                || *date_format != was_date_format
+                || auto_fetch != was_auto_fetch
+            {
                 was_date_style = date_style;
                 was_date_format = date_format.clone();
+                was_auto_fetch = auto_fetch;
                 cx.notify();
             }
             let new_row_height = Self::row_height(window, cx);
@@ -2403,8 +2406,6 @@ impl GitGraph {
             uncommitted_default_applied: false,
             working_tree_changes,
             operation_in_progress: None,
-            auto_fetch_enabled: Self::restore_auto_fetch(cx),
-            _auto_fetch_task: None,
             autoscroll: None,
             _author_day_task: None,
             _operation_in_progress_task: None,
@@ -2424,9 +2425,6 @@ impl GitGraph {
         this.fetch_initial_graph_data(cx);
         this.refresh_operation_in_progress(cx);
         this.select_uncommitted_by_default(cx);
-        if this.auto_fetch_enabled {
-            this.start_auto_fetch(cx);
-        }
         this
     }
 
@@ -4938,59 +4936,26 @@ Checked out in worktree {}",
         )
     }
 
-    fn restore_auto_fetch(cx: &App) -> bool {
-        KeyValueStore::global(cx)
-            .read_kvp(AUTO_FETCH_KEY)
-            .log_err()
-            .flatten()
-            .is_some_and(|value| value == "true")
-    }
-
+    /// Turns Zed's background fetch (`git.auto_fetch`) on or off in the user's settings,
+    /// the same fetch the git panel's setting controls.
     fn toggle_auto_fetch(&mut self, cx: &mut Context<Self>) {
-        self.auto_fetch_enabled = !self.auto_fetch_enabled;
-        if self.auto_fetch_enabled {
-            self.start_auto_fetch(cx);
-        } else {
-            self._auto_fetch_task = None;
-        }
-
-        let value = self.auto_fetch_enabled.to_string();
-        let kvp = KeyValueStore::global(cx);
-        cx.background_spawn(async move {
-            kvp.write_kvp(AUTO_FETCH_KEY.to_string(), value)
-                .await
-                .log_err()
-        })
-        .detach();
-        cx.notify();
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let fs = workspace.read(cx).app_state().fs.clone();
+        let enabled = !ProjectSettings::get_global(cx).git.auto_fetch.enabled;
+        cx.update_global::<settings::SettingsStore, _>(|store, _cx| {
+            store.update_settings_file(fs, move |settings, _cx| {
+                settings
+                    .git
+                    .get_or_insert_default()
+                    .auto_fetch
+                    .get_or_insert_default()
+                    .enabled = Some(enabled);
+            });
+        });
     }
 
-    /// Fetches all remotes every few minutes while the graph is open. It calls
-    /// the repository directly instead of dispatching `git::Fetch`, so it works
-    /// for whichever repository the graph shows and stays quiet: no toasts, and
-    /// a remote that asks for a password just fails until the next round.
-    fn start_auto_fetch(&mut self, cx: &mut Context<Self>) {
-        self._auto_fetch_task = Some(cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(AUTO_FETCH_INTERVAL).await;
-                let Ok(fetch) = this.update(cx, |this, cx| {
-                    let repository = this.get_repository(cx)?;
-                    Some(repository.update(cx, |repository, cx| {
-                        let askpass = AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {});
-                        repository.fetch(FetchOptions::All, askpass, cx)
-                    }))
-                }) else {
-                    break;
-                };
-                if let Some(fetch) = fetch {
-                    match fetch.await {
-                        Ok(Ok(_)) | Err(_) => {}
-                        Ok(Err(error)) => log::debug!("git graph auto-fetch failed: {error:#}"),
-                    }
-                }
-            }
-        }));
-    }
     /// Fetch, pull and push buttons. They dispatch the workspace's git actions so
     /// they share the git panel's remote picker, progress state and output
     /// toasts, which is also why they act on the active repository and are
@@ -5029,17 +4994,21 @@ Checked out in worktree {}",
                 })
         };
 
+        let auto_fetch = ProjectSettings::get_global(cx).git.auto_fetch;
         h_flex()
             .flex_shrink_0()
             .gap_0p5()
             .child(
                 IconButton::new("git-graph-auto-fetch", IconName::Clock)
                     .icon_size(IconSize::Small)
-                    .toggle_state(self.auto_fetch_enabled)
-                    .tooltip(Tooltip::text(if self.auto_fetch_enabled {
-                        "Auto-fetch is on: all remotes are fetched every 5 minutes"
+                    .toggle_state(auto_fetch.enabled)
+                    .tooltip(Tooltip::text(if auto_fetch.enabled {
+                        format!(
+                            "Auto-fetch is on: the branches' remotes are fetched every {} seconds",
+                            auto_fetch.interval_secs
+                        )
                     } else {
-                        "Fetch all remotes every 5 minutes while the graph is open"
+                        "Fetch the branches' remotes in the background (git.auto_fetch)".to_string()
                     }))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.toggle_auto_fetch(cx);
