@@ -1146,10 +1146,6 @@ pub struct Sidebar {
     /// workspaces on top, which keep them in sight there. Saved with the panel's state and
     /// forgotten once a group is removed from the window.
     pinned: HashSet<ProjectGroupKey>,
-    /// Set when a project header starts being dragged, and cleared on the first render after the
-    /// drag ends. gpui doesn't say what is being dragged, and the strip to drop a workspace on to
-    /// pin it must not appear while a region is being resized.
-    dragging_project_group: bool,
     /// The project panel the search last filtered, so it is unfiltered when another workspace
     /// becomes active or the search is cleared.
     searched_project_panel: Option<WeakEntity<ProjectPanel>>,
@@ -1314,7 +1310,6 @@ impl Sidebar {
             databases_height: DEFAULT_DATABASES_HEIGHT,
             databases_hidden: false,
             pinned: HashSet::new(),
-            dragging_project_group: false,
             searched_project_panel: None,
         }
     }
@@ -2882,17 +2877,8 @@ impl Sidebar {
             .when(!has_filter, |this| {
                 this.hover(|s| s.bg(color.ghost_element_hover))
                     .group_active(&group_name, |s| s.bg(color.ghost_element_active))
-                    .on_drag(dragged_group, {
-                        let sidebar = cx.weak_entity();
-                        move |dragged, _, _, cx| {
-                            sidebar
-                                .update(cx, |sidebar, cx| {
-                                    sidebar.dragging_project_group = true;
-                                    cx.notify();
-                                })
-                                .ok();
-                            cx.new(|_| dragged.clone())
-                        }
+                    .on_drag(dragged_group, |dragged, _, _, cx| {
+                        cx.new(|_| dragged.clone())
                     })
                     .drag_over::<DraggedProjectGroup>(move |style, dragged, _, cx| {
                         let style = style
@@ -3148,20 +3134,17 @@ impl Sidebar {
         let active_group = self.contents.active_group.clone();
         let active_header_ix = active_group.as_ref().map(|group| group.header_ix);
         let order = self.workspace_header_order();
-        let mut headers = Vec::with_capacity(order.len() + 1);
-        // While a workspace is dragged, a strip on top pins it when dropped there, which is the
-        // only place to drop it when no inactive workspace is in sight yet.
-        if self.dragging_project_group && cx.has_active_drag() {
-            headers.push(self.render_pin_drop_zone(cx));
-        }
-        headers.extend(order.into_iter().filter_map(|ix| {
-            let presentation = if Some(ix) == active_header_ix {
-                HeaderPresentation::ActiveWorkspace
-            } else {
-                HeaderPresentation::InSight
-            };
-            self.render_header_at(ix, presentation, is_focused, cx)
-        }));
+        let headers: Vec<AnyElement> = order
+            .into_iter()
+            .filter_map(|ix| {
+                let presentation = if Some(ix) == active_header_ix {
+                    HeaderPresentation::ActiveWorkspace
+                } else {
+                    HeaderPresentation::InSight
+                };
+                self.render_header_at(ix, presentation, is_focused, cx)
+            })
+            .collect();
         let active_workspace = active_group
             .as_ref()
             .map(|group| self.render_active_workspace(group, window, cx));
@@ -3252,30 +3235,6 @@ impl Sidebar {
             self.serialize(cx);
             cx.notify();
         }
-    }
-
-    fn render_pin_drop_zone(&self, cx: &mut Context<Self>) -> AnyElement {
-        h_flex()
-            .id("pin-drop-zone")
-            .h(Tab::content_height(cx))
-            .w_full()
-            .px_2()
-            .child(
-                Label::new("Drop here to pin")
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .drag_over::<DraggedProjectGroup>(|style, _, _, cx| {
-                style
-                    .bg(cx.theme().colors().drop_target_background)
-                    .border_color(cx.theme().colors().drop_target_border)
-            })
-            .on_drop(
-                cx.listener(|this, dragged: &DraggedProjectGroup, _window, cx| {
-                    this.set_pinned(&dragged.key, true, cx);
-                }),
-            )
-            .into_any_element()
     }
 
     fn render_active_workspace(
@@ -9083,9 +9042,6 @@ impl Focusable for Sidebar {
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _titlebar_height = ui::utils::platform_title_bar_height(window);
-        if !cx.has_active_drag() {
-            self.dragging_project_group = false;
-        }
         // Headers drawn outside the list keep their menus' handles here too.
         for header_ix in self.contents.project_header_indices.clone() {
             self.project_header_menu_handles
