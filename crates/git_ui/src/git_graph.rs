@@ -2938,26 +2938,28 @@ Checked out in worktree {}",
                 )
             })
             .child(
-                Chip::new(name.clone())
-                    .label_size(LabelSize::Small)
-                    .truncate()
-                    .map(|chip| {
-                        if is_head {
-                            chip.icon(IconName::Check)
-                                .bg_color(background.blend(accent_color.opacity(0.25)))
-                                .border_color(accent_color.opacity(0.5))
-                        } else if is_in_worktree {
-                            chip.icon(IconName::GitWorktree)
-                                .icon_color(Color::Custom(accent_color))
-                                .bg_color(background.blend(accent_color.opacity(0.08)))
-                                .border_color(accent_color.opacity(0.25))
-                        } else {
-                            chip.icon(IconName::GitBranch)
-                                .icon_color(Color::Custom(accent_color))
-                                .bg_color(background.blend(accent_color.opacity(0.08)))
-                                .border_color(accent_color.opacity(0.25))
-                        }
-                    }),
+                Chip::new(SharedString::from(
+                    name.strip_prefix("HEAD -> ").unwrap_or(&name).to_string(),
+                ))
+                .label_size(LabelSize::Small)
+                .truncate()
+                .map(|chip| {
+                    if is_head {
+                        chip.icon(IconName::Check)
+                            .bg_color(background.blend(accent_color.opacity(0.25)))
+                            .border_color(accent_color.opacity(0.5))
+                    } else if is_in_worktree {
+                        chip.icon(IconName::GitWorktree)
+                            .icon_color(Color::Custom(accent_color))
+                            .bg_color(background.blend(accent_color.opacity(0.08)))
+                            .border_color(accent_color.opacity(0.25))
+                    } else {
+                        chip.icon(IconName::GitBranch)
+                            .icon_color(Color::Custom(accent_color))
+                            .bg_color(background.blend(accent_color.opacity(0.08)))
+                            .border_color(accent_color.opacity(0.25))
+                    }
+                }),
             )
             .on_mouse_down(
                 MouseButton::Right,
@@ -8712,11 +8714,19 @@ Checked out in worktree {}",
         let viewport_range = first_visible_row.min(loaded_commit_count.saturating_sub(1))
             ..last_visible_row.min(loaded_commit_count);
 
-        let head_branch_name: Option<SharedString> = self.get_repository(cx).and_then(|repo| {
-            repo.read(cx)
-                .branch
-                .as_ref()
-                .map(|branch| SharedString::from(branch.name().to_string()))
+        let head_branch = self
+            .get_repository(cx)
+            .and_then(|repo| repo.read(cx).branch.clone());
+        let head_branch_name: Option<SharedString> = head_branch
+            .as_ref()
+            .map(|branch| SharedString::from(branch.name().to_string()));
+        // The remote ref the checked-out branch tracks, as `%D` names it (`origin/main`).
+        let head_upstream_name: Option<SharedString> = head_branch.as_ref().and_then(|branch| {
+            branch
+                .upstream
+                .as_ref()?
+                .stripped_ref_name()
+                .map(|name| SharedString::from(name.to_string()))
         });
 
         let show_connector = self.is_graph_column_visible();
@@ -8788,15 +8798,21 @@ Checked out in worktree {}",
             let ref_names = commit.data.ref_names.clone();
 
             // When a commit carries multiple refs we only render a single badge
-            // (preferring the checked-out branch, falling back to the first ref)
             // plus a "+N" counter, so the gutter stays legible instead of
-            // cramming several truncated chips together.
-            let primary_ref = match ref_names
+            // cramming several truncated chips together. The highlighted badge
+            // goes to the remote ref the checked-out branch tracks, which shows
+            // where the branch stands against its remote; the branch itself is
+            // highlighted only when it tracks nothing.
+            let upstream_ref = ref_names
                 .iter()
-                .find(|name| Self::is_head_ref(name.as_ref(), &head_branch_name))
-            {
-                Some(head_ref) => Some((head_ref.clone(), true)),
-                None => ref_names.first().map(|first| (first.clone(), false)),
+                .find(|name| head_upstream_name.as_ref() == Some(*name));
+            let head_ref = ref_names
+                .iter()
+                .find(|name| Self::is_head_ref(name.as_ref(), &head_branch_name));
+            let primary_ref = match (upstream_ref, head_ref) {
+                (Some(upstream_ref), _) => Some((upstream_ref.clone(), true)),
+                (None, Some(head_ref)) => Some((head_ref.clone(), head_upstream_name.is_none())),
+                (None, None) => ref_names.first().map(|first| (first.clone(), false)),
             };
 
             let primary_worktree = primary_ref
