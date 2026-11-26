@@ -23,6 +23,7 @@ pub struct GitPage {
     focus_handle: FocusHandle,
     _git_store_subscription: Subscription,
     _git_graph_subscription: Option<Subscription>,
+    _focus_subscription: Subscription,
 }
 
 impl GitPage {
@@ -44,13 +45,25 @@ impl GitPage {
                 }
             },
         );
+        let focus_handle = cx.focus_handle();
+        // The pane remembers the last focused handle in each of its items and focuses it again
+        // when the pane itself gets focus. The tab's own handle is the one focused before the
+        // graph exists, so it stays rendered around the graph and hands focus on to it; a
+        // remembered handle that is no longer rendered loses focus at once, and the workspace
+        // giving it back to the pane made the two take turns every frame.
+        let focus_subscription = cx.on_focus(&focus_handle, window, |this, window, cx| {
+            if let Some(git_graph) = &this.git_graph {
+                window.focus(&git_graph.focus_handle(cx), cx);
+            }
+        });
         let mut this = Self {
             workspace,
             git_store,
             git_graph: None,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             _git_store_subscription: git_store_subscription,
             _git_graph_subscription: None,
+            _focus_subscription: focus_subscription,
         };
         this.ensure_graph(window, cx);
         this
@@ -146,10 +159,9 @@ fn focus_databases(workspace: &mut Workspace, window: &mut Window, cx: &mut Cont
 
 impl Render for GitPage {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        match &self.git_graph {
+        let content = match &self.git_graph {
             Some(git_graph) => git_graph.clone().into_any_element(),
             None => v_flex()
-                .track_focus(&self.focus_handle)
                 .size_full()
                 .items_center()
                 .justify_center()
@@ -163,7 +175,11 @@ impl Render for GitPage {
                     ),
                 )
                 .into_any_element(),
-        }
+        };
+        div()
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .child(content)
     }
 }
 
