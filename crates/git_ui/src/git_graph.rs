@@ -2887,6 +2887,42 @@ impl GitGraph {
         })
     }
 
+    /// The row of the commit HEAD is on and the checked-out branch's refs there,
+    /// when the uncommitted row is shown. The uncommitted changes are made on that
+    /// branch, so its badge moves from HEAD's row up to the uncommitted row.
+    fn moved_head_refs(&self, cx: &App) -> (Option<usize>, Vec<SharedString>) {
+        let Some(repository) = self.get_repository(cx) else {
+            return (None, Vec::new());
+        };
+        let repository = repository.read(cx);
+        let head_branch_name = repository
+            .branch
+            .as_ref()
+            .map(|branch| SharedString::from(branch.name().to_string()));
+        let head_commit_row = self
+            .graph_data
+            .uncommitted_parent
+            .filter(|_| self.graph_data.has_uncommitted_row)
+            .and_then(|head| {
+                let data = repository.get_graph_data(self.log_source.clone(), self.log_order)?;
+                let index = data.commit_oid_to_index.get(&head)?;
+                Some(index + self.graph_data.repository_offset())
+            });
+        let head_refs = head_commit_row
+            .and_then(|row| self.graph_data.commits.get(row))
+            .map(|commit| {
+                commit
+                    .data
+                    .ref_names
+                    .iter()
+                    .filter(|name| Self::is_head_ref(name.as_ref(), &head_branch_name))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        (head_commit_row, head_refs)
+    }
+
     /// A decoration as the graph shows it: the checked-out branch without git's
     /// `HEAD -> ` prefix.
     fn ref_display_name(decoration: &str) -> &str {
@@ -8438,6 +8474,21 @@ Checked out in worktree {}",
         let is_focused = self.focus_handle.is_focused(window);
         let graph_canvas_bounds = self.graph_canvas_bounds.clone();
         let paint_ref_connectors = self.is_refs_column_visible();
+        // The connector runs from a row's badge to its commit, so it follows the
+        // checked-out branch's badge up to the uncommitted row, and leaves HEAD's
+        // row when that badge was the only one there.
+        let (head_commit_row, head_refs) = self.moved_head_refs(cx);
+        let uncommitted_row_has_badge = !head_refs.is_empty();
+        let head_row_without_badge = head_commit_row.filter(|row| {
+            self.graph_data.commits.get(*row).is_some_and(|commit| {
+                commit
+                    .data
+                    .ref_names
+                    .iter()
+                    .all(|name| head_refs.contains(name))
+            })
+        });
+        let has_uncommitted_row = self.graph_data.has_uncommitted_row;
 
         gpui::canvas(
             move |_bounds, _window, _cx| {},
@@ -8658,9 +8709,15 @@ Checked out in worktree {}",
 
                         let commit_x = lane_center_x(bounds, row.lane as f32);
 
+                        let has_badge = if has_uncommitted_row && absolute_row_idx == 0 {
+                            uncommitted_row_has_badge
+                        } else if head_row_without_badge == Some(absolute_row_idx) {
+                            false
+                        } else {
+                            !row.data.ref_names.is_empty()
+                        };
                         if paint_ref_connectors
-                            && (!row.data.ref_names.is_empty()
-                                || worktree_commits.contains(&row.data.sha))
+                            && (has_badge || worktree_commits.contains(&row.data.sha))
                         {
                             paint_dashed_connector(
                                 bounds.origin.x,
@@ -8793,31 +8850,7 @@ Checked out in worktree {}",
             );
         }
 
-        // The uncommitted changes are made on the checked-out branch, so its badge
-        // moves from the commit HEAD is on up to the uncommitted row.
-        let head_commit_row = self
-            .graph_data
-            .uncommitted_parent
-            .filter(|_| self.graph_data.has_uncommitted_row)
-            .and_then(|head| {
-                let repository = self.get_repository(cx)?;
-                let repository = repository.read(cx);
-                let data = repository.get_graph_data(self.log_source.clone(), self.log_order)?;
-                let index = data.commit_oid_to_index.get(&head)?;
-                Some(index + self.graph_data.repository_offset())
-            });
-        let head_refs: Vec<SharedString> = head_commit_row
-            .and_then(|row| self.graph_data.commits.get(row))
-            .map(|commit| {
-                commit
-                    .data
-                    .ref_names
-                    .iter()
-                    .filter(|name| Self::is_head_ref(name.as_ref(), &head_branch_name))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
+        let (head_commit_row, head_refs) = self.moved_head_refs(cx);
 
         let mut worktrees_by_commit = self.worktrees_by_commit(cx);
         let mut stashes_by_commit = self.stashes_by_commit(cx);
