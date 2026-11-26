@@ -5281,7 +5281,7 @@ Checked out in worktree {}",
                     .truncate(),
                 ),
             )
-            .child(self.render_detail_panel_controls(cx));
+            .child(self.render_detail_panel_controls(false, cx));
 
         let actions = h_flex()
             .w_full()
@@ -5329,13 +5329,14 @@ Checked out in worktree {}",
             );
 
         self.detail_panel_container(cx)
-            .child(header)
-            .child(actions)
+            .child(header.flex_none())
+            .child(actions.flex_none())
             .child(Divider::horizontal())
             .child(
-                div()
+                v_flex()
                     .flex_1()
                     .min_h_0()
+                    .overflow_hidden()
                     .child(self.working_tree_changes.clone()),
             )
             .into_any_element()
@@ -5545,7 +5546,13 @@ Checked out in worktree {}",
                 .into_any_element(),
         )
     }
-    fn render_detail_panel_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The panel's position toggle and, with `closable`, its close button. Closing a
+    /// commit's details goes back to the uncommitted changes, which can't be closed.
+    fn render_detail_panel_controls(
+        &self,
+        closable: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         h_flex()
             .flex_shrink_0()
             .gap_0p5()
@@ -5569,13 +5576,15 @@ Checked out in worktree {}",
                     this.toggle_detail_panel_position(&ToggleDetailPanelPosition, window, cx);
                 })),
             )
-            .child(
-                IconButton::new("close-detail", IconName::Close)
-                    .icon_size(IconSize::Small)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.clear_selection(cx);
-                    })),
-            )
+            .when(closable, |this| {
+                this.child(
+                    IconButton::new("close-detail", IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.clear_selection(cx);
+                        })),
+                )
+            })
     }
 
     /// The selected commits in graph order, newest first.
@@ -5645,7 +5654,7 @@ Checked out in worktree {}",
                     .min_w_0()
                     .child(Label::new(format!("{commit_count} commits selected")).truncate()),
             )
-            .child(self.render_detail_panel_controls(cx));
+            .child(self.render_detail_panel_controls(true, cx));
 
         let actions = h_flex()
             .w_full()
@@ -7770,7 +7779,7 @@ Checked out in worktree {}",
         }
 
         let Some(selected_idx) = self.selected_entry_idx else {
-            return Empty.into_any_element();
+            return self.render_uncommitted_panel(window, cx);
         };
 
         let Some(commit_entry) = self.graph_data.commits.get(selected_idx) else {
@@ -7933,7 +7942,7 @@ Checked out in worktree {}",
                     )
                 }
             })
-            .child(self.render_detail_panel_controls(cx));
+            .child(self.render_detail_panel_controls(true, cx));
 
         let metadata =
             v_flex()
@@ -9715,10 +9724,10 @@ impl Render for GitGraph {
                     });
                     this.persist_split_ratio(cx);
                 }))
-                .when(self.selected_entry_idx.is_some() || self.uncommitted_selected, |this| {
-                    this.child(self.render_commit_view_resize_handle(window, cx))
-                        .child(self.render_commit_detail_panel(window, cx))
-                })
+                // The panel is always open: with no commit selected it shows the
+                // uncommitted changes and their commit form.
+                .child(self.render_commit_view_resize_handle(window, cx))
+                .child(self.render_commit_detail_panel(window, cx))
         };
 
         div()

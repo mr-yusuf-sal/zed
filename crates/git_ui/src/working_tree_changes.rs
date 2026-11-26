@@ -1051,11 +1051,13 @@ impl WorkingTreeChanges {
         cx: &App,
     ) -> AnyElement {
         v_flex()
+            .flex_1()
             .size_full()
             .min_w_0()
             .min_h_0()
             .child(
                 h_flex()
+                    .flex_none()
                     .px_2()
                     .py_1()
                     .justify_between()
@@ -1237,11 +1239,14 @@ impl Render for WorkingTreeChanges {
                 this.commit(window, cx);
             }))
             .size_full()
+            .min_h_0()
+            .overflow_hidden()
             .child(
                 div()
                     .flex()
                     .flex_1()
                     .min_h_0()
+                    .overflow_hidden()
                     .map(|this| {
                         if side_by_side {
                             this.flex_row()
@@ -1249,9 +1254,15 @@ impl Render for WorkingTreeChanges {
                             this.flex_col()
                         }
                     })
-                    .child(div().flex_1().min_h_0().min_w_0().child(unstaged_changes))
                     .child(
-                        div()
+                        v_flex()
+                            .flex_1()
+                            .min_h_0()
+                            .min_w_0()
+                            .child(unstaged_changes),
+                    )
+                    .child(
+                        v_flex()
                             .flex_1()
                             .min_h_0()
                             .min_w_0()
@@ -1266,6 +1277,6 @@ impl Render for WorkingTreeChanges {
                             .child(staged_changes),
                     ),
             )
-            .child(self.render_commit_form(cx))
+            .child(div().flex_none().child(self.render_commit_form(cx)))
     }
 }
