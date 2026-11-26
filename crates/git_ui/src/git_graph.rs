@@ -2887,6 +2887,12 @@ impl GitGraph {
         })
     }
 
+    /// A decoration as the graph shows it: the checked-out branch without git's
+    /// `HEAD -> ` prefix.
+    fn ref_display_name(decoration: &str) -> &str {
+        decoration.strip_prefix("HEAD -> ").unwrap_or(decoration)
+    }
+
     /// Extracts a ref name (branch, remote ref, or tag) from a decoration in
     /// git's `%D` format, returning `None` for a detached `HEAD`.
     fn ref_name_from_decoration(decoration: &str) -> Option<SharedString> {
@@ -2913,14 +2919,15 @@ impl GitGraph {
         background: gpui::Hsla,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let display_name = SharedString::from(Self::ref_display_name(&name).to_string());
         let tooltip_text: SharedString = match worktree {
             Some(worktree) => format!(
-                "{name}
+                "{display_name}
 Checked out in worktree {}",
                 worktree.path.display()
             )
             .into(),
-            None => name.clone(),
+            None => display_name.clone(),
         };
         let is_in_worktree = worktree.is_some();
         let chip_id = SharedString::from(format!("git-graph-ref-chip-{commit_idx}-{name}"));
@@ -2938,28 +2945,26 @@ Checked out in worktree {}",
                 )
             })
             .child(
-                Chip::new(SharedString::from(
-                    name.strip_prefix("HEAD -> ").unwrap_or(&name).to_string(),
-                ))
-                .label_size(LabelSize::Small)
-                .truncate()
-                .map(|chip| {
-                    if is_head {
-                        chip.icon(IconName::Check)
-                            .bg_color(background.blend(accent_color.opacity(0.25)))
-                            .border_color(accent_color.opacity(0.5))
-                    } else if is_in_worktree {
-                        chip.icon(IconName::GitWorktree)
-                            .icon_color(Color::Custom(accent_color))
-                            .bg_color(background.blend(accent_color.opacity(0.08)))
-                            .border_color(accent_color.opacity(0.25))
-                    } else {
-                        chip.icon(IconName::GitBranch)
-                            .icon_color(Color::Custom(accent_color))
-                            .bg_color(background.blend(accent_color.opacity(0.08)))
-                            .border_color(accent_color.opacity(0.25))
-                    }
-                }),
+                Chip::new(display_name)
+                    .label_size(LabelSize::Small)
+                    .truncate()
+                    .map(|chip| {
+                        if is_head {
+                            chip.icon(IconName::Check)
+                                .bg_color(background.blend(accent_color.opacity(0.25)))
+                                .border_color(accent_color.opacity(0.5))
+                        } else if is_in_worktree {
+                            chip.icon(IconName::GitWorktree)
+                                .icon_color(Color::Custom(accent_color))
+                                .bg_color(background.blend(accent_color.opacity(0.08)))
+                                .border_color(accent_color.opacity(0.25))
+                        } else {
+                            chip.icon(IconName::GitBranch)
+                                .icon_color(Color::Custom(accent_color))
+                                .bg_color(background.blend(accent_color.opacity(0.08)))
+                                .border_color(accent_color.opacity(0.25))
+                        }
+                    }),
             )
             .on_mouse_down(
                 MouseButton::Right,
@@ -3032,7 +3037,7 @@ Checked out in worktree {}",
     ) -> AnyElement {
         let hidden_refs_text = hidden_refs
             .iter()
-            .map(|ref_name| format!("- {ref_name}"))
+            .map(|ref_name| format!("- {}", Self::ref_display_name(ref_name)))
             .collect::<Vec<_>>()
             .join("\n");
         let chip_id = SharedString::from(format!("git-graph-ref-count-chip-{commit_idx}"));
@@ -4335,7 +4340,8 @@ Checked out in worktree {}",
             menu = menu.header("Refs");
             for (ref_entry, name) in ref_entries {
                 let git_graph = git_graph.clone();
-                menu = menu.submenu(name, move |submenu, window, _cx| {
+                let label = SharedString::from(Self::ref_display_name(&name).to_string());
+                menu = menu.submenu(label, move |submenu, window, _cx| {
                     ref_entry.clone().add_entries(submenu, &git_graph, window)
                 });
             }
@@ -8778,6 +8784,32 @@ Checked out in worktree {}",
             );
         }
 
+        // The uncommitted changes are made on the checked-out branch, so its badge
+        // moves from the commit HEAD is on up to the uncommitted row.
+        let head_commit_row = self
+            .graph_data
+            .uncommitted_parent
+            .filter(|_| self.graph_data.has_uncommitted_row)
+            .and_then(|head| {
+                let repository = self.get_repository(cx)?;
+                let repository = repository.read(cx);
+                let data = repository.get_graph_data(self.log_source.clone(), self.log_order)?;
+                let index = data.commit_oid_to_index.get(&head)?;
+                Some(index + self.graph_data.repository_offset())
+            });
+        let head_refs: Vec<SharedString> = head_commit_row
+            .and_then(|row| self.graph_data.commits.get(row))
+            .map(|commit| {
+                commit
+                    .data
+                    .ref_names
+                    .iter()
+                    .filter(|name| Self::is_head_ref(name.as_ref(), &head_branch_name))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let mut worktrees_by_commit = self.worktrees_by_commit(cx);
         let mut stashes_by_commit = self.stashes_by_commit(cx);
         for absolute_idx in viewport_range {
@@ -8788,14 +8820,34 @@ Checked out in worktree {}",
                 .remove(&commit.data.sha)
                 .unwrap_or_default();
             let stash = stashes_by_commit.remove(&commit.data.sha);
-            if commit.data.ref_names.is_empty() && worktrees.is_empty() && stash.is_none() {
+            let is_uncommitted = self.is_uncommitted_row(absolute_idx);
+            let ref_names = if is_uncommitted {
+                head_refs.clone()
+            } else if head_commit_row == Some(absolute_idx) {
+                commit
+                    .data
+                    .ref_names
+                    .iter()
+                    .filter(|name| !head_refs.contains(name))
+                    .cloned()
+                    .collect()
+            } else {
+                commit.data.ref_names.clone()
+            };
+            if ref_names.is_empty() && worktrees.is_empty() && stash.is_none() {
                 continue;
             }
+            // The uncommitted row has no commit of its own, so its badge acts on
+            // the commit HEAD is on.
+            let chip_commit_idx = if is_uncommitted {
+                head_commit_row.unwrap_or(absolute_idx)
+            } else {
+                absolute_idx
+            };
 
             let visible_row_idx = absolute_idx - first_visible_row;
             let top = visible_row_idx as f32 * row_height - vertical_scroll_offset;
             let accent_color = accent_colors.color_for_index(commit.color_idx as u32);
-            let ref_names = commit.data.ref_names.clone();
 
             // When a commit carries multiple refs we only render a single badge
             // plus a "+N" counter, so the gutter stays legible instead of
@@ -8824,7 +8876,7 @@ Checked out in worktree {}",
                     accent_color,
                     *is_head,
                     primary_worktree,
-                    absolute_idx,
+                    chip_commit_idx,
                     background,
                     cx,
                 )
@@ -8839,8 +8891,9 @@ Checked out in worktree {}",
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            let count_chip = (!hidden_refs.is_empty())
-                .then(|| self.render_ref_count_chip(hidden_refs, accent_color, absolute_idx, cx));
+            let count_chip = (!hidden_refs.is_empty()).then(|| {
+                self.render_ref_count_chip(hidden_refs, accent_color, chip_commit_idx, cx)
+            });
 
             let primary_worktree_path = primary_worktree.map(|worktree| worktree.path.clone());
             let other_worktrees = worktrees
