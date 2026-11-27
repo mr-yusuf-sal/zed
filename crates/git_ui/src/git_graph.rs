@@ -5362,6 +5362,7 @@ Checked out in worktree {}",
 
         let actions = h_flex()
             .w_full()
+            .items_center()
             .px_2()
             .pb_2()
             .gap_1()
@@ -5403,6 +5404,10 @@ Checked out in worktree {}",
                             );
                         }
                     }),
+            )
+            .child(
+                self.working_tree_changes
+                    .update(cx, |changes, cx| changes.render_filter_controls(cx)),
             );
 
         self.detail_panel_container(cx)

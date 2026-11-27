@@ -1853,8 +1853,9 @@ impl WorkingTreeChanges {
     }
 
     /// The search over both lists, the status filters with their counts, and the
-    /// tree or flat layout.
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// tree or flat layout. The git graph shows them beside its own buttons for the
+    /// uncommitted changes, rather than taking a row of their own above the lists.
+    pub(crate) fn render_filter_controls(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut seen = HashSet::default();
         let mut counts = [0usize; StatusFilter::ALL.len()];
         for repository in &self.changes {
@@ -1876,14 +1877,10 @@ impl WorkingTreeChanges {
             (IconName::ListTree, "Group Files by Folder")
         };
         h_flex()
-            .flex_none()
-            .w_full()
-            .px_2()
-            .py_1()
+            .flex_1()
+            .min_w_0()
             .gap_1()
             .flex_wrap()
-            .border_b_1()
-            .border_color(border_color)
             .child(
                 div()
                     .flex_1()
@@ -2173,7 +2170,6 @@ impl Render for WorkingTreeChanges {
             .size_full()
             .min_h_0()
             .overflow_hidden()
-            .child(self.render_toolbar(cx))
             .child(
                 div()
                     .track_focus(&self.list_focus_handle)
