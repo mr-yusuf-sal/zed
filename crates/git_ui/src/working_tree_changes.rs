@@ -64,8 +64,12 @@ pub struct WorkingTreeChanges {
     status_filter: Option<StatusFilter>,
     /// Folders opened or closed against their default, see `is_directory_collapsed`.
     toggled_directories: HashSet<(bool, RepositoryId, SharedString)>,
-    /// The row the arrow keys, Space, Enter and Delete act on.
+    /// The row the arrow keys, Space, Enter and Delete act on, and the last one clicked.
     selection: Option<RowSelection>,
+    /// Rows of the same list selected along with `selection`, by Alt-click or Shift-click.
+    multi_selection: Vec<RowSelection>,
+    /// Where a Shift-click range starts: the row last clicked without Shift.
+    selection_anchor: Option<RowSelection>,
     unstaged_scroll_handle: ScrollHandle,
     staged_scroll_handle: ScrollHandle,
     autoscroll: Option<ListAutoscroll>,
@@ -259,6 +263,8 @@ impl WorkingTreeChanges {
             status_filter: None,
             toggled_directories: HashSet::default(),
             selection: None,
+            multi_selection: Vec::new(),
+            selection_anchor: None,
             unstaged_scroll_handle: ScrollHandle::new(),
             staged_scroll_handle: ScrollHandle::new(),
             autoscroll: None,
@@ -640,15 +646,224 @@ impl WorkingTreeChanges {
         })
     }
 
-    fn select_row(
+    fn is_selected(&self, selection: &RowSelection) -> bool {
+        self.selection.as_ref() == Some(selection) || self.multi_selection.contains(selection)
+    }
+
+    /// The selected rows, the one last clicked or moved to last.
+    fn selected_set(&self) -> Vec<RowSelection> {
+        self.multi_selection
+            .iter()
+            .cloned()
+            .chain(self.selection.clone())
+            .collect()
+    }
+
+    fn select_only(&mut self, selection: Option<RowSelection>) {
+        self.multi_selection.clear();
+        self.selection_anchor = selection.clone();
+        self.selection = selection;
+    }
+
+    /// A click selects the row, a double click opens it, Alt-click adds the row to the
+    /// selection or takes it out, Shift-click selects the rows from the last one clicked,
+    /// and Ctrl-click (cmd-click on macOS) stages or unstages the row at once.
+    fn handle_row_click(
         &mut self,
-        selection: Option<RowSelection>,
+        staged: bool,
+        row: &ChangeRow,
+        event: &ClickEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.selection = selection;
+        let Some(clicked) = self.row_selection(staged, row) else {
+            return;
+        };
         window.focus(&self.list_focus_handle, cx);
+        let modifiers = event.modifiers();
+        let same_list = self
+            .selection
+            .as_ref()
+            .is_some_and(|selection| selection.staged == staged);
+        if modifiers.secondary(cx) {
+            self.select_only(Some(clicked));
+            self.set_row_staged(staged, row, cx);
+        } else if modifiers.alt && same_list {
+            let mut selected = self.selected_set();
+            match selected.iter().position(|selection| *selection == clicked) {
+                Some(position) => {
+                    selected.remove(position);
+                }
+                None => selected.push(clicked),
+            }
+            self.selection = selected.pop();
+            self.multi_selection = selected;
+            self.selection_anchor = self.selection.clone();
+        } else if modifiers.shift
+            && same_list
+            && let Some(anchor) = self
+                .selection_anchor
+                .clone()
+                .filter(|anchor| anchor.staged == staged)
+            && let Some(range) = self.selection_range(staged, &anchor, &clicked, cx)
+        {
+            self.multi_selection = range
+                .into_iter()
+                .filter(|selection| *selection != clicked)
+                .collect();
+            self.selection = Some(clicked);
+        } else {
+            self.select_only(Some(clicked));
+            if event.click_count() >= 2 {
+                self.open_row(staged, row, window, cx);
+            }
+        }
         cx.notify();
+    }
+
+    /// The rows from `from` to `to`, both included, in the order shown.
+    fn selection_range(
+        &self,
+        staged: bool,
+        from: &RowSelection,
+        to: &RowSelection,
+        cx: &App,
+    ) -> Option<Vec<RowSelection>> {
+        let rows = self
+            .build_rows(staged, cx)
+            .iter()
+            .filter_map(|row| self.row_selection(staged, row))
+            .collect::<Vec<_>>();
+        let from = rows.iter().position(|selection| selection == from)?;
+        let to = rows.iter().position(|selection| selection == to)?;
+        Some(rows[from.min(to)..=from.max(to)].to_vec())
+    }
+
+    /// The files of the selected rows, by repository, with a folder standing for every
+    /// shown file under it.
+    fn selected_files(
+        &self,
+        cx: &App,
+    ) -> Option<(bool, Vec<(WeakEntity<Repository>, Vec<ChangedFile>)>)> {
+        let staged = self.selection.as_ref()?.staged;
+        let selected = self.selected_set();
+        let mut groups: Vec<(RepositoryId, WeakEntity<Repository>, Vec<ChangedFile>)> = Vec::new();
+        for row in self.build_rows(staged, cx) {
+            let Some(selection) = self.row_selection(staged, &row) else {
+                continue;
+            };
+            if !selected.contains(&selection) {
+                continue;
+            }
+            let Some(repository) = self.changes.get(row.repository_index()) else {
+                continue;
+            };
+            let index = match groups.iter().position(|(id, ..)| *id == repository.id) {
+                Some(index) => index,
+                None => {
+                    groups.push((repository.id, repository.repository.clone(), Vec::new()));
+                    groups.len() - 1
+                }
+            };
+            for file in self.row_files(staged, &row) {
+                if !groups[index]
+                    .2
+                    .iter()
+                    .any(|known| known.repo_path == file.repo_path)
+                {
+                    groups[index].2.push(file);
+                }
+            }
+        }
+        Some((
+            staged,
+            groups
+                .into_iter()
+                .map(|(_, repository, files)| (repository, files))
+                .collect(),
+        ))
+    }
+
+    fn stage_selected_files(&mut self, cx: &mut Context<Self>) {
+        let Some((staged, groups)) = self.selected_files(cx) else {
+            return;
+        };
+        for (repository, files) in groups {
+            let repo_paths = files.into_iter().map(|file| file.repo_path).collect();
+            self.set_staged(&repository, repo_paths, !staged, cx);
+        }
+        self.select_only(None);
+        cx.notify();
+    }
+
+    fn discard_selected_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((false, groups)) = self.selected_files(cx) else {
+            return;
+        };
+        for (repository, files) in groups {
+            self.discard(&repository, files, window, cx);
+        }
+    }
+
+    fn stash_selected_files(&mut self, cx: &mut Context<Self>) {
+        let Some((_, groups)) = self.selected_files(cx) else {
+            return;
+        };
+        for (repository, files) in groups {
+            let repo_paths = files.into_iter().map(|file| file.repo_path).collect();
+            self.stash_files(&repository, repo_paths, cx);
+        }
+        self.select_only(None);
+        cx.notify();
+    }
+
+    /// The menu for the selected rows: right-clicking a row of a selection of several, or
+    /// a folder.
+    fn selection_context_menu(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ContextMenu> {
+        let this = cx.entity();
+        let (staged, count) = self
+            .selected_files(cx)
+            .map(|(staged, groups)| {
+                (
+                    staged,
+                    groups.iter().map(|(_, files)| files.len()).sum::<usize>(),
+                )
+            })
+            .unwrap_or_default();
+        let files_label = if count == 1 {
+            "1 File".to_string()
+        } else {
+            format!("{count} Files")
+        };
+        ContextMenu::build(window, cx, move |menu, window, _| {
+            menu.entry(
+                if staged {
+                    format!("Unstage {files_label}")
+                } else {
+                    format!("Stage {files_label}")
+                },
+                None,
+                window.handler_for(&this, |this, _, cx| this.stage_selected_files(cx)),
+            )
+            .when(!staged, |menu| {
+                menu.entry(
+                    format!("Discard {files_label}…"),
+                    None,
+                    window.handler_for(&this, |this, window, cx| {
+                        this.discard_selected_files(window, cx)
+                    }),
+                )
+            })
+            .entry(
+                format!("Stash {files_label}"),
+                None,
+                window.handler_for(&this, |this, _, cx| this.stash_selected_files(cx)),
+            )
+        })
     }
 
     /// The files of a row: the file itself, or every shown file under a directory.
@@ -726,7 +941,8 @@ impl WorkingTreeChanges {
             }
             None => first,
         };
-        self.selection = self.row_selection(staged, &rows[next]);
+        let selection = self.row_selection(staged, &rows[next]);
+        self.select_only(selection);
         self.scroll_handle(staged).scroll_to_item(next);
         cx.notify();
     }
@@ -742,6 +958,10 @@ impl WorkingTreeChanges {
     /// Stages or unstages the selected row and selects the row after it, which takes its
     /// place once the files move to the other list.
     fn toggle_selected_staged(&mut self, cx: &mut Context<Self>) {
+        if !self.multi_selection.is_empty() {
+            self.stage_selected_files(cx);
+            return;
+        }
         let Some((staged, rows, index)) = self.selected_row(cx) else {
             return;
         };
@@ -752,7 +972,7 @@ impl WorkingTreeChanges {
             .find(|row| !matches!(row, ChangeRow::Repository { .. }))
             .and_then(|row| self.row_selection(staged, row));
         self.set_row_staged(staged, &rows[index], cx);
-        self.selection = next;
+        self.select_only(next);
         cx.notify();
     }
 
@@ -760,11 +980,22 @@ impl WorkingTreeChanges {
         let Some((staged, rows, index)) = self.selected_row(cx) else {
             return;
         };
-        let Some(repository) = self.changes.get(rows[index].repository_index()) else {
+        self.open_row(staged, &rows[index], window, cx);
+    }
+
+    /// Opens a file's changes, or opens or closes a folder.
+    fn open_row(
+        &mut self,
+        staged: bool,
+        row: &ChangeRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.changes.get(row.repository_index()) else {
             return;
         };
         let repository_id = repository.id;
-        match &rows[index] {
+        match row {
             ChangeRow::Directory { path, .. } => {
                 self.toggle_directory(staged, repository_id, path.clone(), cx);
             }
@@ -797,6 +1028,10 @@ impl WorkingTreeChanges {
     }
 
     fn discard_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.multi_selection.is_empty() {
+            self.discard_selected_files(window, cx);
+            return;
+        }
         let Some((staged, rows, index)) = self.selected_row(cx) else {
             return;
         };
@@ -1015,7 +1250,9 @@ impl WorkingTreeChanges {
                         file_index, depth, ..
                     } => {
                         let file = repository.files(staged).get(*file_index)?;
-                        self.render_changed_file(row_index, staged, repository, file, *depth, cx)
+                        self.render_changed_file(
+                            row_index, staged, repository, file, *depth, row, cx,
+                        )
                     }
                 })
             })
@@ -1041,8 +1278,9 @@ impl WorkingTreeChanges {
         else {
             return Empty.into_any_element();
         };
-        let selection = self.row_selection(staged, row);
-        let is_selected = selection.is_some() && selection == self.selection;
+        let is_selected = self
+            .row_selection(staged, row)
+            .is_some_and(|selection| self.is_selected(&selection));
         let repository_id = repository.id;
         let repository_handle = repository.repository.clone();
         let (id, stage_icon, stage_tooltip) = if staged {
@@ -1051,22 +1289,32 @@ impl WorkingTreeChanges {
             ("unstaged-directory", IconName::Plus, "Stage Folder")
         };
         let click_row = row.clone();
+        let menu_row = row.clone();
         let stage_row = row.clone();
         let discard_files = self.row_files(staged, row);
         let path = path.clone();
-        ListItem::new((id, row_index))
+        let menu_this = cx.weak_entity();
+        let list_item = ListItem::new((id, row_index))
             .spacing(ListItemSpacing::Dense)
             .indent_level(*depth)
             .indent_step_size(TREE_INDENT)
             .toggle_state(is_selected)
             .start_slot(
-                Icon::new(if *collapsed {
-                    IconName::ChevronRight
-                } else {
-                    IconName::ChevronDown
-                })
-                .size(IconSize::Small)
-                .color(Color::Muted),
+                div()
+                    .id(("directory-chevron", row_index))
+                    .child(
+                        Icon::new(if *collapsed {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_directory(staged, repository_id, path.clone(), cx);
+                    })),
             )
             .child(
                 h_flex()
@@ -1119,15 +1367,33 @@ impl WorkingTreeChanges {
                     ),
             )
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                let selection = this.row_selection(staged, &click_row);
-                this.select_row(selection, window, cx);
-                if event.modifiers().secondary(cx) {
-                    this.set_row_staged(staged, &click_row, cx);
-                } else {
-                    this.toggle_directory(staged, repository_id, path.clone(), cx);
+                this.handle_row_click(staged, &click_row, event, window, cx);
+            }));
+
+        right_click_menu((
+            if staged {
+                "staged-directory-menu"
+            } else {
+                "unstaged-directory-menu"
+            },
+            row_index,
+        ))
+        .trigger(move |_, _, _| list_item)
+        .maybe_menu(move |window, cx| {
+            let this = menu_this.upgrade()?;
+            Some(this.update(cx, |this, cx| {
+                let selection = this.row_selection(staged, &menu_row);
+                if !selection
+                    .as_ref()
+                    .is_some_and(|selection| this.is_selected(selection))
+                {
+                    this.select_only(selection);
+                    cx.notify();
                 }
+                this.selection_context_menu(window, cx)
             }))
-            .into_any_element()
+        })
+        .into_any_element()
     }
 
     fn render_changed_file(
@@ -1137,11 +1403,11 @@ impl WorkingTreeChanges {
         repository: &RepositoryChanges,
         file: &ChangedFile,
         depth: usize,
+        row: &ChangeRow,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let click_row = row.clone();
         let repository_handle = repository.repository.clone();
-        let history_repository = repository.repository.clone();
-        let history_repo_path = file.repo_path.clone();
         let repo_path = file.repo_path.clone();
         let menu_this = cx.weak_entity();
         let menu_repository = repository.repository.clone();
@@ -1151,7 +1417,8 @@ impl WorkingTreeChanges {
             repository_id: repository.id,
             target: RowTarget::File(file.repo_path.clone()),
         };
-        let is_selected = self.selection.as_ref() == Some(&selection);
+        let is_selected = self.is_selected(&selection);
+        let menu_selection = selection.clone();
         let (id, stat_id, icon, tooltip) = if staged {
             (
                 "staged-change",
@@ -1233,20 +1500,10 @@ impl WorkingTreeChanges {
                             }))
                     }),
             )
-            // Ctrl-click (cmd-click on macOS) stages an uncommitted file and unstages a staged
-            // one, so a long list can be sorted out without aiming at the small buttons.
+            // A click selects, a double click opens the file's changes; see
+            // `handle_row_click` for the modifiers.
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                this.select_row(Some(selection.clone()), window, cx);
-                if event.modifiers().secondary(cx) {
-                    this.set_staged(&repository_handle, vec![repo_path.clone()], !staged, cx);
-                } else {
-                    this.open_file_changes(
-                        &history_repository,
-                        history_repo_path.clone(),
-                        window,
-                        cx,
-                    );
-                }
+                this.handle_row_click(staged, &click_row, event, window, cx);
             }));
 
         right_click_menu((
@@ -1261,6 +1518,13 @@ impl WorkingTreeChanges {
         .maybe_menu(move |window, cx| {
             let this = menu_this.upgrade()?;
             Some(this.update(cx, |this, cx| {
+                // A right-click on one of several selected rows acts on all of them; on any
+                // other row it selects just that row.
+                if this.is_selected(&menu_selection) && !this.multi_selection.is_empty() {
+                    return this.selection_context_menu(window, cx);
+                }
+                this.select_only(Some(menu_selection.clone()));
+                cx.notify();
                 this.file_context_menu(
                     menu_repository.clone(),
                     menu_file.clone(),
