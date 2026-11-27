@@ -9851,7 +9851,10 @@ impl Render for GitGraph {
                     .size_full()
                     .child(self.render_search_bar(cx))
                     .children(self.render_operation_in_progress_banner(cx))
-                    .child(div().flex_1().child(content)),
+                    // Without a minimum of zero a flex item is at least as tall as its content, so
+                    // a long list of uncommitted changes grew the graph past the window and left
+                    // the detail panel below its bottom edge.
+                    .child(div().flex_1().min_h_0().overflow_hidden().child(content)),
             )
             .children(self.context_menu.as_ref().map(|context_menu| {
                 deferred(
