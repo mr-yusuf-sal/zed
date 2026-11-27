@@ -2094,6 +2094,9 @@ pub struct GitGraph {
     _selected_commit_message_task: Option<Task<()>>,
     commit_details_split_state: Entity<SplitState>,
     repo_id: RepositoryId,
+    /// Where the repository's working tree is. A repository the project scans again comes
+    /// back under a new id, and this is how the graph finds it.
+    repo_work_directory: Option<Arc<Path>>,
     changed_files_scroll_handle: UniformListScrollHandle,
     selected_commits_scroll_handle: UniformListScrollHandle,
     /// Whether the "Uncommitted Changes" row is selected instead of a commit.
@@ -2285,9 +2288,17 @@ impl GitGraph {
                     }
                 }
             }
+            GitStoreEvent::RepositoryAdded | GitStoreEvent::RepositoryRemoved(_) => {
+                this.follow_rescanned_repository(cx);
+            }
             _ => {}
         })
         .detach();
+        let repo_work_directory = git_store
+            .read(cx)
+            .repositories()
+            .get(&repo_id)
+            .map(|repository| repository.read(cx).work_directory_abs_path.clone());
 
         let search_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
@@ -2399,6 +2410,7 @@ impl GitGraph {
             log_order,
             commit_details_split_state: cx.new(|_cx| SplitState::new()),
             repo_id,
+            repo_work_directory,
             changed_files_scroll_handle: UniformListScrollHandle::new(),
             selected_commits_scroll_handle: UniformListScrollHandle::new(),
             uncommitted_selected: false,
@@ -4043,18 +4055,47 @@ Checked out in worktree {}",
     }
 
     pub fn set_repo_id(&mut self, repo_id: RepositoryId, cx: &mut Context<Self>) {
+        let repository = self
+            .git_store
+            .read(cx)
+            .repositories()
+            .get(&repo_id)
+            .cloned();
         if repo_id != self.repo_id
-            && self
-                .git_store
-                .read(cx)
-                .repositories()
-                .contains_key(&repo_id)
+            && let Some(repository) = repository
         {
             self.repo_id = repo_id;
+            self.repo_work_directory = Some(repository.read(cx).work_directory_abs_path.clone());
             self.working_tree_changes.update(cx, |changes, cx| {
                 changes.set_repository(Some(repo_id), cx);
             });
             self.invalidate_state(cx);
+        }
+    }
+
+    /// When the project scans a repository again, for example after one of its worktrees
+    /// changed, the git store drops it and adds it back under a new id. The graph kept the old
+    /// id and found no repository under it, so it showed no uncommitted changes and an empty
+    /// detail panel while still drawing the commits it had loaded. It now moves to the
+    /// repository at the same working directory.
+    fn follow_rescanned_repository(&mut self, cx: &mut Context<Self>) {
+        if self.get_repository(cx).is_some() {
+            return;
+        }
+        let Some(work_directory) = self.repo_work_directory.clone() else {
+            return;
+        };
+        let rescanned = self
+            .git_store
+            .read(cx)
+            .repositories()
+            .iter()
+            .find(|(_, repository)| {
+                repository.read(cx).work_directory_abs_path.as_ref() == work_directory.as_ref()
+            })
+            .map(|(repo_id, _)| *repo_id);
+        if let Some(repo_id) = rescanned {
+            self.set_repo_id(repo_id, cx);
         }
     }
 
