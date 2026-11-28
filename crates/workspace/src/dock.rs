@@ -26,42 +26,79 @@ use util::ResultExt as _;
 
 pub(crate) const RESIZE_HANDLE_SIZE: Pixels = px(6.);
 const AGENT_PANEL_ON_LEFT_KEY: &str = "agent_panel_on_left";
+const AGENT_PANEL_VERTICAL_KEY: &str = "agent_panel_vertical";
 
-/// Which side of the editor the agent panel is drawn on. The panel is always in the left dock;
-/// this fork draws that dock right of the center unless the user swapped it to the left with the
-/// status bar's button. The choice is kept across restarts.
+/// Where the agent panel is drawn relative to the editor. The panel is always in the left dock;
+/// this fork draws that dock beside the center (horizontal layout) or stacked with it (vertical
+/// layout), after the center unless the user swapped it with the status bar's button. After means
+/// right of the editor in the horizontal layout and below it in the vertical one. Both choices
+/// are kept across restarts.
 #[derive(Clone, Copy)]
 pub struct AgentPanelPlacement {
-    on_right: bool,
+    after_editor: bool,
+    vertical: bool,
 }
 
 impl gpui::Global for AgentPanelPlacement {}
 
 impl AgentPanelPlacement {
-    pub fn agent_on_right(cx: &App) -> bool {
+    /// Whether the agent panel comes after the editor: right of it, or below it when vertical.
+    pub fn agent_after_editor(cx: &App) -> bool {
         cx.try_global::<Self>()
-            .is_none_or(|placement| placement.on_right)
+            .is_none_or(|placement| placement.after_editor)
+    }
+
+    /// Whether the agent panel and the editor are stacked top and bottom instead of side by side.
+    pub fn vertical(cx: &App) -> bool {
+        cx.try_global::<Self>()
+            .is_some_and(|placement| placement.vertical)
     }
 
     pub(crate) fn load(cx: &mut App) {
         if cx.has_global::<Self>() {
             return;
         }
-        let on_left = KeyValueStore::global(cx)
-            .read_kvp(AGENT_PANEL_ON_LEFT_KEY)
-            .log_err()
-            .flatten()
-            .is_some_and(|value| value == "true");
-        cx.set_global(Self { on_right: !on_left });
+        let kvp = KeyValueStore::global(cx);
+        let read_flag = |key: &str| {
+            kvp.read_kvp(key)
+                .log_err()
+                .flatten()
+                .is_some_and(|value| value == "true")
+        };
+        let on_left = read_flag(AGENT_PANEL_ON_LEFT_KEY);
+        let vertical = read_flag(AGENT_PANEL_VERTICAL_KEY);
+        cx.set_global(Self {
+            after_editor: !on_left,
+            vertical,
+        });
     }
 
+    /// Moves the agent panel to the other side of the editor, in the current layout.
     pub fn swap(cx: &mut App) {
-        let on_right = !Self::agent_on_right(cx);
-        cx.set_global(Self { on_right });
+        let after_editor = !Self::agent_after_editor(cx);
+        let vertical = Self::vertical(cx);
+        cx.set_global(Self {
+            after_editor,
+            vertical,
+        });
+        Self::store(cx, AGENT_PANEL_ON_LEFT_KEY, !after_editor);
+    }
+
+    /// Switches between the agent panel beside the editor and the two stacked top and bottom.
+    pub fn toggle_layout(cx: &mut App) {
+        let after_editor = Self::agent_after_editor(cx);
+        let vertical = !Self::vertical(cx);
+        cx.set_global(Self {
+            after_editor,
+            vertical,
+        });
+        Self::store(cx, AGENT_PANEL_VERTICAL_KEY, vertical);
+    }
+
+    fn store(cx: &mut App, key: &'static str, value: bool) {
         let kvp = KeyValueStore::global(cx);
         db::write_and_log(cx, move || async move {
-            kvp.write_kvp(AGENT_PANEL_ON_LEFT_KEY.to_string(), (!on_right).to_string())
-                .await
+            kvp.write_kvp(key.to_string(), value.to_string()).await
         });
         cx.refresh_windows();
     }
@@ -1417,7 +1454,8 @@ impl Render for Dock {
         let dispatch_context = Self::dispatch_context(cx);
         if let Some(entry) = self.visible_entry() {
             let position = self.position;
-            let agent_on_right = AgentPanelPlacement::agent_on_right(cx);
+            let agent_after_editor = AgentPanelPlacement::agent_after_editor(cx);
+            let agent_vertical = AgentPanelPlacement::vertical(cx);
             let create_resize_handle = || {
                 let handle = div()
                     .id("resize-handle")
@@ -1446,14 +1484,30 @@ impl Render for Dock {
                         }),
                     )
                     .occlude();
-                // The left dock holds the agent panel, which is drawn right of the center unless
-                // swapped (see `AgentPanelPlacement`), so its handle faces the center.
+                // The left dock holds the agent panel, which is drawn after the center unless
+                // swapped, and above or below it in the vertical layout (see
+                // `AgentPanelPlacement`), so its handle faces the center.
                 match self.position() {
+                    DockPosition::Left if agent_vertical => deferred(
+                        handle
+                            .absolute()
+                            .map(|handle| {
+                                if agent_after_editor {
+                                    handle.top(-RESIZE_HANDLE_SIZE / 2.)
+                                } else {
+                                    handle.bottom(-RESIZE_HANDLE_SIZE / 2.)
+                                }
+                            })
+                            .left(px(0.))
+                            .w_full()
+                            .h(RESIZE_HANDLE_SIZE)
+                            .cursor_row_resize(),
+                    ),
                     DockPosition::Left => deferred(
                         handle
                             .absolute()
                             .map(|handle| {
-                                if agent_on_right {
+                                if agent_after_editor {
                                     handle.left(-RESIZE_HANDLE_SIZE / 2.)
                                 } else {
                                     handle.right(-RESIZE_HANDLE_SIZE / 2.)
@@ -1501,7 +1555,9 @@ impl Render for Dock {
                     Axis::Vertical => this.h_full().w_full().flex_col(),
                 })
                 .map(|this| match self.position() {
-                    DockPosition::Left if agent_on_right => this.border_l_1(),
+                    DockPosition::Left if agent_vertical && agent_after_editor => this.border_t_1(),
+                    DockPosition::Left if agent_vertical => this.border_b_1(),
+                    DockPosition::Left if agent_after_editor => this.border_l_1(),
                     DockPosition::Left => this.border_r_1(),
                     DockPosition::Right => this.border_l_1(),
                     DockPosition::Bottom => this.border_t_1(),

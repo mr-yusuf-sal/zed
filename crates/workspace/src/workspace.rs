@@ -477,6 +477,8 @@ actions!(
         ToggleLeftDock,
         /// Moves the agent panel to the other side of the editor.
         SwapAgentPanelSide,
+        /// Switches between the agent panel beside the editor and the two stacked top and bottom.
+        ToggleAgentPanelLayout,
         /// Toggles the right dock.
         ToggleRightDock,
         /// Toggles zoom on the active pane.
@@ -2892,6 +2894,15 @@ impl Workspace {
 
         let use_flex = panel.has_flexible_size(window, cx);
 
+        if Self::agent_dock_stacked(position, cx)
+            && use_flex
+            && let Some(flex) = size_state.flex.or_else(|| self.default_dock_flex(position))
+        {
+            let flex = flex.max(0.001);
+            let available = self.agent_column_height(window, cx);
+            return Some((flex / (flex + 1.0) * available).max(RESIZE_HANDLE_SIZE));
+        }
+
         if position.axis() == Axis::Horizontal
             && use_flex
             && let Some(flex) = size_state.flex.or_else(|| self.default_dock_flex(position))
@@ -2936,6 +2947,12 @@ impl Workspace {
     ) -> Option<f32> {
         if position.axis() != Axis::Horizontal {
             return None;
+        }
+
+        if Self::agent_dock_stacked(position, cx) {
+            let available = self.agent_column_height(window, cx);
+            let remaining = (available - size).max(px(1.));
+            return Some((size / remaining).max(0.0));
         }
 
         let workspace_width = self.bounds.size.width;
@@ -3011,6 +3028,29 @@ impl Workspace {
             self.root_width = Some(width);
             cx.notify();
         }
+    }
+
+    /// Whether `position` is the agent panel's dock while it's stacked with the center instead of
+    /// beside it (see [`AgentPanelPlacement::vertical`]).
+    fn agent_dock_stacked(position: DockPosition, cx: &App) -> bool {
+        position == DockPosition::Left && AgentPanelPlacement::vertical(cx)
+    }
+
+    /// The height the stacked agent panel and the center share: the workspace, less a bottom dock
+    /// drawn below both of them.
+    fn agent_column_height(&self, window: &Window, cx: &App) -> Pixels {
+        let mut height = self.bounds.size.height;
+        if matches!(
+            WorkspaceSettings::get_global(cx).bottom_dock_layout,
+            BottomDockLayout::Full | BottomDockLayout::LeftAligned
+        ) {
+            height -= self
+                .bottom_dock
+                .read(cx)
+                .stored_active_panel_size(window, cx)
+                .unwrap_or(Pixels::ZERO);
+        }
+        height.max(RESIZE_HANDLE_SIZE)
     }
 
     fn center_full_height_column_count(&self) -> f32 {
@@ -8793,6 +8833,9 @@ impl Workspace {
             .on_action(cx.listener(|_, _: &SwapAgentPanelSide, _, cx| {
                 AgentPanelPlacement::swap(cx);
             }))
+            .on_action(cx.listener(|_, _: &ToggleAgentPanelLayout, _, cx| {
+                AgentPanelPlacement::toggle_layout(cx);
+            }))
             .on_action(cx.listener(|this, _: &ToggleLeftDock, window, cx| {
                 this.toggle_dock(DockPosition::Left, window, cx);
             }))
@@ -9292,7 +9335,28 @@ impl Workspace {
         if let Some(panel) = dock.visible_panel() {
             let size_state = dock.stored_panel_size_state(panel.as_ref());
             let min_size = panel.min_size(window, cx);
-            if position.axis() == Axis::Horizontal {
+            if Self::agent_dock_stacked(position, cx) {
+                // Stacked with the center, the agent panel takes its share of the height.
+                container = container.w_full();
+                if panel.has_flexible_size(window, cx) {
+                    let grow = size_state
+                        .and_then(|state| state.flex)
+                        .or_else(|| self.default_dock_flex(position))
+                        .unwrap_or(1.0)
+                        .max(0.001);
+                    let style = container.style();
+                    style.flex_grow = Some(grow);
+                    style.flex_shrink = Some(1.0);
+                    style.flex_basis = Some(relative(0.).into());
+                } else {
+                    let size = size_state
+                        .and_then(|state| state.size)
+                        .unwrap_or_else(|| panel.default_size(window, cx));
+                    container = container.h(size);
+                    let style = container.style();
+                    style.flex_shrink = Some(1.0);
+                }
+            } else if position.axis() == Axis::Horizontal {
                 let use_flexible = panel.has_flexible_size(window, cx);
                 let flex_grow = if use_flexible {
                     size_state
@@ -9586,6 +9650,15 @@ impl Workspace {
     }
 
     fn resize_left_dock(&mut self, new_size: Pixels, window: &mut Window, cx: &mut App) {
+        if Self::agent_dock_stacked(DockPosition::Left, cx) {
+            let size = new_size.min(self.agent_column_height(window, cx) - RESIZE_HANDLE_SIZE);
+            let flex_grow = self.dock_flex_for_size(DockPosition::Left, size, window, cx);
+            self.left_dock.update(cx, |left_dock, cx| {
+                left_dock.resize_panel_sizes(Some(size), flex_grow, window, cx);
+            });
+            return;
+        }
+
         let workspace_width = self.bounds.size.width;
         let mut size = new_size.min(workspace_width - RESIZE_HANDLE_SIZE);
 
@@ -10178,7 +10251,8 @@ impl Render for Workspace {
             log::info!("Rendered first frame");
         }
 
-        let agent_on_right = AgentPanelPlacement::agent_on_right(cx);
+        let agent_after_editor = AgentPanelPlacement::agent_after_editor(cx);
+        let agent_vertical = AgentPanelPlacement::vertical(cx);
         let pad_center_pane = self.centered_layout
             && self.center.panes().len() == 1
             && self.active_item(cx).is_some();
@@ -10280,9 +10354,15 @@ impl Render for Workspace {
                                             this.bounds = bounds;
 
                                             if bounds_changed {
+                                                let left_dock_extent =
+                                                    if AgentPanelPlacement::vertical(cx) {
+                                                        bounds.size.height
+                                                    } else {
+                                                        bounds.size.width
+                                                    };
                                                 this.left_dock.update(cx, |dock, cx| {
                                                     dock.clamp_panel_size(
-                                                        bounds.size.width,
+                                                        left_dock_extent,
                                                         window,
                                                         cx,
                                                     )
@@ -10322,14 +10402,25 @@ impl Render for Workspace {
 
                                             match e.drag(cx).0 {
                                                 DockPosition::Left => {
-                                                    let size =
-                                                        if AgentPanelPlacement::agent_on_right(cx) {
-                                                            workspace.bounds.right()
-                                                                - e.event.position.x
+                                                    let bounds = workspace.bounds;
+                                                    let mouse = e.event.position;
+                                                    let after =
+                                                        AgentPanelPlacement::agent_after_editor(cx);
+                                                    let size = if AgentPanelPlacement::vertical(cx)
+                                                    {
+                                                        if after {
+                                                            bounds.top()
+                                                                + workspace
+                                                                    .agent_column_height(window, cx)
+                                                                - mouse.y
                                                         } else {
-                                                            e.event.position.x
-                                                                - workspace.bounds.left()
-                                                        };
+                                                            mouse.y - bounds.top()
+                                                        }
+                                                    } else if after {
+                                                        bounds.right() - mouse.x
+                                                    } else {
+                                                        mouse.x - bounds.left()
+                                                    };
                                                     workspace.resize_left_dock(size, window, cx);
                                                 }
                                                 DockPosition::Right => {
@@ -10363,10 +10454,16 @@ impl Render for Workspace {
                                         .child(
                                             div()
                                                 .flex()
-                                                .flex_row()
+                                                .map(|this| {
+                                                    if agent_vertical {
+                                                        this.flex_col()
+                                                    } else {
+                                                        this.flex_row()
+                                                    }
+                                                })
                                                 .flex_1()
                                                 .overflow_hidden()
-                                                .when(!agent_on_right, |this| {
+                                                .when(!agent_after_editor, |this| {
                                                     this.children(self.render_dock(
                                                         DockPosition::Left,
                                                         &self.left_dock,
@@ -10409,7 +10506,7 @@ impl Render for Workspace {
                                                                 ),
                                                         ),
                                                 )
-                                                .when(agent_on_right, |this| {
+                                                .when(agent_after_editor, |this| {
                                                     this.children(self.render_dock(
                                                         DockPosition::Left,
                                                         &self.left_dock,
@@ -10435,9 +10532,15 @@ impl Render for Workspace {
                                                 .child(
                                                     div()
                                                         .flex()
-                                                        .flex_row()
+                                                        .map(|this| {
+                                                            if agent_vertical {
+                                                                this.flex_col()
+                                                            } else {
+                                                                this.flex_row()
+                                                            }
+                                                        })
                                                         .flex_1()
-                                                        .when(!agent_on_right, |this| {
+                                                        .when(!agent_after_editor, |this| {
                                                             this.children(self.render_dock(
                                                                 DockPosition::Left,
                                                                 &self.left_dock,
@@ -10484,7 +10587,7 @@ impl Render for Workspace {
                                                                         ),
                                                                 ),
                                                         )
-                                                        .when(agent_on_right, |this| {
+                                                        .when(agent_after_editor, |this| {
                                                             this.children(self.render_dock(
                                                                 DockPosition::Left,
                                                                 &self.left_dock,
@@ -10503,9 +10606,15 @@ impl Render for Workspace {
                                     }
                                     BottomDockLayout::RightAligned => div()
                                         .flex()
-                                        .flex_row()
+                                        .map(|this| {
+                                            if agent_vertical {
+                                                this.flex_col()
+                                            } else {
+                                                this.flex_row()
+                                            }
+                                        })
                                         .h_full()
-                                        .when(!agent_on_right, |this| {
+                                        .when(!agent_after_editor, |this| {
                                             this.children(self.render_dock(
                                                 DockPosition::Left,
                                                 &self.left_dock,
@@ -10567,7 +10676,7 @@ impl Render for Workspace {
                                                     cx,
                                                 ))),
                                         )
-                                        .when(agent_on_right, |this| {
+                                        .when(agent_after_editor, |this| {
                                             this.children(self.render_dock(
                                                 DockPosition::Left,
                                                 &self.left_dock,
@@ -10577,9 +10686,15 @@ impl Render for Workspace {
                                         }),
                                     BottomDockLayout::Contained => div()
                                         .flex()
-                                        .flex_row()
+                                        .map(|this| {
+                                            if agent_vertical {
+                                                this.flex_col()
+                                            } else {
+                                                this.flex_row()
+                                            }
+                                        })
                                         .h_full()
-                                        .when(!agent_on_right, |this| {
+                                        .when(!agent_after_editor, |this| {
                                             this.children(self.render_dock(
                                                 DockPosition::Left,
                                                 &self.left_dock,
@@ -10624,7 +10739,7 @@ impl Render for Workspace {
                                                     cx,
                                                 )),
                                         )
-                                        .when(agent_on_right, |this| {
+                                        .when(agent_after_editor, |this| {
                                             this.children(self.render_dock(
                                                 DockPosition::Left,
                                                 &self.left_dock,
@@ -10675,7 +10790,15 @@ impl Render for Workspace {
                                 }
 
                                 Some(match self.zoomed_position {
-                                    Some(DockPosition::Left) if agent_on_right => {
+                                    Some(DockPosition::Left)
+                                        if agent_vertical && agent_after_editor =>
+                                    {
+                                        overlay.top_2().border_t_1()
+                                    }
+                                    Some(DockPosition::Left) if agent_vertical => {
+                                        overlay.bottom_2().border_b_1()
+                                    }
+                                    Some(DockPosition::Left) if agent_after_editor => {
                                         overlay.left_2().border_l_1()
                                     }
                                     Some(DockPosition::Left) => overlay.right_2().border_r_1(),

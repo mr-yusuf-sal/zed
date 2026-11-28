@@ -1,6 +1,6 @@
 use crate::{
     AgentPanelPlacement, ItemHandle, MultiWorkspace, Pane, SidebarSide, SwapAgentPanelSide,
-    ToggleWorkspaceSidebar, sidebar_side_context_menu,
+    ToggleAgentPanelLayout, ToggleWorkspaceSidebar, sidebar_side_context_menu,
 };
 use gpui::{
     Anchor, AnyView, App, Context, Decorations, Entity, FocusHandle, Focusable, IntoElement,
@@ -223,6 +223,7 @@ impl StatusBar {
                         render_hideable_item("status-bar-right", index, item.as_ref(), cx)
                     }),
             )
+            .child(Self::render_agent_panel_layout_button(cx))
             .child(Self::render_agent_panel_side_button(cx))
             .when(
                 sidebar.show_toggle && !sidebar.open && sidebar.side == SidebarSide::Right,
@@ -230,14 +231,40 @@ impl StatusBar {
             )
     }
 
+    /// Switches the agent panel between beside the editor and stacked with it top and bottom.
+    fn render_agent_panel_layout_button(cx: &App) -> impl IntoElement {
+        let (icon, tooltip) = if AgentPanelPlacement::vertical(cx) {
+            (IconName::SplitRows, "Place Agent Panel Beside the Editor")
+        } else {
+            (
+                IconName::Split,
+                "Place Agent Panel Above or Below the Editor",
+            )
+        };
+        IconButton::new("toggle-agent-panel-layout", icon)
+            .icon_size(IconSize::Small)
+            .tab_index(0isize)
+            .aria_label(tooltip)
+            .tooltip(move |_, cx| Tooltip::for_action(tooltip, &ToggleAgentPanelLayout, cx))
+            .on_click(|_, _, cx| AgentPanelPlacement::toggle_layout(cx))
+    }
+
     /// Swaps the agent panel and the editor, which keep the Workspaces panel on their left.
     fn render_agent_panel_side_button(cx: &App) -> impl IntoElement {
-        let tooltip = if AgentPanelPlacement::agent_on_right(cx) {
-            "Move Agent Panel Left of the Editor"
-        } else {
-            "Move Agent Panel Right of the Editor"
+        let after_editor = AgentPanelPlacement::agent_after_editor(cx);
+        let (icon, tooltip) = match (AgentPanelPlacement::vertical(cx), after_editor) {
+            (true, true) => (IconName::ArrowUpDown, "Move Agent Panel Above the Editor"),
+            (true, false) => (IconName::ArrowUpDown, "Move Agent Panel Below the Editor"),
+            (false, true) => (
+                IconName::ArrowRightLeft,
+                "Move Agent Panel Left of the Editor",
+            ),
+            (false, false) => (
+                IconName::ArrowRightLeft,
+                "Move Agent Panel Right of the Editor",
+            ),
         };
-        IconButton::new("swap-agent-panel-side", IconName::ArrowRightLeft)
+        IconButton::new("swap-agent-panel-side", icon)
             .icon_size(IconSize::Small)
             .tab_index(0isize)
             .aria_label(tooltip)

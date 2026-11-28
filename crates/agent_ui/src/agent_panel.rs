@@ -5160,8 +5160,8 @@ impl Focusable for AgentPanel {
 }
 
 // This fork keeps the agent panel in the left dock whatever `agent.dock` says. That dock is never
-// closed, and `Workspace::render` draws it right or left of the center, as the status bar's swap
-// button last chose (see `workspace::AgentPanelPlacement`).
+// closed, and `Workspace::render` draws it beside the center or above or below it, on the side the
+// status bar's layout and swap buttons last chose (see `workspace::AgentPanelPlacement`).
 fn agent_panel_dock_position(_cx: &App) -> DockPosition {
     DockPosition::Left
 }
